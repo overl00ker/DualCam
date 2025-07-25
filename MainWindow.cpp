@@ -262,7 +262,6 @@ void MainWindow::setOneCamera()
     desiredCamCount_ = 1;
     actOneCam_->setChecked(true);
     actTwoCam_->setChecked(false);
-    // not implemented: actually closing second camera feed yet
 }
 
 void MainWindow::setTwoCameras()
@@ -270,7 +269,6 @@ void MainWindow::setTwoCameras()
     desiredCamCount_ = 2;
     actOneCam_->setChecked(false);
     actTwoCam_->setChecked(true);
-    // not implemented: open second camera if closed
 }
 
 void MainWindow::setResolution640x480()
