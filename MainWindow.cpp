@@ -288,12 +288,25 @@ void MainWindow::updateDisplayGeometry()
 cv::Mat MainWindow::ensureGray(const cv::Mat& src)
 {
     if (src.empty()) return src;
-    if (src.channels() == 1) return src.clone();
+    if (src.channels() == 1) return src;
     cv::Mat gray;
-    cv::cvtColor(src, gray, (src.channels() == 3) ? cv::COLOR_BGR2GRAY
-        : cv::COLOR_BGRA2GRAY);
+    if (src.channels() == 3)       cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    else if (src.channels() == 4)  cv::cvtColor(src, gray, cv::COLOR_BGRA2GRAY);
+    else                           cv::cvtColor(ensureBGR(src), gray, cv::COLOR_BGR2GRAY);
     return gray;
 }
+
+cv::Mat MainWindow::ensureBGR(const cv::Mat& src)
+{
+    if (src.empty()) return src;
+    if (src.channels() == 3) return src;
+    cv::Mat bgr;
+    if (src.channels() == 1)       cv::cvtColor(src, bgr, cv::COLOR_GRAY2BGR);
+    else if (src.channels() == 4)  cv::cvtColor(src, bgr, cv::COLOR_BGRA2BGR);
+    else                           cv::cvtColor(src, bgr, cv::COLOR_YUV2BGR_YUYV); 
+    return bgr;
+}
+
 
 double MainWindow::computeSharp(const cv::Mat& gray)
 {
@@ -333,4 +346,5 @@ cv::Mat MainWindow::makeGraphImage(int w, int h)
     drawSeries(0, { 0,255,0 });
     drawSeries(1, { 0,0,255 });
     return graph;
+
 }
