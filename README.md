@@ -65,7 +65,7 @@ sudo apt install -y build-essential cmake qtbase5-dev qt6-base-dev libopencv-dev
 
 Збірка проєкту:
 ```bash
-git clone https://github.com/<your-username>/DualCam.git
+git clone https://github.com/overl00ker/DualCam.git
 cd DualCam
 mkdir build && cd build
 cmake ..
