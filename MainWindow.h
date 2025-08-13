@@ -9,6 +9,7 @@
 #include <QVBoxLayout>
 #include <QProcess>
 #include <deque>
+#include <memory>
 #include <opencv2/opencv.hpp>
 #include "capture_backend.h"
 
@@ -19,8 +20,8 @@ class MainWindow : public QMainWindow
     Q_OBJECT
 public:
     explicit MainWindow(const CaptureParams& cam0,
-        const CaptureParams& cam1,
-        QWidget* parent = nullptr);
+                        const CaptureParams& cam1,
+                        QWidget* parent = nullptr);
     ~MainWindow() override;
 
 private slots:
@@ -46,9 +47,9 @@ private:
 
     void updateDisplayGeometry();
 
-    cv::Mat ensureGray(const cv::Mat& src);     
-    cv::Mat ensureBGR(const cv::Mat& src);     
-    double  computeSharp(const cv::Mat& gray);  
+    [[nodiscard]] cv::Mat ensureGray(const cv::Mat& src);
+    [[nodiscard]] cv::Mat ensureBGR(const cv::Mat& src);
+    double  computeSharp(const cv::Mat& gray);
     void    drawOverlay(cv::Mat& img, const std::string& text);
     cv::Mat makeGraphImage(int w, int h);
 
@@ -85,45 +86,3 @@ private:
     FrameGrabber* grabber0_{ nullptr };
     FrameGrabber* grabber1_{ nullptr };
 };
-
-inline cv::Mat MainWindow::ensureBGR(const cv::Mat& src)
-{
-    if (src.empty()) return src;
-    if (src.channels() == 3) return src;
-    cv::Mat bgr;
-    if (src.channels() == 1) 
-    {
-        cv::cvtColor(src, bgr, cv::COLOR_GRAY2BGR);
-    }
-    else if (src.channels() == 4) 
-    {
-        cv::cvtColor(src, bgr, cv::COLOR_BGRA2BGR);
-    }
-    else 
-    {
-        cv::Mat tmp = src.clone();
-        cv::cvtColor(tmp, bgr, cv::COLOR_YUV2BGR_YUYV);
-    }
-    return bgr;
-}
-
-inline cv::Mat MainWindow::ensureGray(const cv::Mat& src)
-{
-    if (src.empty()) return src;
-    if (src.channels() == 1) return src;
-    cv::Mat gray;
-    if (src.channels() == 3) 
-    {
-        cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    }
-    else if (src.channels() == 4) 
-    {
-        cv::cvtColor(src, gray, cv::COLOR_BGRA2GRAY);
-    }
-    else 
-    {
-        cv::Mat bgr = ensureBGR(src);
-        cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
-    }
-    return gray;
-}
