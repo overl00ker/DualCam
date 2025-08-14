@@ -90,9 +90,8 @@ int main(int argc, char* argv[])
     parser.addVersionOption();
 
     const QStringList cams = { "cam0", "cam1" };
-    for (const auto& c : cams) {
-        // Define options without leading dashes; QCommandLineParser automatically
-        // matches them as long options with "--" prefix.
+    for (const auto& c : cams) 
+    {
         parser.addOption({ QStringLiteral("%1-backend").arg(c),
                            "backend: auto|libcamera|v4l2.", "name" });
         parser.addOption({ QStringLiteral("%1-id").arg(c),
@@ -136,6 +135,11 @@ int main(int argc, char* argv[])
     applyCamOpts(p1, parser, "cam1");
 
     MainWindow w(p0, p1);
+    qInfo() << "Before show()";
+    w.resize(1280, 720);
+    w.move(50, 50);
     w.show();
+    qInfo() << "After show()";
     return app.exec();
+
 }
