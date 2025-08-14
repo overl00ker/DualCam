@@ -40,7 +40,10 @@ MainWindow::MainWindow(const CaptureParams& cam0,
     layout->addWidget(viewLabel_);
     setCentralWidget(central);
 
+    QTimer::singleShot(0, this, [this]
+    {
     openCams();
+    });
 
     timer_ = new QTimer(this);
     connect(timer_, &QTimer::timeout, this, &MainWindow::updateFrame);
@@ -88,6 +91,12 @@ void MainWindow::buildMenus()
     actFull_->setCheckable(true);
     winMenu->addAction(tr("Restart"), this, &MainWindow::restartApp);
     winMenu->addAction(tr("Check updates"), this, &MainWindow::checkUpdates);
+}
+
+void MainWindow::showEvent(QShowEvent* e) 
+{
+    QMainWindow::showEvent(e);
+    qInfo() << "MainWindow shown";  
 }
 
 static bool isVEYEFixedGRAY(const CaptureParams& p)
@@ -348,3 +357,4 @@ cv::Mat MainWindow::makeGraphImage(int w, int h)
     return graph;
 
 }
+
