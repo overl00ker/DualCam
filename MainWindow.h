@@ -85,4 +85,8 @@ private:
 
     FrameGrabber* grabber0_{ nullptr };
     FrameGrabber* grabber1_{ nullptr };
+
+protected:
+    void showEvent(QShowEvent* e) override;                        
 };
+
