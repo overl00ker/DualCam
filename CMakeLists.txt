@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.16)
 project(DualCam LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -28,9 +28,10 @@ else()
   set(QT_LIB Qt5::Widgets)
 endif()
 
-find_package(OpenCV REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio highgui)
 message(STATUS "OpenCV version: ${OpenCV_VERSION}")
-message(STATUS "OpenCV libs: ${OpenCV_LIBS}")
+
+find_package(Threads REQUIRED)
 
 set(SOURCES
   main.cpp
@@ -52,6 +53,7 @@ target_link_libraries(${PROJECT_NAME}
   PRIVATE
     ${QT_LIB}
     ${OpenCV_LIBS}
+    Threads::Threads
 )
 
 if(UNIX AND NOT APPLE)
