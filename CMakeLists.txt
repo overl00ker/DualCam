@@ -13,6 +13,10 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+set(Qt6_DIR    "D:/IF NASU/Addons/Qt/6.9.1/msvc2022_64/lib/cmake/Qt6")
+set(OpenCV_DIR "D:/IF NASU/Addons/opencv/build/x64/vc16/lib")
+
+
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
@@ -33,16 +37,18 @@ message(STATUS "OpenCV version: ${OpenCV_VERSION}")
 
 find_package(Threads REQUIRED)
 
-set(SOURCES
-  main.cpp
-  MainWindow.cpp
-)
-set(HEADERS
-  MainWindow.h
-  capture_backend.h
+set(DUALCAM_SOURCES
+    src/main.cpp
+    src/core.cpp
+    src/mainwindow.cpp
 )
 
-add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS})
+set(DUALCAM_HEADERS
+    src/core.h
+    src/mainwindow.h
+)
+
+add_executable(${PROJECT_NAME} ${DUALCAM_SOURCES} ${DUALCAM_HEADERS})
 
 target_include_directories(${PROJECT_NAME}
   PRIVATE
@@ -52,7 +58,7 @@ target_include_directories(${PROJECT_NAME}
 target_link_libraries(${PROJECT_NAME}
   PRIVATE
     ${QT_LIB}
-    ${OpenCV_LIBS}
+    opencv::opencv 
     Threads::Threads
 )
 
@@ -62,3 +68,5 @@ if(UNIX AND NOT APPLE)
     INSTALL_RPATH "$ORIGIN"
   )
 endif()
+
+
