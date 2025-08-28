@@ -1,7 +1,7 @@
-#include <QApplication>
+﻿#include <QApplication>
 #include "DualCam.h"
 
-int main(int argc, char* argv[])
+int main(int argc, char* argv[]) 
 {
     QApplication app(argc, argv);
     DualCam w;

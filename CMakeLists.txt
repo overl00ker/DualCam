@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.16)
-project(DualCam LANGUAGES CXX)
+project(DualCamQt LANGUAGES CXX)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 set(CMAKE_CXX_STANDARD 17)
@@ -18,11 +18,9 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
 
 
 add_executable(DualCam
-main.cpp
-DualCam.cpp
-DualCam.h
-CaptureBackend.cpp
-CaptureBackend.h
+    main.cpp
+    DualCam.cpp
+    DualCam.h
 )
 
 
