@@ -28,8 +28,12 @@ static inline std::string getenv_lower(const char* key) {
 // Static: build a list of candidate capture specifications for the given camera
 std::vector<std::tuple<std::string, bool, bool>> DualCam::buildCandidates(int index) {
     std::vector<std::tuple<std::string, bool, bool>> cands;
-    // Check for explicit pipeline override
-    {
+    // Determine CAP_PRIORITY; if it contains "v4l2", we will not push any GStreamer pipelines.
+    std::string prioStr = getenv_lower("CAP_PRIORITY");
+    bool preferV4L2Only = (!prioStr.empty() && prioStr.find("v4l2") != std::string::npos);
+
+    // Check for explicit pipeline override (gst pipelines still supported) unless V4L2 is explicitly requested
+    if (!preferV4L2Only) {
         std::string key = std::string("GST_PIPELINE_CAM") + std::to_string(index);
         const char* val = std::getenv(key.c_str());
         if (val && *val) {
@@ -39,8 +43,19 @@ std::vector<std::tuple<std::string, bool, bool>> DualCam::buildCandidates(int in
             cands.emplace_back(spec, /*isGst*/true, /*isDevice*/false);
         }
     }
-    // Check for camera-name override
+
+    // Check for explicit device path override (direct V4L2 capture)
     {
+        std::string key = std::string("DEV_VIDEO_CAM") + std::to_string(index);
+        const char* val = std::getenv(key.c_str());
+        if (val && *val) {
+            // When a device path is specified, add it as a candidate.  This allows
+            // direct V4L2 capture on Linux or path-based capture on other OSes.
+            cands.emplace_back(std::string(val), /*isGst*/false, /*isDevice*/true);
+        }
+    }
+    // Check for camera-name override (libcamera), unless V4L2 is explicitly requested
+    if (!preferV4L2Only) {
         std::string key = std::string("GST_CAMERA_NAME_CAM") + std::to_string(index);
         const char* val = std::getenv(key.c_str());
         if (val && *val) {
@@ -62,12 +77,16 @@ std::vector<std::tuple<std::string, bool, bool>> DualCam::buildCandidates(int in
             cands.emplace_back(pipeline, true, false);
         }
     }
-    // Decide priority: prefer libcamera if CAP_PRIORITY contains libcamera/gst/gstreamer
+    // Decide priority: prefer libcamera if CAP_PRIORITY contains libcamera/gst/gstreamer;
+    // explicitly prefer v4l2 if CAP_PRIORITY contains v4l2
     bool preferLibcamera = false;
     {
         std::string pr = getenv_lower("CAP_PRIORITY");
         if (!pr.empty()) {
-            if (pr.find("libcamera") != std::string::npos || pr.find("gst") != std::string::npos || pr.find("gstreamer") != std::string::npos) {
+            // If v4l2 is requested, force libcamera preference off
+            if (pr.find("v4l2") != std::string::npos) {
+                preferLibcamera = false;
+            } else if (pr.find("libcamera") != std::string::npos || pr.find("gst") != std::string::npos || pr.find("gstreamer") != std::string::npos) {
                 preferLibcamera = true;
             }
         }
@@ -105,8 +124,10 @@ std::vector<std::tuple<std::string, bool, bool>> DualCam::buildCandidates(int in
     // On non-Linux platforms, only index is meaningful
     cands.emplace_back(std::to_string(index), false, false);
 #endif
-    // If not preferring libcamera, append camera-id pipeline as ultimate fallback
-    if (!preferLibcamera) {
+    // If not preferring libcamera, append camera-id pipeline as ultimate fallback,
+    // unless V4L2-only mode was requested.  In V4L2-only mode, do not push any
+    // GStreamer/libcamera pipeline here.
+    if (!preferLibcamera && !preferV4L2Only) {
         std::string pipe = std::string("libcamerasrc camera-id=") + std::to_string(index) +
             " ! video/x-raw,width=" + std::to_string(w) + ",height=" + std::to_string(h) + ",format=YUY2"
             " ! videoconvert ! video/x-raw,format=BGR ! appsink max-buffers=1 drop=true sync=false";
@@ -428,6 +449,22 @@ void DualCam::tick() {
     cv::Mat f0, f1;
     bool got0 = ok0_ && cap0_.read(f0);
     bool got1 = ok1_ && cap1_.read(f1);
+    // If frames are 16-bit (e.g. Y16 or 16-bit grayscale), convert them down to 8-bit
+    if (got0 && !f0.empty() && f0.depth() == CV_16U) {
+        // Scale 16-bit to 8-bit by shifting right 8 bits.  Use per-channel conversion.
+        double scale = 1.0 / 256.0;
+        int type = CV_MAKETYPE(CV_8U, f0.channels());
+        cv::Mat tmp;
+        f0.convertTo(tmp, type, scale);
+        f0 = tmp;
+    }
+    if (got1 && !f1.empty() && f1.depth() == CV_16U) {
+        double scale = 1.0 / 256.0;
+        int type = CV_MAKETYPE(CV_8U, f1.channels());
+        cv::Mat tmp;
+        f1.convertTo(tmp, type, scale);
+        f1 = tmp;
+    }
     cv::Mat r0b = got0 ? f0 : black_;
     cv::Mat r1b = got1 ? f1 : black_;
     // Convert grayscale to BGR
