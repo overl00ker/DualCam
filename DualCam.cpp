@@ -58,7 +58,7 @@ std::vector<std::tuple<std::string, bool, bool>> DualCam::buildCandidates(int in
         if (val && *val) 
         {
             std::string name(val);
-            int w = 640, h = 480, f = 30;
+            int w = 1440, h = 1088, f = 60;
             if (const char* wenv = std::getenv("GST_WIDTH")) 
             {
                 int wi = atoi(wenv); if (wi > 0) w = wi;
@@ -72,7 +72,7 @@ std::vector<std::tuple<std::string, bool, bool>> DualCam::buildCandidates(int in
                 int fi = atoi(fpsenv); if (fi > 0) f = fi;
             }
             std::string pipeline = std::string("libcamerasrc camera-name=") + name +
-                " ! video/x-raw,width=" + std::to_string(w) + ",height=" + std::to_string(h) + ",format=YUY2"
+                " ! video/x-raw,width=" + std::to_string(w) + ",height=" + std::to_string(h) + ",format=GRAY8"
                 " ! videoconvert ! video/x-raw,format=BGR ! appsink max-buffers=1 drop=true sync=false";
             cands.emplace_back(pipeline, true, false);
         }
@@ -91,7 +91,7 @@ std::vector<std::tuple<std::string, bool, bool>> DualCam::buildCandidates(int in
             }
         }
     }
-    int w = 640, h = 480, f = 30;
+    int w = 1400, h = 1088, f = 60;
     if (const char* wenv = std::getenv("GST_WIDTH")) 
     {
         int wi = atoi(wenv); if (wi > 0) w = wi;
