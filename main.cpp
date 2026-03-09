@@ -1,10 +1,12 @@
+﻿#include <QApplication>
 #include "mainwindow.h"
-#include <QtWidgets/QApplication> 
 
 int main(int argc, char* argv[])
 {
-    QApplication a(argc, argv);
+    QApplication app(argc, argv);
     MainWindow w;
+    w.setWindowTitle("DualCam");
+    w.resize(1920, 1080);
     w.show();
-    return a.exec();
+    return app.exec();
 }

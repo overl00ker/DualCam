@@ -1,4 +1,4 @@
-﻿#ifndef MAINWINDOW_H
+#ifndef MAINWINDOW_H
 #define MAINWINDOW_H
 
 #include <QMainWindow>
@@ -9,7 +9,9 @@
 
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
-#include <opencv2/features2d.hpp>
+#include <opencv2/video/background_segm.hpp>
+
+#include <deque>
 
 class QWidget;
 class QVBoxLayout;
@@ -23,6 +25,9 @@ class QCheckBox;
 class QSplitter;
 class QTabWidget;
 class QSpinBox;
+class QSlider;
+
+enum class ColorMode { GRAY_NATIVE, GRAY_CV, COLOR };
 
 class MainWindow : public QMainWindow
 {
@@ -43,9 +48,13 @@ private:
     void initUI();
     void displayMat(QLabel* label, const cv::Mat& mat);
     double calculateFocus(const cv::Mat& frame);
-    bool computeHomography(const cv::Mat& img1, const cv::Mat& img2, cv::Mat& outHomography);
 
-    // --- New Helper Methods for GStreamer/Libcamera ---
+    double detectMotion(const cv::Mat& frame);
+    cv::Mat applyTemporalDenoise();
+    cv::Mat fuseCameras(const cv::Mat& a, const cv::Mat& b);
+    cv::Mat applyBilateral(const cv::Mat& src);
+    cv::Mat applyDiffView(const cv::Mat& d1, const cv::Mat& d2);
+
     QStringList getLibCameraIds();
     std::string makeGStreamerPipeline(const QString& cameraId, int width, int height, int fps);
 
@@ -55,14 +64,26 @@ private:
 
     cv::Mat m_frame1;
     cv::Mat m_frame2;
-    cv::Ptr<cv::ORB> m_orb;
-    cv::Ptr<cv::BFMatcher> m_matcher;
-    cv::Mat m_homography;
+    cv::Mat m_eccWarpMatrix;
 
     bool m_camerasOpen = false;
     bool m_isAligned = false;
     qint64 m_frameCount = 0;
     int m_maxHistory = 200;
+
+    QCheckBox* m_chkFlipVer2 = nullptr;
+    QCheckBox* m_chkFlipHor2 = nullptr;
+
+    cv::Ptr<cv::BackgroundSubtractorMOG2> m_bgSubtractor;
+    std::deque<cv::Mat> m_frameBuffer1;
+    std::deque<cv::Mat> m_frameBuffer2;
+    int m_bufferSize = 8;
+    double m_motionThreshold = 0.05;
+    bool m_motionActive = false;
+    int m_noiseFloor = 15;
+    bool m_diffStretch = false;
+
+    ColorMode m_colorMode = ColorMode::GRAY_CV;
 
     QWidget* m_centralWidget;
     QTabWidget* m_tabWidget;
@@ -73,8 +94,21 @@ private:
     QSplitter* m_splitter;
     QPushButton* m_btnToggleCameras;
     QComboBox* m_comboViewMode;
+    QComboBox* m_comboColorMode;
     QCheckBox* m_chkAlign;
     QPushButton* m_btnCalibrateAlign;
+
+    QSlider* m_bufferSlider;
+    QLabel* m_bufferLabel;
+    QSlider* m_motionThresholdSlider;
+    QLabel* m_motionThresholdLabel;
+    QCheckBox* m_chkFusion;
+    QCheckBox* m_chkBilateral;
+    QLabel* m_motionIndicator;
+
+    QSlider* m_noiseFloorSlider;
+    QLabel* m_noiseFloorLabel;
+    QCheckBox* m_chkStretch;
 
     QChartView* m_chartView;
     QChart* m_chart;

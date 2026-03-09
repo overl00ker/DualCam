@@ -1,4 +1,4 @@
-﻿#include "mainwindow.h"
+#include "mainwindow.h"
 
 #include <QApplication>
 #include <QWidget>
@@ -15,6 +15,7 @@
 #include <QSplitter>
 #include <QTabWidget>
 #include <QSpinBox>
+#include <QSlider>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QDebug>
@@ -23,7 +24,7 @@
 #include <QtCharts/QLegend>
 
 #include <opencv2/imgproc.hpp>
-#include <opencv2/calib3d.hpp>
+#include <opencv2/video.hpp>
 
 #include <iostream>
 #include <vector>
@@ -32,10 +33,11 @@
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
-    m_orb = cv::ORB::create(1000);
-    m_matcher = cv::BFMatcher::create(cv::NORM_HAMMING);
+    m_bgSubtractor = cv::createBackgroundSubtractorMOG2(500, 16.0, false);
+
     m_timer = new QTimer(this);
     connect(m_timer, &QTimer::timeout, this, &MainWindow::updateFrames);
+
     initUI();
 }
 
@@ -46,8 +48,8 @@ MainWindow::~MainWindow()
 
 void MainWindow::initUI()
 {
-    setWindowTitle("Stereo Camera Calibrate");
-    setGeometry(100, 100, 1280, 720);
+    setWindowTitle("DualCam");
+    setGeometry(100, 100, 1280, 850);
 
     m_centralWidget = new QWidget(this);
     setCentralWidget(m_centralWidget);
@@ -68,10 +70,33 @@ void MainWindow::initUI()
         });
     controlsLayout->addWidget(m_btnToggleCameras);
 
+    m_chkFlipVer2 = new QCheckBox("Flip 2ndV", this);
+    controlsLayout->addWidget(m_chkFlipVer2);
+    m_chkFlipHor2 = new QCheckBox("Flip 2ndH", this);
+    controlsLayout->addWidget(m_chkFlipHor2);
+
     m_comboViewMode = new QComboBox(this);
     m_comboViewMode->addItems({ "Dual View", "Difference View" });
     connect(m_comboViewMode, &QComboBox::currentTextChanged, this, &MainWindow::updateView);
     controlsLayout->addWidget(m_comboViewMode);
+
+    QLabel* colorLabel = new QLabel("Color:", this);
+    m_comboColorMode = new QComboBox(this);
+    m_comboColorMode->addItems({ "Gray Native", "Gray CV", "Color" });
+    m_comboColorMode->setCurrentIndex(1);
+    m_comboColorMode->setToolTip("Gray Native: expect GRAY8 from camera\n"
+                                  "Gray CV: capture BGR, convert to grayscale\n"
+                                  "Color: keep BGR as-is");
+    connect(m_comboColorMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        m_colorMode = static_cast<ColorMode>(index);
+        m_frameBuffer1.clear();
+        m_frameBuffer2.clear();
+        if (m_colorMode == ColorMode::COLOR) {
+            m_statusBar->showMessage("Color mode: ECC calibration uses grayscale internally.", 4000);
+        }
+    });
+    controlsLayout->addWidget(colorLabel);
+    controlsLayout->addWidget(m_comboColorMode);
 
     m_chkAlign = new QCheckBox("Align Frames", this);
     connect(m_chkAlign, &QCheckBox::stateChanged, this, &MainWindow::updateView);
@@ -83,6 +108,114 @@ void MainWindow::initUI()
 
     controlsLayout->addStretch();
     liveLayout->addLayout(controlsLayout);
+
+    QHBoxLayout* denoiseLayout = new QHBoxLayout();
+
+    QLabel* bufferTitle = new QLabel("Buffer:", this);
+    m_bufferSlider = new QSlider(Qt::Horizontal, this);
+    m_bufferSlider->setRange(1, 30);
+    m_bufferSlider->setValue(m_bufferSize);
+    m_bufferSlider->setTickPosition(QSlider::TicksBelow);
+    m_bufferSlider->setTickInterval(5);
+    m_bufferSlider->setFixedWidth(160);
+
+    m_bufferLabel = new QLabel(QString::number(m_bufferSize), this);
+    m_bufferLabel->setFixedWidth(30);
+    m_bufferLabel->setStyleSheet("font-weight: bold; font-size: 14px; color: cyan;");
+
+    connect(m_bufferSlider, &QSlider::valueChanged, this, [this](int value) {
+        m_bufferSize = value;
+        m_bufferLabel->setText(QString::number(value));
+    });
+
+    denoiseLayout->addWidget(bufferTitle);
+    denoiseLayout->addWidget(m_bufferSlider);
+    denoiseLayout->addWidget(m_bufferLabel);
+
+    QLabel* motionTitle = new QLabel("Motion Threshold:", this);
+    m_motionThresholdSlider = new QSlider(Qt::Horizontal, this);
+    m_motionThresholdSlider->setRange(1, 50);
+    m_motionThresholdSlider->setValue(static_cast<int>(m_motionThreshold * 100));
+    m_motionThresholdSlider->setTickPosition(QSlider::TicksBelow);
+    m_motionThresholdSlider->setTickInterval(5);
+    m_motionThresholdSlider->setFixedWidth(160);
+
+    m_motionThresholdLabel = new QLabel(QString("%1%").arg(m_motionThreshold * 100, 0, 'f', 0), this);
+    m_motionThresholdLabel->setFixedWidth(40);
+    m_motionThresholdLabel->setStyleSheet("font-weight: bold; font-size: 14px; color: cyan;");
+
+    connect(m_motionThresholdSlider, &QSlider::valueChanged, this, [this](int value) {
+        m_motionThreshold = static_cast<double>(value) / 100.0;
+        m_motionThresholdLabel->setText(QString("%1%").arg(value));
+    });
+
+    denoiseLayout->addWidget(motionTitle);
+    denoiseLayout->addWidget(m_motionThresholdSlider);
+    denoiseLayout->addWidget(m_motionThresholdLabel);
+
+    m_chkFusion = new QCheckBox("Camera Fusion", this);
+    m_chkFusion->setToolTip("Blend both cameras for +3 dB SNR (requires calibrated alignment)");
+    denoiseLayout->addWidget(m_chkFusion);
+
+    m_chkBilateral = new QCheckBox("Bilateral Filter", this);
+    m_chkBilateral->setToolTip("Apply bilateral filter on top for edge-preserving smoothing");
+    denoiseLayout->addWidget(m_chkBilateral);
+
+    m_motionIndicator = new QLabel(QString::fromUtf8("\u25CF Idle"), this);
+    m_motionIndicator->setStyleSheet("font-weight: bold; font-size: 13px; color: gray;");
+    m_motionIndicator->setFixedWidth(110);
+    denoiseLayout->addWidget(m_motionIndicator);
+
+    denoiseLayout->addStretch();
+    liveLayout->addLayout(denoiseLayout);
+
+    QHBoxLayout* diffLayout = new QHBoxLayout();
+
+    QLabel* noiseFloorTitle = new QLabel("Noise Floor:", this);
+    m_noiseFloorSlider = new QSlider(Qt::Horizontal, this);
+    m_noiseFloorSlider->setRange(0, 50);
+    m_noiseFloorSlider->setValue(m_noiseFloor);
+    m_noiseFloorSlider->setTickPosition(QSlider::TicksBelow);
+    m_noiseFloorSlider->setTickInterval(5);
+    m_noiseFloorSlider->setFixedWidth(160);
+
+    m_noiseFloorLabel = new QLabel(QString::number(m_noiseFloor), this);
+    m_noiseFloorLabel->setFixedWidth(30);
+    m_noiseFloorLabel->setStyleSheet("font-weight: bold; font-size: 14px; color: cyan;");
+
+    connect(m_noiseFloorSlider, &QSlider::valueChanged, this, [this](int value) {
+        m_noiseFloor = value;
+        m_noiseFloorLabel->setText(QString::number(value));
+    });
+
+    m_chkStretch = new QCheckBox("Stretch Range", this);
+    m_chkStretch->setToolTip("Normalize remaining diff to full 0-255 range for visibility");
+
+    diffLayout->addWidget(noiseFloorTitle);
+    diffLayout->addWidget(m_noiseFloorSlider);
+    diffLayout->addWidget(m_noiseFloorLabel);
+    diffLayout->addWidget(m_chkStretch);
+    diffLayout->addStretch();
+    liveLayout->addLayout(diffLayout);
+
+    noiseFloorTitle->setObjectName("diffCtrl");
+    m_noiseFloorSlider->setObjectName("diffCtrl");
+    m_noiseFloorLabel->setObjectName("diffCtrl");
+    m_chkStretch->setObjectName("diffCtrl");
+    noiseFloorTitle->hide();
+    m_noiseFloorSlider->hide();
+    m_noiseFloorLabel->hide();
+    m_chkStretch->hide();
+
+    connect(m_comboViewMode, &QComboBox::currentTextChanged, this, [this](const QString& text) {
+        bool isDiff = (text == "Difference View");
+        m_noiseFloorSlider->setVisible(isDiff);
+        m_noiseFloorLabel->setVisible(isDiff);
+        m_chkStretch->setVisible(isDiff);
+        for (auto* child : m_centralWidget->findChildren<QLabel*>("diffCtrl")) {
+            child->setVisible(isDiff);
+        }
+    });
 
     m_splitter = new QSplitter(Qt::Horizontal, this);
 
@@ -112,7 +245,6 @@ void MainWindow::initUI()
 
     m_tabWidget->addTab(liveTab, "Live View");
 
-    // --- Tab 2: Focus Analysis ---
     QWidget* focusTab = new QWidget();
     QVBoxLayout* focusLayout = new QVBoxLayout(focusTab);
 
@@ -136,8 +268,8 @@ void MainWindow::initUI()
     m_chart->addAxis(axisX, Qt::AlignBottom);
 
     QValueAxis* axisY = new QValueAxis;
-    axisY->setTitleText("Focus Score (Lap Var)");
-    axisY->setRange(0, 10000);
+    axisY->setTitleText("Focus Score");
+    axisY->setRange(0, 5000);
     m_chart->addAxis(axisY, Qt::AlignLeft);
 
     m_seriesCam1->attachAxis(axisX);
@@ -168,7 +300,7 @@ void MainWindow::initUI()
         });
 
     historyLayout->addStretch();
-    historyLayout->addWidget(new QLabel("Graph History Length:", this));
+    historyLayout->addWidget(new QLabel("Graph History:", this));
     historyLayout->addWidget(m_historySpinBox);
     historyLayout->addStretch();
     focusLayout->addLayout(historyLayout);
@@ -210,13 +342,13 @@ QStringList MainWindow::getLibCameraIds()
 std::string MainWindow::makeGStreamerPipeline(const QString& cameraId, int width, int height, int fps)
 {
     return QString("libcamerasrc camera-name=%1 ! "
-        "video/x-raw, width=%2, height=%3, framerate=%4/1 ! "
+        "video/x-raw, width=%2, height=%3, format=NV12 ! "
         "videoconvert ! "
-        "video/x-raw, format=(string)BGR ! appsink drop=1")
+        "video/x-raw, format=(string)BGR ! "
+        "appsink drop=1 sync=false")
         .arg(cameraId)
         .arg(width)
         .arg(height)
-        .arg(fps)
         .toStdString();
 }
 
@@ -228,11 +360,8 @@ void MainWindow::openCameras()
     QStringList camPaths = getLibCameraIds();
 
     if (camPaths.size() < 2) {
-        // Fallback to V4L2/DSHOW if not enough libcameras found (e.g., testing on PC)
-        m_statusBar->showMessage("Warning: < 2 libcameras found. Trying default indices.", 3000);
-
+        m_statusBar->showMessage("Warning: < 2 libcameras found.", 3000);
 #ifdef Q_OS_LINUX
-        // Try V4L2 fallback
         m_cap1.open(0, cv::CAP_V4L2);
         m_cap2.open(1, cv::CAP_V4L2);
 #else
@@ -241,12 +370,8 @@ void MainWindow::openCameras()
 #endif
     }
     else {
-        // Use GStreamer pipelines with specific camera paths
         std::string pipe1 = makeGStreamerPipeline(camPaths[0], 640, 480, 30);
         std::string pipe2 = makeGStreamerPipeline(camPaths[1], 640, 480, 30);
-
-        qDebug() << "Opening Pipeline 1:" << QString::fromStdString(pipe1);
-        qDebug() << "Opening Pipeline 2:" << QString::fromStdString(pipe2);
 
         m_cap1.open(pipe1, cv::CAP_GSTREAMER);
         m_cap2.open(pipe2, cv::CAP_GSTREAMER);
@@ -254,7 +379,7 @@ void MainWindow::openCameras()
 
     if (!m_cap1.isOpened() || !m_cap2.isOpened())
     {
-        m_statusBar->showMessage("Error: Could not open one or both cameras.", 5000);
+        m_statusBar->showMessage("Error: Camera open failed.", 5000);
         if (m_cap1.isOpened()) m_cap1.release();
         if (m_cap2.isOpened()) m_cap2.release();
         return;
@@ -262,17 +387,23 @@ void MainWindow::openCameras()
 
     m_camerasOpen = true;
     m_isAligned = false;
-    m_homography.release();
+    m_eccWarpMatrix.release();
     m_btnToggleCameras->setText("Close Cameras");
+
+    m_frameBuffer1.clear();
+    m_frameBuffer2.clear();
+    m_motionActive = false;
+    m_bgSubtractor = cv::createBackgroundSubtractorMOG2(500, 16.0, false);
 
     m_frameCount = 0;
     m_seriesCam1->clear();
     m_seriesCam2->clear();
-    m_chart->axes(Qt::Horizontal).first()->setRange(0, m_maxHistory);
-    m_chart->axes(Qt::Vertical).first()->setRange(0, 10000);
 
-    m_timer->start(33); // ~30 FPS
-    m_statusBar->showMessage(QString("Cameras opened. Mode: %1").arg(camPaths.size() >= 2 ? "Libcamera/GStreamer" : "V4L2/Legacy"), 3000);
+    m_chart->axes(Qt::Horizontal).first()->setRange(0, m_maxHistory);
+    m_chart->axes(Qt::Vertical).first()->setRange(0, 1000);
+
+    m_timer->start(33);
+    m_statusBar->showMessage("Cameras OK. Noise suppression active.", 4000);
 }
 
 void MainWindow::closeCameras()
@@ -286,7 +417,102 @@ void MainWindow::closeCameras()
     m_view2->clear();
     m_view1->setText("Camera 1");
     m_view2->setText("Camera 2");
+
+    m_frameBuffer1.clear();
+    m_frameBuffer2.clear();
+
+    m_motionIndicator->setText(QString::fromUtf8("\u25CF Idle"));
+    m_motionIndicator->setStyleSheet("font-weight: bold; font-size: 13px; color: gray;");
+
     m_statusBar->showMessage("Cameras closed.", 2000);
+}
+
+double MainWindow::detectMotion(const cv::Mat& frame)
+{
+    if (frame.empty()) return 0.0;
+
+    cv::Mat gray;
+    if (frame.channels() == 3)
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    else
+        gray = frame;
+
+    cv::Mat fgMask;
+    m_bgSubtractor->apply(gray, fgMask);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(fgMask, fgMask, cv::MORPH_OPEN, kernel);
+
+    int nonZero = cv::countNonZero(fgMask);
+    return static_cast<double>(nonZero) / (frame.rows * frame.cols);
+}
+
+cv::Mat MainWindow::applyTemporalDenoise()
+{
+    if (m_frameBuffer1.empty()) return cv::Mat();
+
+    if (m_frameBuffer1.size() == 1) {
+        return m_frameBuffer1.front().clone();
+    }
+
+    int cvType = (m_frameBuffer1.front().channels() == 3) ? CV_32FC3 : CV_32F;
+
+    cv::Mat accumulator;
+    m_frameBuffer1.front().convertTo(accumulator, cvType);
+
+    for (size_t i = 1; i < m_frameBuffer1.size(); ++i) {
+        cv::Mat tmp;
+        m_frameBuffer1[i].convertTo(tmp, cvType);
+        accumulator += tmp;
+    }
+
+    accumulator /= static_cast<double>(m_frameBuffer1.size());
+
+    cv::Mat result;
+    accumulator.convertTo(result, m_frameBuffer1.front().type());
+    return result;
+}
+
+cv::Mat MainWindow::fuseCameras(const cv::Mat& a, const cv::Mat& b)
+{
+    cv::Mat out;
+    cv::addWeighted(a, 0.5, b, 0.5, 0.0, out);
+    return out;
+}
+
+cv::Mat MainWindow::applyBilateral(const cv::Mat& src)
+{
+    cv::Mat out;
+    cv::bilateralFilter(src, out, 9, 75.0, 75.0);
+    return out;
+}
+
+cv::Mat MainWindow::applyDiffView(const cv::Mat& d1, const cv::Mat& d2)
+{
+    cv::Mat diff;
+
+    cv::Mat a = d1, b = d2;
+    if (b.size() != a.size()) cv::resize(b, b, a.size());
+
+    cv::Mat ga, gb;
+    if (a.channels() == 3) cv::cvtColor(a, ga, cv::COLOR_BGR2GRAY);
+    else ga = a;
+    if (b.channels() == 3) cv::cvtColor(b, gb, cv::COLOR_BGR2GRAY);
+    else gb = b;
+
+    cv::absdiff(ga, gb, diff);
+
+    if (m_noiseFloor > 0) {
+        cv::threshold(diff, diff, m_noiseFloor, 255, cv::THRESH_TOZERO);
+    }
+
+    if (m_diffStretch || (m_chkStretch && m_chkStretch->isChecked())) {
+        cv::normalize(diff, diff, 0, 255, cv::NORM_MINMAX);
+    }
+
+    cv::applyColorMap(diff, diff, cv::COLORMAP_JET);
+
+    return diff;
 }
 
 void MainWindow::updateFrames()
@@ -296,10 +522,94 @@ void MainWindow::updateFrames()
     m_cap1.read(m_frame1);
     m_cap2.read(m_frame2);
 
-    if (m_frame1.empty() || m_frame2.empty())
-    {
-        m_statusBar->showMessage("Error: Dropped frame or stream ended.", 1000);
-        return;
+    if (m_frame1.empty() || m_frame2.empty()) return;
+
+    if (m_chkFlipHor2 && m_chkFlipHor2->isChecked()) {
+        cv::flip(m_frame2, m_frame2, 0);
+    }
+    if (m_chkFlipVer2 && m_chkFlipVer2->isChecked()) {
+        cv::flip(m_frame2, m_frame2, 1);
+    }
+
+    auto toWorkingFormat = [&](cv::Mat& frame) {
+        switch (m_colorMode) {
+        case ColorMode::GRAY_NATIVE:
+            break;
+        case ColorMode::GRAY_CV:
+            if (frame.channels() == 3)
+                cv::cvtColor(frame, frame, cv::COLOR_BGR2GRAY);
+            break;
+        case ColorMode::COLOR:
+            break;
+        }
+    };
+    toWorkingFormat(m_frame1);
+    toWorkingFormat(m_frame2);
+
+    double motionRatio = detectMotion(m_frame1);
+    m_motionActive = (motionRatio >= m_motionThreshold);
+
+    if (m_motionActive) {
+        m_motionIndicator->setText(QString::fromUtf8("\u25CF Motion %1%")
+            .arg(static_cast<int>(motionRatio * 100)));
+        m_motionIndicator->setStyleSheet("font-weight: bold; font-size: 13px; color: #ff4444;");
+    }
+    else {
+        m_motionIndicator->setText(QString::fromUtf8("\u25CF Static %1%")
+            .arg(static_cast<int>(motionRatio * 100)));
+        m_motionIndicator->setStyleSheet("font-weight: bold; font-size: 13px; color: #44ff44;");
+    }
+
+    if (m_motionActive) {
+        while (m_frameBuffer1.size() > 2) m_frameBuffer1.pop_front();
+        while (m_frameBuffer2.size() > 2) m_frameBuffer2.pop_front();
+    }
+
+    m_frameBuffer1.push_back(m_frame1.clone());
+    m_frameBuffer2.push_back(m_frame2.clone());
+
+    while (static_cast<int>(m_frameBuffer1.size()) > m_bufferSize)
+        m_frameBuffer1.pop_front();
+    while (static_cast<int>(m_frameBuffer2.size()) > m_bufferSize)
+        m_frameBuffer2.pop_front();
+
+    cv::Mat denoised1 = applyTemporalDenoise();
+
+    cv::Mat denoised2;
+    if (m_frameBuffer2.size() == 1) {
+        denoised2 = m_frameBuffer2.front().clone();
+    }
+    else {
+        int cvType = (m_frameBuffer2.front().channels() == 3) ? CV_32FC3 : CV_32F;
+        cv::Mat acc2;
+        m_frameBuffer2.front().convertTo(acc2, cvType);
+        for (size_t i = 1; i < m_frameBuffer2.size(); ++i) {
+            cv::Mat tmp;
+            m_frameBuffer2[i].convertTo(tmp, cvType);
+            acc2 += tmp;
+        }
+        acc2 /= static_cast<double>(m_frameBuffer2.size());
+        acc2.convertTo(denoised2, m_frameBuffer2.front().type());
+    }
+
+    m_frame1 = denoised1;
+    m_frame2 = denoised2;
+
+    if (m_chkFusion->isChecked() && m_isAligned && !m_eccWarpMatrix.empty()) {
+        try {
+            cv::Mat aligned2;
+            cv::warpAffine(m_frame2, aligned2, m_eccWarpMatrix, m_frame1.size(),
+                           cv::INTER_LINEAR | cv::WARP_INVERSE_MAP);
+            m_frame1 = fuseCameras(m_frame1, aligned2);
+        }
+        catch (const cv::Exception& e) {
+            std::cerr << "Fusion warp error: " << e.what() << std::endl;
+        }
+    }
+
+    if (m_chkBilateral->isChecked()) {
+        m_frame1 = applyBilateral(m_frame1);
+        m_frame2 = applyBilateral(m_frame2);
     }
 
     double focus1 = calculateFocus(m_frame1);
@@ -320,11 +630,16 @@ void MainWindow::updateFrames()
     for (const auto& p : m_seriesCam2->points()) maxFocus = std::max(maxFocus, p.y());
 
     auto axisY = m_chart->axes(Qt::Vertical).first();
-    axisY->setRange(0, std::max(100.0, maxFocus * 1.1));
+    if (maxFocus > 10.0) {
+        axisY->setRange(0, maxFocus * 1.1);
+    }
 
-    m_statusBar->showMessage(QString("Focus Cam1: %1 | Focus Cam2: %2")
+    m_statusBar->showMessage(QString("F1: %1 | F2: %2 | Buf: %3/%4 | Motion: %5%")
         .arg(static_cast<int>(focus1))
-        .arg(static_cast<int>(focus2)));
+        .arg(static_cast<int>(focus2))
+        .arg(m_frameBuffer1.size())
+        .arg(m_bufferSize)
+        .arg(static_cast<int>(motionRatio * 100)));
 
     updateView();
 }
@@ -337,12 +652,13 @@ void MainWindow::updateView()
     cv::Mat f2 = m_frame2.clone();
     cv::Mat alignedF2 = f2;
 
-    if (m_chkAlign->isChecked() && m_isAligned && !m_homography.empty()) {
+    if (m_chkAlign->isChecked() && m_isAligned && !m_eccWarpMatrix.empty()) {
         try {
-            cv::warpPerspective(f2, alignedF2, m_homography, f1.size());
+            cv::warpAffine(f2, alignedF2, m_eccWarpMatrix, f1.size(),
+                           cv::INTER_LINEAR | cv::WARP_INVERSE_MAP);
         }
         catch (const cv::Exception& e) {
-            std::cerr << "Warp failed: " << e.what() << std::endl;
+            std::cerr << "Warp error: " << e.what() << std::endl;
             alignedF2 = f2;
         }
     }
@@ -358,17 +674,8 @@ void MainWindow::updateView()
     {
         m_splitter->hide();
         m_resultView->show();
-        cv::Mat diff;
 
-        if (alignedF2.size() != f1.size()) cv::resize(alignedF2, alignedF2, f1.size());
-
-        cv::absdiff(f1, alignedF2, diff);
-        cv::cvtColor(diff, diff, cv::COLOR_BGR2GRAY);
-        cv::normalize(diff, diff, 0, 255, cv::NORM_MINMAX);
-
-        // Apply heatmap for better visualization of differences
-        cv::applyColorMap(diff, diff, cv::COLORMAP_JET);
-
+        cv::Mat diff = applyDiffView(f1, alignedF2);
         displayMat(m_resultView, diff);
     }
 }
@@ -376,33 +683,53 @@ void MainWindow::updateView()
 void MainWindow::calibrateAlignment()
 {
     if (!m_camerasOpen) {
-        m_statusBar->showMessage("Cameras are closed. Cannot calibrate.", 3000);
+        m_statusBar->showMessage("Cameras closed.", 2000);
         return;
     }
 
-    // Capture fresh frames for calibration to ensure sync
     cv::Mat f1, f2;
-    m_cap1.read(f1);
-    m_cap2.read(f2);
+    for (int i = 0; i < 5; ++i) {
+        m_cap1.read(f1);
+        m_cap2.read(f2);
+        QApplication::processEvents();
+    }
 
     if (f1.empty() || f2.empty()) {
         m_statusBar->showMessage("Calibration failed: Empty frames.", 3000);
         return;
     }
 
-    m_statusBar->showMessage("Calibrating alignment... please wait.");
+    cv::Mat gray1, gray2;
+    if (f1.channels() == 3) cv::cvtColor(f1, gray1, cv::COLOR_BGR2GRAY);
+    else gray1 = f1.clone();
+    if (f2.channels() == 3) cv::cvtColor(f2, gray2, cv::COLOR_BGR2GRAY);
+    else gray2 = f2.clone();
+
+    if (calculateFocus(gray1) < 5.0) {
+        m_statusBar->showMessage("Error: Too dark for calibration!", 4000);
+        return;
+    }
+
+    m_statusBar->showMessage("Calibrating (ECC)... please wait.");
     QApplication::processEvents();
 
-    cv::Mat h;
-    if (computeHomography(f1, f2, h)) {
-        m_homography = h;
+    cv::Mat warpMatrix = cv::Mat::eye(2, 3, CV_32F);
+    cv::TermCriteria criteria(
+        cv::TermCriteria::COUNT | cv::TermCriteria::EPS,
+        100, 1e-4);
+
+    try {
+        cv::findTransformECC(gray1, gray2, warpMatrix,
+                             cv::MOTION_AFFINE, criteria);
+        m_eccWarpMatrix = warpMatrix;
         m_isAligned = true;
-        m_statusBar->showMessage("Alignment calibrated successfully.", 3000);
+        m_statusBar->showMessage("Alignment OK (ECC)!", 3000);
     }
-    else {
-        m_homography.release();
+    catch (const cv::Exception& e) {
+        m_eccWarpMatrix.release();
         m_isAligned = false;
-        m_statusBar->showMessage("Calibration failed: Not enough matches found.", 5000);
+        m_statusBar->showMessage(
+            "ECC failed: " + QString::fromStdString(e.what()), 4000);
     }
 }
 
@@ -417,53 +744,6 @@ double MainWindow::calculateFocus(const cv::Mat& frame)
     cv::Scalar mean, stddev;
     cv::meanStdDev(lap, mean, stddev);
     return stddev.val[0] * stddev.val[0];
-}
-
-bool MainWindow::computeHomography(const cv::Mat& img1, const cv::Mat& img2, cv::Mat& outHomography)
-{
-    if (img1.empty() || img2.empty()) return false;
-
-    cv::Mat gray1, gray2;
-    cv::cvtColor(img1, gray1, cv::COLOR_BGR2GRAY);
-    cv::cvtColor(img2, gray2, cv::COLOR_BGR2GRAY);
-
-    std::vector<cv::KeyPoint> keypoints1, keypoints2;
-    cv::Mat descriptors1, descriptors2;
-
-    m_orb->detectAndCompute(gray1, cv::noArray(), keypoints1, descriptors1);
-    m_orb->detectAndCompute(gray2, cv::noArray(), keypoints2, descriptors2);
-
-    if (descriptors1.empty() || descriptors2.empty() || descriptors1.rows < 4 || descriptors2.rows < 4) {
-        return false;
-    }
-
-    if (descriptors1.type() != CV_8U) descriptors1.convertTo(descriptors1, CV_8U);
-    if (descriptors2.type() != CV_8U) descriptors2.convertTo(descriptors2, CV_8U);
-
-    std::vector<std::vector<cv::DMatch>> knn_matches;
-    m_matcher->knnMatch(descriptors2, descriptors1, knn_matches, 2);
-
-    std::vector<cv::DMatch> good_matches;
-    const float ratio_thresh = 0.75f;
-    for (size_t i = 0; i < knn_matches.size(); i++) {
-        if (knn_matches[i].size() > 1 && knn_matches[i][0].distance < ratio_thresh * knn_matches[i][1].distance) {
-            good_matches.push_back(knn_matches[i][0]);
-        }
-    }
-
-    if (good_matches.size() < 10) return false;
-
-    std::vector<cv::Point2f> points1, points2;
-    for (size_t i = 0; i < good_matches.size(); i++) {
-        points2.push_back(keypoints2[good_matches[i].queryIdx].pt);
-        points1.push_back(keypoints1[good_matches[i].trainIdx].pt);
-    }
-
-    cv::Mat h = cv::findHomography(points2, points1, cv::RANSAC, 5.0);
-    if (h.empty()) return false;
-
-    outHomography = h;
-    return true;
 }
 
 void MainWindow::displayMat(QLabel* label, const cv::Mat& mat)
