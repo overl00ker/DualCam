@@ -9,9 +9,11 @@
 
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
+#include <opencv2/imgproc.hpp>
 #include <opencv2/video/background_segm.hpp>
 
 #include <deque>
+#include <QString>
 
 class QWidget;
 class QVBoxLayout;
@@ -23,9 +25,10 @@ class QStatusBar;
 class QComboBox;
 class QCheckBox;
 class QSplitter;
-class QTabWidget;
 class QSpinBox;
 class QSlider;
+class QGroupBox;
+class QStackedWidget;
 
 enum class ColorMode { GRAY_NATIVE, GRAY_CV, COLOR };
 
@@ -43,9 +46,12 @@ private slots:
     void updateFrames();
     void updateView();
     void calibrateAlignment();
+    void showPeakIntensities();
+    void saveDiffSnapshot();
 
 private:
     void initUI();
+
     void displayMat(QLabel* label, const cv::Mat& mat);
     double calculateFocus(const cv::Mat& frame);
 
@@ -65,14 +71,16 @@ private:
     cv::Mat m_frame1;
     cv::Mat m_frame2;
     cv::Mat m_eccWarpMatrix;
+    cv::Mat m_lastDiffResult;
 
     bool m_camerasOpen = false;
     bool m_isAligned = false;
+    bool m_isDiffMode = false;
     qint64 m_frameCount = 0;
     int m_maxHistory = 200;
 
-    QCheckBox* m_chkFlipVer2 = nullptr;
-    QCheckBox* m_chkFlipHor2 = nullptr;
+    double m_lastFocus1 = 0.0;
+    double m_lastFocus2 = 0.0;
 
     cv::Ptr<cv::BackgroundSubtractorMOG2> m_bgSubtractor;
     std::deque<cv::Mat> m_frameBuffer1;
@@ -86,17 +94,25 @@ private:
     ColorMode m_colorMode = ColorMode::GRAY_CV;
 
     QWidget* m_centralWidget;
-    QTabWidget* m_tabWidget;
+    QStackedWidget* m_stackedWidget;
+    QWidget* m_controlsWidget;
+
+    QPushButton* m_navCalibrate;
+    QPushButton* m_navLiveView;
+    QPushButton* m_navFocus;
+    QPushButton* m_navMode;
 
     QLabel* m_view1;
     QLabel* m_view2;
     QLabel* m_resultView;
     QSplitter* m_splitter;
+
     QPushButton* m_btnToggleCameras;
-    QComboBox* m_comboViewMode;
     QComboBox* m_comboColorMode;
     QCheckBox* m_chkAlign;
     QPushButton* m_btnCalibrateAlign;
+    QCheckBox* m_chkFlipVer2;
+    QCheckBox* m_chkFlipHor2;
 
     QSlider* m_bufferSlider;
     QLabel* m_bufferLabel;
@@ -109,6 +125,10 @@ private:
     QSlider* m_noiseFloorSlider;
     QLabel* m_noiseFloorLabel;
     QCheckBox* m_chkStretch;
+
+    QPushButton* m_btnPeakIntensities;
+    QPushButton* m_btnSaveDiff;
+    QLabel* m_lblPeakInfo;
 
     QChartView* m_chartView;
     QChart* m_chart;
