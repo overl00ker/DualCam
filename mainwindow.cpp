@@ -76,21 +76,26 @@ void MainWindow::initUI()
     m_navCalibrate = new QPushButton("Calibrate", this);
     m_navFocus = new QPushButton("Focus", this);
     m_navLiveView = new QPushButton("Live View", this);
-    m_navMode = new QPushButton("Mode: Dual View", this);
+    m_navMode = new QPushButton("Dual View", this);
     m_navMode->setCheckable(true);
 
-    QString navStyle = "QPushButton { font-weight: bold; font-size: 16px; padding: 12px; min-width: 120px; }";
+    QString navStyle = "QPushButton { font-weight: bold; font-size: 14px; padding: 8px 4px; }";
     m_btnToggleCameras->setStyleSheet(navStyle);
     m_navCalibrate->setStyleSheet(navStyle);
     m_navFocus->setStyleSheet(navStyle);
     m_navLiveView->setStyleSheet(navStyle);
     m_navMode->setStyleSheet(navStyle + " QPushButton:checked { background-color: #2196F3; color: white; border: none; }");
 
+    m_btnToggleCameras->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_navCalibrate->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_navFocus->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_navLiveView->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_navMode->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+
     navBarLayout->addWidget(m_btnToggleCameras);
     navBarLayout->addWidget(m_navCalibrate);
     navBarLayout->addWidget(m_navFocus);
     navBarLayout->addWidget(m_navLiveView);
-    navBarLayout->addStretch();
     navBarLayout->addWidget(m_navMode);
 
     mainLayout->addLayout(navBarLayout);
@@ -340,7 +345,7 @@ void MainWindow::initUI()
     diffGroup->hide();
     connect(m_navMode, &QPushButton::toggled, this, [this, diffGroup](bool checked) {
         m_isDiffMode = checked;
-        m_navMode->setText(checked ? "Mode: Diff View" : "Mode: Dual View");
+        m_navMode->setText(checked ? "Diff View" : "Dual View");
         diffGroup->setVisible(checked);
         if (!checked) m_lblPeakInfo->clear();
         updateView();
