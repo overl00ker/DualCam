@@ -13,6 +13,8 @@
 #include <opencv2/video/background_segm.hpp>
 
 #include <deque>
+#include <thread>
+#include <atomic>
 #include <QString>
 
 class QWidget;
@@ -46,7 +48,6 @@ private slots:
     void updateFrames();
     void updateView();
     void calibrateAlignment();
-    void showPeakIntensities();
     void saveDiffSnapshot();
 
 private:
@@ -56,7 +57,7 @@ private:
     double calculateFocus(const cv::Mat& frame);
 
     double detectMotion(const cv::Mat& frame);
-    cv::Mat applyTemporalDenoise();
+    cv::Mat applyTemporalDenoise(const std::deque<cv::Mat>& buffer);
     cv::Mat fuseCameras(const cv::Mat& a, const cv::Mat& b);
     cv::Mat applyBilateral(const cv::Mat& src);
     cv::Mat applyDiffView(const cv::Mat& d1, const cv::Mat& d2);
@@ -89,7 +90,6 @@ private:
     double m_motionThreshold = 0.05;
     bool m_motionActive = false;
     int m_noiseFloor = 15;
-    bool m_diffStretch = false;
 
     ColorMode m_colorMode = ColorMode::GRAY_CV;
 
@@ -113,6 +113,7 @@ private:
     QPushButton* m_btnCalibrateAlign;
     QCheckBox* m_chkFlipVer2;
     QCheckBox* m_chkFlipHor2;
+    QLabel* m_eccIndicator;
 
     QSlider* m_bufferSlider;
     QLabel* m_bufferLabel;
@@ -137,6 +138,9 @@ private:
     QSpinBox* m_historySpinBox;
 
     QStatusBar* m_statusBar;
+
+    std::thread m_calibThread;
+    std::atomic<bool> m_calibrating{false};
 };
 
 #endif

@@ -22,6 +22,7 @@
 #include <QDateTime>
 #include <QGroupBox>
 #include <QStackedWidget>
+#include <QScrollArea>
 #include <QtCharts/QValueAxis>
 #include <QtCharts/QChart>
 #include <QtCharts/QLegend>
@@ -39,6 +40,7 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
     cv::setUseOptimized(true);
+    cv::setNumThreads(cv::getNumberOfCPUs());
 
     m_bgSubtractor = cv::createBackgroundSubtractorMOG2(500, 16.0, false);
 
@@ -51,12 +53,13 @@ MainWindow::MainWindow(QWidget* parent)
 MainWindow::~MainWindow()
 {
     closeCameras();
+    if (m_calibThread.joinable()) m_calibThread.join();
 }
 
 void MainWindow::initUI()
 {
     setWindowTitle("DualCam Analysis Tool");
-    setGeometry(100, 100, 1380, 900);
+    setMinimumSize(640, 400);
 
     m_centralWidget = new QWidget(this);
     setCentralWidget(m_centralWidget);
@@ -79,12 +82,12 @@ void MainWindow::initUI()
     m_navMode = new QPushButton("Dual View", this);
     m_navMode->setCheckable(true);
 
-    QString navStyle = "QPushButton { font-weight: bold; font-size: 14px; padding: 8px 4px; }";
+    QString navStyle = "QPushButton { font-weight: bold; font-size: 12px; padding: 5px 3px; }";
     m_btnToggleCameras->setStyleSheet(navStyle);
     m_navCalibrate->setStyleSheet(navStyle);
     m_navFocus->setStyleSheet(navStyle);
     m_navLiveView->setStyleSheet(navStyle);
-    m_navMode->setStyleSheet(navStyle + " QPushButton:checked { background-color: #2196F3; color: white; border: none; }");
+    m_navMode->setStyleSheet(navStyle);
 
     m_btnToggleCameras->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_navCalibrate->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
@@ -137,8 +140,11 @@ void MainWindow::initUI()
     connect(m_chkAlign, &QCheckBox::stateChanged, this, &MainWindow::updateView);
     m_btnCalibrateAlign = new QPushButton("Calibrate ECC", this);
     connect(m_btnCalibrateAlign, &QPushButton::clicked, this, &MainWindow::calibrateAlignment);
+    m_eccIndicator = new QLabel(QString::fromUtf8("\u25CF No ECC"), this);
+    m_eccIndicator->setStyleSheet("font-weight: bold; color: #ff4444;");
     camBot->addWidget(m_chkAlign);
     camBot->addWidget(m_btnCalibrateAlign);
+    camBot->addWidget(m_eccIndicator);
     camLayout->addLayout(camBot);
 
     panelsLayout->addWidget(camGroup);
@@ -230,7 +236,13 @@ void MainWindow::initUI()
     panelsLayout->addWidget(diffGroup);
     panelsLayout->addStretch();
 
-    videoPageLayout->addWidget(m_controlsWidget);
+    QScrollArea* controlsScroll = new QScrollArea();
+    controlsScroll->setWidget(m_controlsWidget);
+    controlsScroll->setWidgetResizable(true);
+    controlsScroll->setMaximumHeight(140);
+    controlsScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    controlsScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    videoPageLayout->addWidget(controlsScroll);
 
     QWidget* videoAreaWidget = new QWidget();
     QVBoxLayout* videoAreaLayout = new QVBoxLayout(videoAreaWidget);
@@ -241,14 +253,14 @@ void MainWindow::initUI()
     m_view1 = new QLabel("Camera 1", this);
     m_view1->setScaledContents(true);
     m_view1->setAlignment(Qt::AlignCenter);
-    m_view1->setMinimumSize(320, 240);
+    m_view1->setMinimumSize(160, 120);
     m_view1->setStyleSheet("background-color: black; color: white;");
     m_splitter->addWidget(m_view1);
 
     m_view2 = new QLabel("Camera 2", this);
     m_view2->setScaledContents(true);
     m_view2->setAlignment(Qt::AlignCenter);
-    m_view2->setMinimumSize(320, 240);
+    m_view2->setMinimumSize(160, 120);
     m_view2->setStyleSheet("background-color: black; color: white;");
     m_splitter->addWidget(m_view2);
 
@@ -257,7 +269,7 @@ void MainWindow::initUI()
     m_resultView = new QLabel("Result View", this);
     m_resultView->setScaledContents(true);
     m_resultView->setAlignment(Qt::AlignCenter);
-    m_resultView->setMinimumSize(640, 480);
+    m_resultView->setMinimumSize(160, 120);
     m_resultView->setStyleSheet("background-color: black; color: white;");
     videoAreaLayout->addWidget(m_resultView, 1);
     m_resultView->hide();
@@ -271,13 +283,19 @@ void MainWindow::initUI()
 
     m_chart = new QChart();
     m_chart->setTitle("Live Focus Analysis");
+    m_chart->setBackgroundBrush(QBrush(QColor(0x1e, 0x1e, 0x1e)));
+    m_chart->setPlotAreaBackgroundBrush(QBrush(QColor(0x25, 0x25, 0x25)));
+    m_chart->setPlotAreaBackgroundVisible(true);
+    m_chart->setTitleBrush(QBrush(QColor(0xd4, 0xd4, 0xd4)));
     m_chartView = new QChartView(m_chart);
     m_chartView->setRenderHint(QPainter::Antialiasing);
 
     m_seriesCam1 = new QLineSeries();
     m_seriesCam1->setName("Camera 1 Focus");
+    m_seriesCam1->setColor(QColor(0x4e, 0xc9, 0xb0));
     m_seriesCam2 = new QLineSeries();
     m_seriesCam2->setName("Camera 2 Focus");
+    m_seriesCam2->setColor(QColor(0xce, 0x91, 0x78));
 
     m_chart->addSeries(m_seriesCam1);
     m_chart->addSeries(m_seriesCam2);
@@ -286,11 +304,17 @@ void MainWindow::initUI()
     axisX->setTitleText("Time (Frames)");
     axisX->setRange(0, m_maxHistory);
     axisX->setTickCount(10);
+    axisX->setLabelsColor(QColor(0xd4, 0xd4, 0xd4));
+    axisX->setTitleBrush(QBrush(QColor(0xa0, 0xa0, 0xa0)));
+    axisX->setGridLineColor(QColor(0x3c, 0x3c, 0x3c));
     m_chart->addAxis(axisX, Qt::AlignBottom);
 
     QValueAxis* axisY = new QValueAxis;
     axisY->setTitleText("Focus Score");
     axisY->setRange(0, 5000);
+    axisY->setLabelsColor(QColor(0xd4, 0xd4, 0xd4));
+    axisY->setTitleBrush(QBrush(QColor(0xa0, 0xa0, 0xa0)));
+    axisY->setGridLineColor(QColor(0x3c, 0x3c, 0x3c));
     m_chart->addAxis(axisY, Qt::AlignLeft);
 
     m_seriesCam1->attachAxis(axisX);
@@ -300,6 +324,7 @@ void MainWindow::initUI()
 
     m_chart->legend()->setVisible(true);
     m_chart->legend()->setAlignment(Qt::AlignBottom);
+    m_chart->legend()->setLabelColor(QColor(0xd4, 0xd4, 0xd4));
 
     focusLayout->addWidget(m_chartView);
 
@@ -328,14 +353,14 @@ void MainWindow::initUI()
 
     m_stackedWidget->addWidget(focusPage);
 
-    connect(m_navCalibrate, &QPushButton::clicked, this, [this]() {
+    connect(m_navCalibrate, &QPushButton::clicked, this, [this, controlsScroll]() {
         m_stackedWidget->setCurrentIndex(0);
-        m_controlsWidget->show();
+        controlsScroll->show();
         });
 
-    connect(m_navLiveView, &QPushButton::clicked, this, [this]() {
+    connect(m_navLiveView, &QPushButton::clicked, this, [this, controlsScroll]() {
         m_stackedWidget->setCurrentIndex(0);
-        m_controlsWidget->hide();
+        controlsScroll->hide();
         });
 
     connect(m_navFocus, &QPushButton::clicked, this, [this]() {
@@ -386,13 +411,14 @@ QStringList MainWindow::getLibCameraIds()
 std::string MainWindow::makeGStreamerPipeline(const QString& cameraId, int width, int height, int fps)
 {
     return QString("libcamerasrc camera-name=%1 ! "
-        "video/x-raw, width=%2, height=%3, format=NV12 ! "
+        "video/x-raw, width=%2, height=%3, framerate=%4/1, format=NV12 ! "
         "videoconvert ! "
         "video/x-raw, format=(string)BGR ! "
         "appsink drop=1 sync=false")
         .arg(cameraId)
         .arg(width)
         .arg(height)
+        .arg(fps)
         .toStdString();
 }
 
@@ -412,6 +438,11 @@ void MainWindow::openCameras()
         m_cap1.open(0, cv::CAP_DSHOW);
         m_cap2.open(1, cv::CAP_DSHOW);
 #endif
+        for (auto* cap : {&m_cap1, &m_cap2}) {
+            cap->set(cv::CAP_PROP_FRAME_WIDTH, 640);
+            cap->set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+            cap->set(cv::CAP_PROP_FPS, 30);
+        }
     }
     else {
         std::string pipe1 = makeGStreamerPipeline(camPaths[0], 640, 480, 30);
@@ -433,6 +464,8 @@ void MainWindow::openCameras()
     m_isAligned = false;
     m_eccWarpMatrix.release();
     m_btnToggleCameras->setText("Close Cameras");
+    m_eccIndicator->setText(QString::fromUtf8("\u25CF No ECC"));
+    m_eccIndicator->setStyleSheet("font-weight: bold; color: #ff4444;");
 
     m_frameBuffer1.clear();
     m_frameBuffer2.clear();
@@ -467,6 +500,8 @@ void MainWindow::closeCameras()
 
     m_motionIndicator->setText(QString::fromUtf8("\u25CF Idle"));
     m_motionIndicator->setStyleSheet("font-weight: bold; color: gray;");
+    m_eccIndicator->setText(QString::fromUtf8("\u25CF No ECC"));
+    m_eccIndicator->setStyleSheet("font-weight: bold; color: #ff4444;");
 
     m_statusBar->showMessage("Cameras closed.", 2000);
 }
@@ -487,36 +522,36 @@ double MainWindow::detectMotion(const cv::Mat& frame)
     cv::Mat fgMask;
     m_bgSubtractor->apply(smallGray, fgMask);
 
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    static const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
     cv::morphologyEx(fgMask, fgMask, cv::MORPH_OPEN, kernel);
 
     int nonZero = cv::countNonZero(fgMask);
     return static_cast<double>(nonZero) / (smallGray.rows * smallGray.cols);
 }
 
-cv::Mat MainWindow::applyTemporalDenoise()
+cv::Mat MainWindow::applyTemporalDenoise(const std::deque<cv::Mat>& buffer)
 {
-    if (m_frameBuffer1.empty()) return cv::Mat();
+    if (buffer.empty()) return cv::Mat();
 
-    if (m_frameBuffer1.size() == 1) {
-        return m_frameBuffer1.front().clone();
+    if (buffer.size() == 1) {
+        return buffer.front().clone();
     }
 
-    int cvType = (m_frameBuffer1.front().channels() == 3) ? CV_32FC3 : CV_32F;
+    int cvType = (buffer.front().channels() == 3) ? CV_32FC3 : CV_32F;
 
     cv::Mat accumulator;
-    m_frameBuffer1.front().convertTo(accumulator, cvType);
+    buffer.front().convertTo(accumulator, cvType);
 
-    for (size_t i = 1; i < m_frameBuffer1.size(); ++i) {
+    for (size_t i = 1; i < buffer.size(); ++i) {
         cv::Mat tmp;
-        m_frameBuffer1[i].convertTo(tmp, cvType);
+        buffer[i].convertTo(tmp, cvType);
         accumulator += tmp;
     }
 
-    accumulator /= static_cast<double>(m_frameBuffer1.size());
+    accumulator /= static_cast<double>(buffer.size());
 
     cv::Mat result;
-    accumulator.convertTo(result, m_frameBuffer1.front().type());
+    accumulator.convertTo(result, buffer.front().type());
     return result;
 }
 
@@ -553,7 +588,7 @@ cv::Mat MainWindow::applyDiffView(const cv::Mat& d1, const cv::Mat& d2)
         cv::threshold(diff, diff, m_noiseFloor, 255, cv::THRESH_TOZERO);
     }
 
-    if (m_diffStretch || (m_chkStretch && m_chkStretch->isChecked())) {
+    if (m_chkStretch && m_chkStretch->isChecked()) {
         cv::normalize(diff, diff, 0, 255, cv::NORM_MINMAX);
     }
 
@@ -572,10 +607,10 @@ void MainWindow::updateFrames()
     if (m_frame1.empty() || m_frame2.empty()) return;
 
     if (m_chkFlipHor2 && m_chkFlipHor2->isChecked()) {
-        cv::flip(m_frame2, m_frame2, 0);
+        cv::flip(m_frame2, m_frame2, 1);
     }
     if (m_chkFlipVer2 && m_chkFlipVer2->isChecked()) {
-        cv::flip(m_frame2, m_frame2, 1);
+        cv::flip(m_frame2, m_frame2, 0);
     }
 
     auto toWorkingFormat = [&](cv::Mat& frame) {
@@ -620,24 +655,8 @@ void MainWindow::updateFrames()
     while (static_cast<int>(m_frameBuffer2.size()) > m_bufferSize)
         m_frameBuffer2.pop_front();
 
-    cv::Mat denoised1 = applyTemporalDenoise();
-
-    cv::Mat denoised2;
-    if (m_frameBuffer2.size() == 1) {
-        denoised2 = m_frameBuffer2.front().clone();
-    }
-    else {
-        int cvType = (m_frameBuffer2.front().channels() == 3) ? CV_32FC3 : CV_32F;
-        cv::Mat acc2;
-        m_frameBuffer2.front().convertTo(acc2, cvType);
-        for (size_t i = 1; i < m_frameBuffer2.size(); ++i) {
-            cv::Mat tmp;
-            m_frameBuffer2[i].convertTo(tmp, cvType);
-            acc2 += tmp;
-        }
-        acc2 /= static_cast<double>(m_frameBuffer2.size());
-        acc2.convertTo(denoised2, m_frameBuffer2.front().type());
-    }
+    cv::Mat denoised1 = applyTemporalDenoise(m_frameBuffer1);
+    cv::Mat denoised2 = applyTemporalDenoise(m_frameBuffer2);
 
     m_frame1 = denoised1;
     m_frame2 = denoised2;
@@ -672,13 +691,15 @@ void MainWindow::updateFrames()
     auto axisX = m_chart->axes(Qt::Horizontal).first();
     axisX->setRange(std::max(0LL, m_frameCount - m_maxHistory), m_frameCount);
 
-    double maxFocus = 0.0;
-    for (const auto& p : m_seriesCam1->points()) maxFocus = std::max(maxFocus, p.y());
-    for (const auto& p : m_seriesCam2->points()) maxFocus = std::max(maxFocus, p.y());
+    if (m_frameCount % 10 == 0) {
+        double maxFocus = 0.0;
+        for (const auto& p : m_seriesCam1->points()) maxFocus = std::max(maxFocus, p.y());
+        for (const auto& p : m_seriesCam2->points()) maxFocus = std::max(maxFocus, p.y());
 
-    auto axisY = m_chart->axes(Qt::Vertical).first();
-    if (maxFocus > 10.0) {
-        axisY->setRange(0, maxFocus * 1.1);
+        auto axisY = m_chart->axes(Qt::Vertical).first();
+        if (maxFocus > 10.0) {
+            axisY->setRange(0, maxFocus * 1.1);
+        }
     }
 
     m_statusBar->showMessage(QString("Frames processed: %1 | Buffer: %2/%3")
@@ -793,11 +814,15 @@ void MainWindow::calibrateAlignment()
         return;
     }
 
+    if (m_calibrating) {
+        m_statusBar->showMessage("Calibration already in progress...", 2000);
+        return;
+    }
+
     cv::Mat f1, f2;
     for (int i = 0; i < 5; ++i) {
         m_cap1.read(f1);
         m_cap2.read(f2);
-        QApplication::processEvents();
     }
 
     if (f1.empty() || f2.empty()) {
@@ -816,27 +841,51 @@ void MainWindow::calibrateAlignment()
         return;
     }
 
+    m_calibrating = true;
+    m_btnCalibrateAlign->setEnabled(false);
+    m_eccIndicator->setText(QString::fromUtf8("\u25CF Calibrating..."));
+    m_eccIndicator->setStyleSheet("font-weight: bold; color: #ffaa00;");
     m_statusBar->showMessage("Calibrating (ECC)... please wait.");
-    QApplication::processEvents();
 
-    cv::Mat warpMatrix = cv::Mat::eye(2, 3, CV_32F);
-    cv::TermCriteria criteria(
-        cv::TermCriteria::COUNT | cv::TermCriteria::EPS,
-        100, 1e-4);
+    if (m_calibThread.joinable()) m_calibThread.join();
 
-    try {
-        cv::findTransformECC(gray1, gray2, warpMatrix,
-            cv::MOTION_AFFINE, criteria);
-        m_eccWarpMatrix = warpMatrix;
-        m_isAligned = true;
-        m_statusBar->showMessage("Alignment OK (ECC)!", 3000);
-    }
-    catch (const cv::Exception& e) {
-        m_eccWarpMatrix.release();
-        m_isAligned = false;
-        m_statusBar->showMessage(
-            "ECC failed: " + QString::fromStdString(e.what()), 4000);
-    }
+    m_calibThread = std::thread([this, gray1 = std::move(gray1), gray2 = std::move(gray2)]() {
+        cv::Mat warpMatrix = cv::Mat::eye(2, 3, CV_32F);
+        cv::TermCriteria criteria(
+            cv::TermCriteria::COUNT | cv::TermCriteria::EPS,
+            100, 1e-4);
+
+        bool success = false;
+        QString errorMsg;
+        try {
+            cv::findTransformECC(gray1, gray2, warpMatrix,
+                cv::MOTION_AFFINE, criteria);
+            success = true;
+        }
+        catch (const cv::Exception& e) {
+            errorMsg = QString::fromStdString(e.what());
+        }
+
+        cv::Mat resultMatrix = success ? warpMatrix : cv::Mat();
+        QMetaObject::invokeMethod(this, [this, success, resultMatrix, errorMsg]() {
+            if (success) {
+                m_eccWarpMatrix = resultMatrix;
+                m_isAligned = true;
+                m_eccIndicator->setText(QString::fromUtf8("\u25CF ECC Ready"));
+                m_eccIndicator->setStyleSheet("font-weight: bold; color: #44ff44;");
+                m_statusBar->showMessage("Alignment OK (ECC)!", 3000);
+            }
+            else {
+                m_eccWarpMatrix.release();
+                m_isAligned = false;
+                m_eccIndicator->setText(QString::fromUtf8("\u25CF ECC Failed"));
+                m_eccIndicator->setStyleSheet("font-weight: bold; color: #ff4444;");
+                m_statusBar->showMessage("ECC failed: " + errorMsg, 4000);
+            }
+            m_btnCalibrateAlign->setEnabled(true);
+            m_calibrating = false;
+        });
+    });
 }
 
 double MainWindow::calculateFocus(const cv::Mat& frame)
@@ -856,26 +905,18 @@ void MainWindow::displayMat(QLabel* label, const cv::Mat& mat)
 {
     if (mat.empty() || label == nullptr) return;
 
-    QImage::Format format = QImage::Format_RGB888;
-    cv::Mat tempMat;
-
     if (mat.channels() == 1) {
-        format = QImage::Format_Grayscale8;
-        tempMat = mat.clone();
+        QImage img(mat.data, mat.cols, mat.rows, static_cast<int>(mat.step), QImage::Format_Grayscale8);
+        label->setPixmap(QPixmap::fromImage(img));
     }
     else if (mat.channels() == 3) {
-        cv::cvtColor(mat, tempMat, cv::COLOR_BGR2RGB);
+        cv::Mat rgb;
+        cv::cvtColor(mat, rgb, cv::COLOR_BGR2RGB);
+        QImage img(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
+        label->setPixmap(QPixmap::fromImage(img));
     }
-    else {
-        return;
-    }
-
-    QImage img(tempMat.data, tempMat.cols, tempMat.rows, static_cast<int>(tempMat.step), format);
-    label->setPixmap(QPixmap::fromImage(img));
 }
 
-void MainWindow::showPeakIntensities()
-{}
 
 void MainWindow::saveDiffSnapshot()
 {
