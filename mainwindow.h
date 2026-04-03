@@ -31,6 +31,7 @@ class QSpinBox;
 class QSlider;
 class QGroupBox;
 class QStackedWidget;
+class QLineEdit;
 
 enum class ColorMode { GRAY_NATIVE, GRAY_CV, COLOR };
 
@@ -48,10 +49,12 @@ private slots:
     void updateFrames();
     void updateView();
     void calibrateAlignment();
-    void saveDiffSnapshot();
+    void saveSnapshot();
 
 private:
     void initUI();
+    void saveDiffSnapshot();
+    void saveDualSnapshot(bool combined);
 
     void displayMat(QLabel* label, const cv::Mat& mat);
     double calculateFocus(const cv::Mat& frame);
@@ -64,6 +67,13 @@ private:
 
     QStringList getLibCameraIds();
     std::string makeGStreamerPipeline(const QString& cameraId, int width, int height, int fps);
+
+    void saveSettings();
+    void loadSettings();
+    void savePreset(const QString& name);
+    void loadPreset(const QString& name);
+    void deletePreset(const QString& name);
+    void refreshPresetList();
 
     cv::VideoCapture m_cap1;
     cv::VideoCapture m_cap2;
@@ -128,8 +138,16 @@ private:
     QCheckBox* m_chkStretch;
 
     QPushButton* m_btnPeakIntensities;
-    QPushButton* m_btnSaveDiff;
     QLabel* m_lblPeakInfo;
+
+    QComboBox* m_comboSnapshotMode;
+    QPushButton* m_btnSaveSnapshot;
+
+    QComboBox* m_comboPresets;
+    QLineEdit* m_presetNameEdit;
+    QPushButton* m_btnSavePreset;
+    QPushButton* m_btnLoadPreset;
+    QPushButton* m_btnDeletePreset;
 
     QChartView* m_chartView;
     QChart* m_chart;

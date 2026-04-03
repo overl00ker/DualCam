@@ -59,7 +59,8 @@ static const char* DARK_STYLE = R"(
     }
     QSlider::groove:horizontal { background: #3c3c3c; height: 4px; border-radius: 2px; }
     QSlider::handle:horizontal { background: #0078d4; width: 14px; margin: -5px 0; border-radius: 7px; }
-    QSpinBox {
+    QSpinBox 
+    {
         background-color: #2d2d2d;
         border: 1px solid #3c3c3c;
         border-radius: 3px;

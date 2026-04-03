@@ -23,6 +23,8 @@
 #include <QGroupBox>
 #include <QStackedWidget>
 #include <QScrollArea>
+#include <QSettings>
+#include <QLineEdit>
 #include <QtCharts/QValueAxis>
 #include <QtCharts/QChart>
 #include <QtCharts/QLegend>
@@ -48,10 +50,13 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_timer, &QTimer::timeout, this, &MainWindow::updateFrames);
 
     initUI();
+    loadSettings();
+    refreshPresetList();
 }
 
 MainWindow::~MainWindow()
 {
+    saveSettings();
     closeCameras();
     if (m_calibThread.joinable()) m_calibThread.join();
 }
@@ -95,11 +100,22 @@ void MainWindow::initUI()
     m_navLiveView->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_navMode->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
 
+    m_comboSnapshotMode = new QComboBox(this);
+    m_comboSnapshotMode->addItems({"Dual Combined", "Dual Separate", "Difference"});
+    m_comboSnapshotMode->setToolTip("Screenshot mode");
+
+    m_btnSaveSnapshot = new QPushButton("Save Snapshot", this);
+    m_btnSaveSnapshot->setStyleSheet(navStyle);
+    m_btnSaveSnapshot->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    connect(m_btnSaveSnapshot, &QPushButton::clicked, this, &MainWindow::saveSnapshot);
+
     navBarLayout->addWidget(m_btnToggleCameras);
     navBarLayout->addWidget(m_navCalibrate);
     navBarLayout->addWidget(m_navFocus);
     navBarLayout->addWidget(m_navLiveView);
     navBarLayout->addWidget(m_navMode);
+    navBarLayout->addWidget(m_comboSnapshotMode);
+    navBarLayout->addWidget(m_btnSaveSnapshot);
 
     mainLayout->addLayout(navBarLayout);
 
@@ -223,10 +239,7 @@ void MainWindow::initUI()
         if (!checked) m_lblPeakInfo->clear();
         updateView();
         });
-    m_btnSaveDiff = new QPushButton("Save Snapshot", this);
-    connect(m_btnSaveDiff, &QPushButton::clicked, this, &MainWindow::saveDiffSnapshot);
     diffBtnsLayout->addWidget(m_btnPeakIntensities);
-    diffBtnsLayout->addWidget(m_btnSaveDiff);
     diffLayout->addLayout(diffBtnsLayout);
 
     m_lblPeakInfo = new QLabel("", this);
@@ -234,6 +247,41 @@ void MainWindow::initUI()
     diffLayout->addWidget(m_lblPeakInfo);
 
     panelsLayout->addWidget(diffGroup);
+
+    QGroupBox* presetsGroup = new QGroupBox("Presets", this);
+    QVBoxLayout* presetsLayout = new QVBoxLayout(presetsGroup);
+
+    QHBoxLayout* presetSaveRow = new QHBoxLayout();
+    m_presetNameEdit = new QLineEdit(this);
+    m_presetNameEdit->setPlaceholderText("Preset name...");
+    m_btnSavePreset = new QPushButton("Save", this);
+    connect(m_btnSavePreset, &QPushButton::clicked, this, [this]() {
+        QString name = m_presetNameEdit->text().trimmed();
+        if (name.isEmpty()) name = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+        savePreset(name);
+        m_statusBar->showMessage("Preset '" + name + "' saved.", 3000);
+    });
+    presetSaveRow->addWidget(m_presetNameEdit);
+    presetSaveRow->addWidget(m_btnSavePreset);
+    presetsLayout->addLayout(presetSaveRow);
+
+    QHBoxLayout* presetLoadRow = new QHBoxLayout();
+    m_comboPresets = new QComboBox(this);
+    m_comboPresets->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_btnLoadPreset = new QPushButton("Load", this);
+    connect(m_btnLoadPreset, &QPushButton::clicked, this, [this]() {
+        loadPreset(m_comboPresets->currentText());
+    });
+    m_btnDeletePreset = new QPushButton("Delete", this);
+    connect(m_btnDeletePreset, &QPushButton::clicked, this, [this]() {
+        deletePreset(m_comboPresets->currentText());
+    });
+    presetLoadRow->addWidget(m_comboPresets);
+    presetLoadRow->addWidget(m_btnLoadPreset);
+    presetLoadRow->addWidget(m_btnDeletePreset);
+    presetsLayout->addLayout(presetLoadRow);
+
+    panelsLayout->addWidget(presetsGroup);
     panelsLayout->addStretch();
 
     QScrollArea* controlsScroll = new QScrollArea();
@@ -918,6 +966,16 @@ void MainWindow::displayMat(QLabel* label, const cv::Mat& mat)
 }
 
 
+void MainWindow::saveSnapshot()
+{
+    int mode = m_comboSnapshotMode->currentIndex();
+    if (mode == 2) {
+        saveDiffSnapshot();
+    } else {
+        saveDualSnapshot(mode == 0);
+    }
+}
+
 void MainWindow::saveDiffSnapshot()
 {
     if (m_lastDiffResult.empty()) {
@@ -939,4 +997,160 @@ void MainWindow::saveDiffSnapshot()
     else {
         m_statusBar->showMessage("Error saving snapshot to: " + filePath, 4000);
     }
+}
+
+void MainWindow::saveDualSnapshot(bool combined)
+{
+    if (m_frame1.empty() || m_frame2.empty()) {
+        m_statusBar->showMessage("No frames available to save.", 3000);
+        return;
+    }
+
+    QString metricsDir = QCoreApplication::applicationDirPath() + "/metrics";
+    QDir().mkpath(metricsDir);
+    QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+
+    cv::Mat f1 = m_frame1.clone();
+    cv::Mat f2 = m_frame2.clone();
+    if (f1.channels() == 1) cv::cvtColor(f1, f1, cv::COLOR_GRAY2BGR);
+    if (f2.channels() == 1) cv::cvtColor(f2, f2, cv::COLOR_GRAY2BGR);
+
+    if (combined) {
+        if (f1.rows != f2.rows) {
+            int newW = f2.cols * f1.rows / f2.rows;
+            cv::resize(f2, f2, cv::Size(newW, f1.rows));
+        }
+        cv::Mat combined;
+        cv::hconcat(f1, f2, combined);
+        QString path = metricsDir + "/dual_snapshot_" + timestamp + ".png";
+        bool ok = cv::imwrite(path.toStdString(), combined);
+        m_statusBar->showMessage(ok ? "Saved: " + path : "Error saving: " + path, 4000);
+    } else {
+        QString path1 = metricsDir + "/dual_cam1_" + timestamp + ".png";
+        QString path2 = metricsDir + "/dual_cam2_" + timestamp + ".png";
+        bool ok1 = cv::imwrite(path1.toStdString(), f1);
+        bool ok2 = cv::imwrite(path2.toStdString(), f2);
+        if (ok1 && ok2)
+            m_statusBar->showMessage("Saved cam1 and cam2 snapshots.", 4000);
+        else
+            m_statusBar->showMessage("Error saving dual snapshots.", 4000);
+    }
+}
+
+static QString settingsPath()
+{
+    return QCoreApplication::applicationDirPath() + "/dualcam.ini";
+}
+
+void MainWindow::saveSettings()
+{
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    s.setValue("colorMode", m_comboColorMode->currentIndex());
+    s.setValue("flipVer2", m_chkFlipVer2->isChecked());
+    s.setValue("flipHor2", m_chkFlipHor2->isChecked());
+    s.setValue("align", m_chkAlign->isChecked());
+    s.setValue("bufferSize", m_bufferSlider->value());
+    s.setValue("motionThreshold", m_motionThresholdSlider->value());
+    s.setValue("fusion", m_chkFusion->isChecked());
+    s.setValue("bilateral", m_chkBilateral->isChecked());
+    s.setValue("noiseFloor", m_noiseFloorSlider->value());
+    s.setValue("stretchIntensity", m_chkStretch->isChecked());
+    s.setValue("trackPeaks", m_btnPeakIntensities->isChecked());
+    s.setValue("snapshotMode", m_comboSnapshotMode->currentIndex());
+    s.setValue("maxHistory", m_historySpinBox->value());
+    s.setValue("diffMode", m_isDiffMode);
+}
+
+void MainWindow::loadSettings()
+{
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    m_comboColorMode->setCurrentIndex(s.value("colorMode", 1).toInt());
+    m_chkFlipVer2->setChecked(s.value("flipVer2", false).toBool());
+    m_chkFlipHor2->setChecked(s.value("flipHor2", false).toBool());
+    m_chkAlign->setChecked(s.value("align", false).toBool());
+    m_bufferSlider->setValue(s.value("bufferSize", 8).toInt());
+    m_motionThresholdSlider->setValue(s.value("motionThreshold", 5).toInt());
+    m_chkFusion->setChecked(s.value("fusion", false).toBool());
+    m_chkBilateral->setChecked(s.value("bilateral", false).toBool());
+    m_noiseFloorSlider->setValue(s.value("noiseFloor", 15).toInt());
+    m_chkStretch->setChecked(s.value("stretchIntensity", false).toBool());
+    m_btnPeakIntensities->setChecked(s.value("trackPeaks", false).toBool());
+    m_comboSnapshotMode->setCurrentIndex(s.value("snapshotMode", 0).toInt());
+    m_historySpinBox->setValue(s.value("maxHistory", 200).toInt());
+    bool diffMode = s.value("diffMode", false).toBool();
+    if (diffMode != m_isDiffMode)
+        m_navMode->setChecked(diffMode);
+}
+
+void MainWindow::savePreset(const QString& name)
+{
+    if (name.isEmpty()) return;
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    s.beginGroup("presets");
+    s.beginGroup(name);
+    s.setValue("colorMode", m_comboColorMode->currentIndex());
+    s.setValue("flipVer2", m_chkFlipVer2->isChecked());
+    s.setValue("flipHor2", m_chkFlipHor2->isChecked());
+    s.setValue("align", m_chkAlign->isChecked());
+    s.setValue("bufferSize", m_bufferSlider->value());
+    s.setValue("motionThreshold", m_motionThresholdSlider->value());
+    s.setValue("fusion", m_chkFusion->isChecked());
+    s.setValue("bilateral", m_chkBilateral->isChecked());
+    s.setValue("noiseFloor", m_noiseFloorSlider->value());
+    s.setValue("stretchIntensity", m_chkStretch->isChecked());
+    s.setValue("trackPeaks", m_btnPeakIntensities->isChecked());
+    s.setValue("snapshotMode", m_comboSnapshotMode->currentIndex());
+    s.setValue("diffMode", m_isDiffMode);
+    s.endGroup();
+    s.endGroup();
+    refreshPresetList();
+}
+
+void MainWindow::loadPreset(const QString& name)
+{
+    if (name.isEmpty()) return;
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    s.beginGroup("presets");
+    s.beginGroup(name);
+    m_comboColorMode->setCurrentIndex(s.value("colorMode", 1).toInt());
+    m_chkFlipVer2->setChecked(s.value("flipVer2", false).toBool());
+    m_chkFlipHor2->setChecked(s.value("flipHor2", false).toBool());
+    m_chkAlign->setChecked(s.value("align", false).toBool());
+    m_bufferSlider->setValue(s.value("bufferSize", 8).toInt());
+    m_motionThresholdSlider->setValue(s.value("motionThreshold", 5).toInt());
+    m_chkFusion->setChecked(s.value("fusion", false).toBool());
+    m_chkBilateral->setChecked(s.value("bilateral", false).toBool());
+    m_noiseFloorSlider->setValue(s.value("noiseFloor", 15).toInt());
+    m_chkStretch->setChecked(s.value("stretchIntensity", false).toBool());
+    m_btnPeakIntensities->setChecked(s.value("trackPeaks", false).toBool());
+    m_comboSnapshotMode->setCurrentIndex(s.value("snapshotMode", 0).toInt());
+    bool diffMode = s.value("diffMode", m_isDiffMode).toBool();
+    if (diffMode != m_isDiffMode)
+        m_navMode->setChecked(diffMode);
+    s.endGroup();
+    s.endGroup();
+    m_statusBar->showMessage("Preset '" + name + "' loaded.", 3000);
+}
+
+void MainWindow::deletePreset(const QString& name)
+{
+    if (name.isEmpty()) return;
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    s.beginGroup("presets");
+    s.beginGroup(name);
+    s.remove("");
+    s.endGroup();
+    s.endGroup();
+    refreshPresetList();
+    m_statusBar->showMessage("Preset '" + name + "' deleted.", 3000);
+}
+
+void MainWindow::refreshPresetList()
+{
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    s.beginGroup("presets");
+    QStringList presets = s.childGroups();
+    s.endGroup();
+    m_comboPresets->clear();
+    m_comboPresets->addItems(presets);
 }
