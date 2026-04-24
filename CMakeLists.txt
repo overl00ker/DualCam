@@ -9,8 +9,14 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-set(OpenCV_DIR "D:/opencv/build/x64/vc16/lib")
-set(Qt6_DIR "D:/Qt/6.10.0/msvc2022_64/lib/cmake/Qt6")
+if(WIN32)
+    if(NOT DEFINED CACHE{OpenCV_DIR})
+        set(OpenCV_DIR "D:/opencv/build/x64/vc16/lib" CACHE PATH "OpenCV build directory")
+    endif()
+    if(NOT DEFINED CACHE{Qt6_DIR})
+        set(Qt6_DIR "D:/Qt/6.10.0/msvc2022_64/lib/cmake/Qt6" CACHE PATH "Qt6 cmake directory")
+    endif()
+endif()
 
 find_package(OpenCV REQUIRED)
 find_package(Qt6 REQUIRED COMPONENTS
