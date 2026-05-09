@@ -22,6 +22,9 @@
 #include <QMap>
 #include <QThread>
 #include <QMutex>
+#include <QOpenGLWidget>
+#include <QOpenGLFunctions>
+#include <QImage>
 
 enum class CmdType { Action, Toggle, Parameter };
 
@@ -56,6 +59,28 @@ class QListWidget;
 
 enum class ColorMode { GRAY_NATIVE, GRAY_CV, COLOR };
 
+class GpuImageView : public QOpenGLWidget, protected QOpenGLFunctions {
+    Q_OBJECT
+public:
+    explicit GpuImageView(QWidget* parent = nullptr);
+    void setImage(const QImage& img);
+    void setPlaceholder(const QString& text);
+    void setOverlayText(const QString& text, bool rightAlign);
+    void setOverlayColor(const QColor& c) { m_overlayColor = c; update(); }
+
+protected:
+    void initializeGL() override;
+    void paintGL() override;
+    void resizeGL(int w, int h) override;
+
+private:
+    QImage m_image;
+    QString m_placeholder;
+    QString m_overlayText;
+    bool m_overlayRight = false;
+    QColor m_overlayColor{0x5a, 0xff, 0x8a};
+};
+
 struct ManualAdjust {
     double tx = 0.0;
     double ty = 0.0;
@@ -76,6 +101,7 @@ struct WorkerParams {
     double motionThr = 0.05;
     int bufferSize = 8;
     bool applyBilateral = false;
+    int bilateralStrength = 5;
     int noiseFloor = 15;
 };
 
@@ -114,6 +140,9 @@ private:
     cv::Mat m_ema1;
     cv::Mat m_ema2;
     qint64 m_frameCount = 0;
+
+public:
+    std::atomic<int> m_pendingFrames{0};
 };
 
 class MainWindow : public QMainWindow
@@ -135,6 +164,8 @@ public:
 
 protected:
     void resizeEvent(QResizeEvent* event) override;
+    void closeEvent(QCloseEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
     bool eventFilter(QObject* obj, QEvent* event) override;
 
 private slots:
@@ -168,15 +199,18 @@ private:
 
     void saveDiffSnapshot();
     void saveDualSnapshot(bool combined);
+    QString buildSnapshotBaseName(const QString& prefix) const;
+    void writeSnapshotMeta(const QString& jsonPath, const QString& mode) const;
 
-    void displayMat(QLabel* label, const cv::Mat& mat);
+    void displayMat(GpuImageView* view, const cv::Mat& mat);
     double calculateFocus(const cv::Mat& frame);
 
     cv::Mat fuseCameras(const cv::Mat& a, const cv::Mat& b);
     cv::Mat applyDiffView(const cv::Mat& d1, const cv::Mat& d2);
 
     QStringList getLibCameraIds();
-    std::string makeGStreamerPipeline(const QString& cameraId, int width, int height, int fps);
+    std::string makeGStreamerPipeline(const QString& cameraId, int width, int height, int fps, int camIndex = 0);
+    void applyExposureControls();
 
     void saveSettings();
     void loadSettings();
@@ -218,6 +252,7 @@ private:
     double m_motionThreshold = 0.05;
     bool m_motionActive = false;
     int m_noiseFloor = 15;
+    int m_bilateralStrength = 5;
 
     ColorMode m_colorMode = ColorMode::GRAY_CV;
 
@@ -237,9 +272,32 @@ private:
     QPushButton* m_btnGallery;
     QPushButton* m_btnHelp;
 
-    QLabel* m_view1;
-    QLabel* m_view2;
-    QLabel* m_resultView;
+    QPushButton* m_btnExpToggle = nullptr;
+    QPushButton* m_btnExpChange = nullptr;
+    QLabel* m_lblExposureVals = nullptr;
+    QDoubleSpinBox* m_spnGain = nullptr;        // cam1 (or shared)
+    QSpinBox* m_spnShutter = nullptr;
+    QSlider* m_sldGain = nullptr;
+    QSlider* m_sldShutter = nullptr;
+    QDoubleSpinBox* m_spnGain2 = nullptr;       // cam2 (per-camera mode)
+    QSpinBox* m_spnShutter2 = nullptr;
+    QSlider* m_sldGain2 = nullptr;
+    QSlider* m_sldShutter2 = nullptr;
+    bool m_manualExposure = false;
+    bool m_perCameraExposure = false;
+    int m_gainQ8 = 256;        // analogue gain * 256 (cam1 / shared)
+    int m_shutterUs = 10000;   // exposure time us (cam1 / shared)
+    int m_gain2Q8 = 256;       // cam2 (per-camera mode)
+    int m_shutter2Us = 10000;
+    void showExposureDialog();
+
+    QPushButton* m_btnConfigParams = nullptr;
+    QMap<QString, bool> m_paramInName;
+    void showFilenameParamsDialog();
+
+    GpuImageView* m_view1;
+    GpuImageView* m_view2;
+    GpuImageView* m_resultView;
     QLabel* m_osd1;
     QLabel* m_osd2;
     QLabel* m_osdResult;
@@ -259,7 +317,9 @@ private:
     QCheckBox* m_chkFlipVer2;
     QCheckBox* m_chkFlipHor2;
     QCheckBox* m_chkBilateral;
-    QComboBox* m_comboSnapshotMode;
+    QSlider* m_bilateralSlider;
+    QLabel* m_bilateralLabel;
+    QCheckBox* m_chkAppendParams;
     QPushButton* m_btnSaveSnapshot;
 
     QSlider* m_bufferSlider;

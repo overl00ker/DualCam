@@ -36,6 +36,7 @@
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QMouseEvent>
+#include <QCloseEvent>
 #include <QJsonObject>
 #include <QJsonDocument>
 #include <QMenu>
@@ -64,6 +65,86 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
+
+#include <QPainter>
+#include <QPaintEvent>
+
+GpuImageView::GpuImageView(QWidget* parent)
+    : QOpenGLWidget(parent)
+{
+    setAttribute(Qt::WA_OpaquePaintEvent);
+    setAutoFillBackground(false);
+    setMinimumSize(160, 120);
+}
+
+void GpuImageView::initializeGL()
+{
+    initializeOpenGLFunctions();
+}
+
+void GpuImageView::resizeGL(int /*w*/, int /*h*/) {}
+
+void GpuImageView::setImage(const QImage& img)
+{
+    m_image = img;
+    update();
+}
+
+void GpuImageView::setPlaceholder(const QString& text)
+{
+    m_placeholder = text;
+    m_image = QImage();
+    update();
+}
+
+void GpuImageView::setOverlayText(const QString& text, bool rightAlign)
+{
+    m_overlayText = text;
+    m_overlayRight = rightAlign;
+    update();
+}
+
+void GpuImageView::paintGL()
+{
+    QPainter p(this);
+    p.fillRect(rect(), QColor("#000000"));
+
+    if (m_image.isNull()) {
+        if (!m_placeholder.isEmpty()) {
+            p.setPen(QColor("#8a94a3"));
+            p.drawText(rect(), Qt::AlignCenter, m_placeholder);
+        }
+        return;
+    }
+
+    // Aspect-fit
+    QSize is = m_image.size();
+    QSize ws = size();
+    double k = std::min(static_cast<double>(ws.width()) / is.width(),
+                        static_cast<double>(ws.height()) / is.height());
+    int dw = static_cast<int>(is.width() * k);
+    int dh = static_cast<int>(is.height() * k);
+    int dx = (ws.width() - dw) / 2;
+    int dy = (ws.height() - dh) / 2;
+    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    p.drawImage(QRect(dx, dy, dw, dh), m_image);
+
+    if (!m_overlayText.isEmpty()) {
+        QFont f = p.font();
+        f.setFamily("Inter");
+        f.setPointSize(10);
+        f.setBold(true);
+        p.setFont(f);
+        QFontMetrics fm(f);
+        QRect tr = fm.boundingRect(m_overlayText).adjusted(-8, -4, 8, 4);
+        int x = m_overlayRight ? (width() - 10 - tr.width()) : 10;
+        int y = 10;
+        QRect bg(x, y, tr.width(), tr.height());
+        p.fillRect(bg, QColor(14, 16, 19, 210));
+        p.setPen(m_overlayColor);
+        p.drawText(bg, Qt::AlignCenter, m_overlayText);
+    }
+}
 
 CameraWorker::CameraWorker(QObject* parent) : QThread(parent) {
     m_bgSubtractor = cv::createBackgroundSubtractorMOG2(500, 16.0, false);
@@ -104,7 +185,13 @@ void CameraWorker::startCamerasV4L2(int id1, int id2, int w, int h, int fps) {
 }
 void CameraWorker::stopCameras() {
     m_running = false;
-    wait();
+    if (!wait(2000)) {
+        requestInterruption();
+        if (!wait(1000)) {
+            terminate();
+            wait();
+        }
+    }
     if (m_cap1.isOpened()) m_cap1.release();
     if (m_cap2.isOpened()) m_cap2.release();
 }
@@ -185,16 +272,28 @@ void CameraWorker::run() {
         f2 = applyTemporalDenoise(f2, m_ema2, p.bufferSize);
 
         if (p.applyBilateral) {
-            cv::Mat b1, b2;
-            cv::bilateralFilter(f1, b1, 9, 75, 75);
-            cv::bilateralFilter(f2, b2, 9, 75, 75);
-            f1 = b1; f2 = b2;
+            const int depth = f1.depth();
+            if (depth == CV_8U || depth == CV_32F) {
+                int s = std::max(1, std::min(20, p.bilateralStrength));
+                int d = (s % 2 == 0) ? s + 1 : s;
+                double sigma = 10.0 * s;
+                cv::Mat b1, b2;
+                cv::bilateralFilter(f1, b1, d, sigma, sigma);
+                cv::bilateralFilter(f2, b2, d, sigma, sigma);
+                f1 = b1; f2 = b2;
+            }
         }
 
         double focus1 = calculateFocus(f1);
         double focus2 = calculateFocus(f2);
-        
+
         m_frameCount++;
+
+        if (m_pendingFrames.load() >= 2) {
+            // UI is overwhelmed — drop this frame to avoid event-queue blowup.
+            continue;
+        }
+        m_pendingFrames.fetch_add(1);
         emit framesProcessed(f1.clone(), f2.clone(), focus1, focus2, motionDetected, m_frameCount);
     }
 }
@@ -228,6 +327,33 @@ static QString pillStyle(const char* fg, const char* bg, const char* border)
         .arg(fg).arg(bg).arg(border);
 }
 
+static QString settingsPath()
+{
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    QDir().mkpath(dir);
+    return dir + "/dualcam.ini";
+}
+
+struct FilenameParamSpec {
+    const char* key;
+    const char* label;
+};
+
+static const FilenameParamSpec kFilenameParamSpecs[] = {
+    {"BF",  "Bilateral (BF#)"},
+    {"TB",  "Time Buffer (TB#)"},
+    {"MT",  "Motion Threshold (MT#)"},
+    {"FU",  "Fusion (FU)"},
+    {"ECC", "ECC Align (ECC)"},
+    {"NF",  "Noise Floor (NF#)"},
+    {"ST",  "Intensity Stretch (ST)"},
+    {"G",   "Gain (G#x)"},
+    {"SH",  "Shutter (SH#us)"},
+    {"CM",  "Color Mode (RGB/GRY)"},
+    {"FH",  "Flip Horizontal (FH)"},
+    {"FV",  "Flip Vertical (FV)"},
+};
+
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
@@ -241,6 +367,10 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_worker, &CameraWorker::cameraError, this, [this](const QString& msg) {
         if (m_statusBar) m_statusBar->showMessage(msg, 5000);
     });
+
+    for (const auto& spec : kFilenameParamSpecs) {
+        m_paramInName[QString::fromLatin1(spec.key)] = true;
+    }
 
     initUI();
     initCommands();
@@ -258,7 +388,8 @@ MainWindow::~MainWindow()
 QString MainWindow::styleSheetText() const
 {
     return QString(R"(
-        QMainWindow, QWidget#root { background: %1; }
+        QMainWindow, QWidget#root, QDialog { background: %1; color: %3; }
+        QDialog QLabel { color: %3; background: transparent; }
         QWidget { color: %3; font-family: 'Inter','Segoe UI',sans-serif; font-size: 13px; }
         QLabel { color: %3; }
         QLabel[role="dim"] { color: %4; font-size: 11px; }
@@ -374,11 +505,12 @@ QString MainWindow::styleSheetText() const
 void MainWindow::initUI()
 {
     setWindowTitle("DualCam Analysis Tool");
-    setMinimumSize(800, 560);
+    setMinimumSize(560, 420);
     setStyleSheet(styleSheetText());
 
     m_centralWidget = new QWidget(this);
     m_centralWidget->setObjectName("root");
+    m_centralWidget->setFocusPolicy(Qt::ClickFocus);
     setCentralWidget(m_centralWidget);
 
     QVBoxLayout* rootLayout = new QVBoxLayout(m_centralWidget);
@@ -447,8 +579,9 @@ void MainWindow::initUI()
     m_btnGallery = new QPushButton("\u25A6  Snapshots", this);
     m_btnGallery->setStyleSheet(topBtnSty);
     m_btnGallery->setCursor(Qt::PointingHandCursor);
+    m_btnGallery->setToolTip("Open snapshots folder");
     connect(m_btnGallery, &QPushButton::clicked, this, [this]() {
-        QString dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation) + "/presets";
+        QString dir = QCoreApplication::applicationDirPath() + "/metrics";
         QDir().mkpath(dir);
         QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
         m_statusBar->showMessage("Snapshots folder: " + dir, 4000);
@@ -462,6 +595,177 @@ void MainWindow::initUI()
     connect(m_btnHelp, &QPushButton::clicked, this, &MainWindow::showActionsMenu);
 
     topLay->addWidget(m_comboCamSet);
+
+    // ---------- Exposure controls (Auto/Manual + Gain + Shutter) ----------
+    m_btnExpToggle = new QPushButton("AUTO", this);
+    m_btnExpToggle->setCheckable(true);
+    m_btnExpToggle->setCursor(Qt::PointingHandCursor);
+    m_btnExpToggle->setToolTip("Toggle automatic / manual exposure");
+    m_btnExpToggle->setFixedWidth(70);
+    m_btnExpToggle->setStyleSheet(QString(
+        "QPushButton { background: %1; color: %2; border: 1px solid %3; border-radius: 4px;"
+        " padding: 4px 8px; font-weight: 700; font-size: 11px; letter-spacing: 0.5px; }"
+        "QPushButton:checked { background: %4; color: #0a1220; border-color: %4; }")
+        .arg(T::bg2).arg(T::text).arg(T::border).arg(T::accent));
+
+    // Hidden controls (live in the popup dialog opened by Change). Parented to
+    // MainWindow so they survive popup close/reopen and remain hotkey targets.
+    auto buildGainSpin = [this](int q8) {
+        auto* s = new QDoubleSpinBox(this);
+        s->setRange(0.1, 10.0);
+        s->setDecimals(2);
+        s->setSingleStep(0.1);
+        s->setSuffix("x");
+        s->setValue(qBound(0.1, q8 / 256.0, 10.0));
+        s->setKeyboardTracking(false);
+        s->hide();
+        return s;
+    };
+    auto buildGainSlider = [this](double initVal) {
+        auto* s = new QSlider(Qt::Horizontal, this);
+        s->setRange(10, 1000);
+        s->setSingleStep(10);
+        s->setPageStep(50);
+        s->setValue(qBound(10, static_cast<int>(initVal * 100.0 + 0.5), 1000));
+        s->hide();
+        return s;
+    };
+    auto buildShutterSpin = [this](int us) {
+        auto* s = new QSpinBox(this);
+        s->setRange(50, 30000);
+        s->setSingleStep(100);
+        s->setSuffix(" us");
+        s->setValue(qBound(50, us, 30000));
+        s->setKeyboardTracking(false);
+        s->hide();
+        return s;
+    };
+    auto buildShutterSlider = [this](int initVal) {
+        auto* s = new QSlider(Qt::Horizontal, this);
+        s->setRange(50, 30000);
+        s->setSingleStep(100);
+        s->setPageStep(1000);
+        s->setValue(qBound(50, initVal, 30000));
+        s->hide();
+        return s;
+    };
+
+    m_spnGain     = buildGainSpin(m_gainQ8);
+    m_sldGain     = buildGainSlider(m_spnGain->value());
+    m_spnShutter  = buildShutterSpin(m_shutterUs);
+    m_sldShutter  = buildShutterSlider(m_spnShutter->value());
+
+    m_spnGain2    = buildGainSpin(m_gain2Q8);
+    m_sldGain2    = buildGainSlider(m_spnGain2->value());
+    m_spnShutter2 = buildShutterSpin(m_shutter2Us);
+    m_sldShutter2 = buildShutterSlider(m_spnShutter2->value());
+
+    // Inline values pill — shows current gain/shutter
+    m_lblExposureVals = new QLabel(this);
+    m_lblExposureVals->setStyleSheet(QString(
+        "QLabel { background: %1; color: %2; border: 1px solid %3; border-radius: 4px;"
+        " padding: 4px 10px; font-family: 'Inter','Segoe UI',monospace; font-size: 11px; }")
+        .arg(T::bg2).arg(T::text).arg(T::border));
+    m_lblExposureVals->setToolTip("Current gain * shutter (manual mode)");
+    m_lblExposureVals->setMinimumWidth(220);
+    m_lblExposureVals->setAlignment(Qt::AlignCenter);
+
+    m_btnExpChange = new QPushButton("Change", this);
+    m_btnExpChange->setStyleSheet(topBtnSty);
+    m_btnExpChange->setCursor(Qt::PointingHandCursor);
+    m_btnExpChange->setToolTip("Adjust gain and shutter (manual mode only)");
+    m_btnExpChange->setEnabled(false);
+    connect(m_btnExpChange, &QPushButton::clicked, this, &MainWindow::showExposureDialog);
+
+    auto refreshExposureLabel = [this]() {
+        if (!m_lblExposureVals) return;
+        double g1 = m_spnGain     ? m_spnGain->value()     : m_gainQ8    / 256.0;
+        int    s1 = m_spnShutter  ? m_spnShutter->value()  : m_shutterUs;
+        if (m_perCameraExposure) {
+            double g2 = m_spnGain2    ? m_spnGain2->value()    : m_gain2Q8 / 256.0;
+            int    s2 = m_spnShutter2 ? m_spnShutter2->value() : m_shutter2Us;
+            m_lblExposureVals->setText(QString("%1x * %2 // %3x * %4")
+                .arg(g1, 0, 'f', 2).arg(s1)
+                .arg(g2, 0, 'f', 2).arg(s2));
+        } else {
+            m_lblExposureVals->setText(QString("%1x * %2")
+                .arg(g1, 0, 'f', 2).arg(s1));
+        }
+    };
+    refreshExposureLabel();
+
+    connect(m_btnExpToggle, &QPushButton::toggled, this, [this](bool on) {
+        m_manualExposure = on;
+        m_btnExpToggle->setText(on ? "MAN" : "AUTO");
+        const bool en = on;
+        if (m_spnGain)     m_spnGain->setEnabled(en);
+        if (m_spnShutter)  m_spnShutter->setEnabled(en);
+        if (m_sldGain)     m_sldGain->setEnabled(en);
+        if (m_sldShutter)  m_sldShutter->setEnabled(en);
+        if (m_spnGain2)    m_spnGain2->setEnabled(en);
+        if (m_spnShutter2) m_spnShutter2->setEnabled(en);
+        if (m_sldGain2)    m_sldGain2->setEnabled(en);
+        if (m_sldShutter2) m_sldShutter2->setEnabled(en);
+        if (m_btnExpChange) m_btnExpChange->setEnabled(en);
+        applyExposureControls();
+    });
+
+    // Wire each pair (spin <-> slider) and store updated value into the right backing field.
+    auto wireGainPair = [this, refreshExposureLabel](QDoubleSpinBox* spn, QSlider* sld, int* backing) {
+        connect(spn, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+                [this, sld, backing, refreshExposureLabel](double v) {
+            if (sld) {
+                QSignalBlocker b(sld);
+                sld->setValue(qBound(sld->minimum(), static_cast<int>(v * 100.0 + 0.5), sld->maximum()));
+            }
+            *backing = static_cast<int>(v * 256.0 + 0.5);
+            refreshExposureLabel();
+            if (m_manualExposure) applyExposureControls();
+        });
+        connect(sld, &QSlider::valueChanged, this,
+                [this, spn, backing, refreshExposureLabel](int v) {
+            if (spn) {
+                QSignalBlocker b(spn);
+                spn->setValue(v / 100.0);
+            }
+            *backing = static_cast<int>((v / 100.0) * 256.0 + 0.5);
+            refreshExposureLabel();
+            if (m_manualExposure) applyExposureControls();
+        });
+    };
+    auto wireShutterPair = [this, refreshExposureLabel](QSpinBox* spn, QSlider* sld, int* backing) {
+        connect(spn, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                [this, sld, backing, refreshExposureLabel](int v) {
+            if (sld) {
+                QSignalBlocker b(sld);
+                sld->setValue(qBound(sld->minimum(), v, sld->maximum()));
+            }
+            *backing = v;
+            refreshExposureLabel();
+            if (m_manualExposure) applyExposureControls();
+        });
+        connect(sld, &QSlider::valueChanged, this,
+                [this, spn, backing, refreshExposureLabel](int v) {
+            if (spn) {
+                QSignalBlocker b(spn);
+                spn->setValue(v);
+            }
+            *backing = v;
+            refreshExposureLabel();
+            if (m_manualExposure) applyExposureControls();
+        });
+    };
+
+    wireGainPair(m_spnGain,    m_sldGain,    &m_gainQ8);
+    wireShutterPair(m_spnShutter, m_sldShutter, &m_shutterUs);
+    wireGainPair(m_spnGain2,   m_sldGain2,   &m_gain2Q8);
+    wireShutterPair(m_spnShutter2, m_sldShutter2, &m_shutter2Us);
+
+    topLay->addSpacing(6);
+    topLay->addWidget(m_btnExpToggle);
+    topLay->addWidget(m_lblExposureVals);
+    topLay->addWidget(m_btnExpChange);
+
     topLay->addStretch();
     topLay->addWidget(m_fpsPill);
     topLay->addWidget(m_eccPill);
@@ -496,35 +800,21 @@ void MainWindow::initUI()
     m_splitter = new QSplitter(Qt::Horizontal, m_videoArea);
     m_splitter->setHandleWidth(4);
 
-    auto makeView = [this](const QString& placeholder, QLabel*& osdOut) {
-        QLabel* v = new QLabel(placeholder, this);
-        v->setScaledContents(true);
-        v->setAlignment(Qt::AlignCenter);
+    auto makeView = [this](const QString& placeholder) {
+        GpuImageView* v = new GpuImageView(this);
         v->setMinimumSize(160, 120);
-        v->setStyleSheet(QString(
-            "background:#000; color:%1; border:1px solid %2; border-radius:6px;"
-            "font-family:'Inter','Segoe UI',sans-serif;")
-                .arg(T::textDim).arg(T::border));
-        osdOut = new QLabel(v);
-        osdOut->setAttribute(Qt::WA_TransparentForMouseEvents);
-        osdOut->setStyleSheet(
-            "QLabel { color: #5aff8a; background: transparent;"
-            " font-family: 'Inter','Segoe UI',sans-serif;"
-            " font-size: 11px; font-weight: 600; padding: 6px 10px; }");
-        osdOut->move(8, 6);
-        osdOut->raise();
+        v->setPlaceholder(placeholder);
         return v;
     };
-    m_view1 = makeView("Camera 1", m_osd1);
-    m_view2 = makeView("Camera 2", m_osd2);
+    m_view1 = makeView("Camera 1");
+    m_view2 = makeView("Camera 2");
+    m_osd1 = nullptr;
+    m_osd2 = nullptr;
     m_splitter->addWidget(m_view1);
     m_splitter->addWidget(m_view2);
 
-    m_resultView = makeView("Result View", m_osdResult);
-    m_osdResult->setStyleSheet(
-        "QLabel { color: #ffffff; background: rgba(0,0,0,140);"
-        " font-family: 'Inter','Segoe UI',sans-serif;"
-        " font-size: 11px; font-weight: 600; padding: 4px 8px; border-radius: 3px; }");
+    m_resultView = makeView("Result View");
+    m_osdResult = nullptr;
     m_resultView->hide();
 
     vidLay->addWidget(m_splitter, 1);
@@ -551,12 +841,13 @@ void MainWindow::initUI()
         m_fabStreamIcon = new QLabel(QString::fromUtf8("\u25B6"), m_btnFabStream);
         m_fabStreamIcon->setAttribute(Qt::WA_TransparentForMouseEvents);
         m_fabStreamIcon->setAlignment(Qt::AlignCenter);
-        m_fabStreamIcon->setFixedSize(48, 48);
         m_fabStreamIcon->setStyleSheet(QString(
             "QLabel { background: transparent; color: %1; border: none;"
             " font-family: 'Segoe UI Symbol','Segoe UI Emoji','Arial Unicode MS';"
             " font-size: 20px; font-weight: 700; }").arg(T::accent));
-        m_fabStreamIcon->move(0, 0);
+        QVBoxLayout* fabLay = new QVBoxLayout(m_btnFabStream);
+        fabLay->setContentsMargins(0, 0, 0, 0);
+        fabLay->addWidget(m_fabStreamIcon, 0, Qt::AlignCenter);
     }
     connect(m_btnFabStream, &QPushButton::clicked, this, [this]() {
         if (m_camerasOpen) closeCameras();
@@ -590,12 +881,13 @@ void MainWindow::initUI()
         m_fabSnapIcon = new QLabel("snap", m_btnFabSnapshot);
         m_fabSnapIcon->setAttribute(Qt::WA_TransparentForMouseEvents);
         m_fabSnapIcon->setAlignment(Qt::AlignCenter);
-        m_fabSnapIcon->setFixedSize(48, 48);
         m_fabSnapIcon->setStyleSheet(
             "QLabel { background: transparent; color: #000000; border: none;"
             " font-family: 'Inter','Segoe UI',sans-serif;"
             " font-size: 12px; font-weight: 900; letter-spacing: 0.5px; }");
-        m_fabSnapIcon->move(0, 0);
+        QVBoxLayout* snapLay = new QVBoxLayout(m_btnFabSnapshot);
+        snapLay->setContentsMargins(0, 0, 0, 0);
+        snapLay->addWidget(m_fabSnapIcon, 0, Qt::AlignCenter);
     }
     connect(m_btnFabSnapshot, &QPushButton::clicked, this, [this]() {
         saveSnapshot();
@@ -636,7 +928,8 @@ void MainWindow::initUI()
 
     // ---------- Bottom sheet (tabs) ----------
     m_sheetWidget = new QWidget(this);
-    m_sheetWidget->setFixedHeight(140);
+    m_sheetWidget->setMinimumHeight(140);
+    m_sheetWidget->setMaximumHeight(140);
     m_sheetWidget->setStyleSheet(QString("background:%1;").arg(T::bg1));
 
     QVBoxLayout* sheetLay = new QVBoxLayout(m_sheetWidget);
@@ -709,6 +1002,7 @@ QWidget* MainWindow::buildCaptureTab()
         p.motionThr = m_motionThreshold;
         p.bufferSize = m_bufferSize;
         p.applyBilateral = m_chkBilateral->isChecked();
+        p.bilateralStrength = m_bilateralStrength;
         p.noiseFloor = m_noiseFloor;
         m_worker->setParams(p);
     };
@@ -740,9 +1034,28 @@ QWidget* MainWindow::buildCaptureTab()
 
     // Bilateral
     grid->addWidget(sectionLabel("BILATERAL FILTER"), 0, 2);
-    m_chkBilateral = new QCheckBox("Enabled", this);
+    QWidget* bfBox = new QWidget(this);
+    QHBoxLayout* bfLay = new QHBoxLayout(bfBox);
+    bfLay->setContentsMargins(0, 0, 0, 0);
+    bfLay->setSpacing(6);
+    m_chkBilateral = new QCheckBox("On", this);
     connect(m_chkBilateral, &QCheckBox::stateChanged, updateWorkerParams);
-    grid->addWidget(m_chkBilateral, 1, 2);
+    m_bilateralSlider = new QSlider(Qt::Horizontal, this);
+    m_bilateralSlider->setRange(1, 20);
+    m_bilateralSlider->setValue(m_bilateralStrength);
+    m_bilateralSlider->setToolTip("Filter strength (radius & sigma)");
+    m_bilateralLabel = new QLabel(QString::number(m_bilateralStrength), this);
+    m_bilateralLabel->setFixedWidth(24);
+    m_bilateralLabel->setAlignment(Qt::AlignCenter);
+    connect(m_bilateralSlider, &QSlider::valueChanged, this, [this, updateWorkerParams](int v) {
+        m_bilateralStrength = v;
+        m_bilateralLabel->setText(QString::number(v));
+        updateWorkerParams();
+    });
+    bfLay->addWidget(m_chkBilateral);
+    bfLay->addWidget(m_bilateralSlider, 1);
+    bfLay->addWidget(m_bilateralLabel);
+    grid->addWidget(bfBox, 1, 2);
 
     grid->setColumnStretch(0, 1);
     grid->setColumnStretch(1, 1);
@@ -767,6 +1080,7 @@ QWidget* MainWindow::buildPipelineTab()
         p.motionThr = m_motionThreshold;
         p.bufferSize = m_bufferSize;
         p.applyBilateral = m_chkBilateral->isChecked();
+        p.bilateralStrength = m_bilateralStrength;
         p.noiseFloor = m_noiseFloor;
         m_worker->setParams(p);
     };
@@ -913,6 +1227,7 @@ QWidget* MainWindow::buildDiffTab()
         p.motionThr = m_motionThreshold;
         p.bufferSize = m_bufferSize;
         p.applyBilateral = m_chkBilateral->isChecked();
+        p.bilateralStrength = m_bilateralStrength;
         p.noiseFloor = m_noiseFloor;
         m_worker->setParams(p);
     };
@@ -1108,25 +1423,12 @@ QWidget* MainWindow::buildSnapshotTab()
     root->setContentsMargins(14, 14, 14, 14);
     root->setSpacing(10);
 
-    // Top row: format, name, save
+    // Top row: name, save
     QFrame* saveCard = new QFrame(this);
     saveCard->setProperty("role", "card");
     QHBoxLayout* saveLay = new QHBoxLayout(saveCard);
     saveLay->setContentsMargins(10, 10, 10, 10);
     saveLay->setSpacing(10);
-
-    QLabel* fmtLabel = new QLabel("FORMAT", this);
-    fmtLabel->setStyleSheet(QString(
-        "color:%1; font-family:'Inter','Segoe UI',sans-serif;"
-        "font-size:10px; letter-spacing:0.5px;").arg(T::textDim));
-    saveLay->addWidget(fmtLabel);
-
-    m_comboSnapshotMode = new QComboBox(this);
-    m_comboSnapshotMode->addItems({ "Dual Combined", "Dual Separate", "Difference" });
-    m_comboSnapshotMode->setToolTip("Format used when saving snapshots");
-    m_comboSnapshotMode->setMinimumWidth(150);
-    saveLay->addWidget(m_comboSnapshotMode);
-    saveLay->addSpacing(12);
 
     QLabel* nameLabel = new QLabel("NAME", this);
     nameLabel->setStyleSheet(QString(
@@ -1137,6 +1439,17 @@ QWidget* MainWindow::buildSnapshotTab()
     m_snapshotNameEdit = new QLineEdit(this);
     m_snapshotNameEdit->setPlaceholderText("Auto-generated...");
     saveLay->addWidget(m_snapshotNameEdit, 1);
+
+    m_chkAppendParams = new QCheckBox("Append params", this);
+    m_chkAppendParams->setToolTip("Add active filter values to filename (e.g. _BF5_NF15)");
+    saveLay->addWidget(m_chkAppendParams);
+
+    m_btnConfigParams = new QPushButton("Configure…", this);
+    m_btnConfigParams->setProperty("kind", "ghost");
+    m_btnConfigParams->setToolTip("Choose which parameters are written into the filename");
+    m_btnConfigParams->setCursor(Qt::PointingHandCursor);
+    connect(m_btnConfigParams, &QPushButton::clicked, this, &MainWindow::showFilenameParamsDialog);
+    saveLay->addWidget(m_btnConfigParams);
 
     m_btnSaveSnapshot = new QPushButton("Save", this);
     m_btnSaveSnapshot->setProperty("kind", "primary");
@@ -1153,11 +1466,14 @@ QWidget* MainWindow::buildSnapshotTab()
     m_snapshotPreview = new QListWidget(this);
     m_snapshotPreview->setViewMode(QListWidget::IconMode);
     m_snapshotPreview->setIconSize(QSize(160, 120));
+    m_snapshotPreview->setGridSize(QSize(180, 200));
     m_snapshotPreview->setResizeMode(QListWidget::Adjust);
     m_snapshotPreview->setSpacing(8);
     m_snapshotPreview->setFlow(QListWidget::LeftToRight);
     m_snapshotPreview->setWrapping(true);
     m_snapshotPreview->setUniformItemSizes(true);
+    m_snapshotPreview->setWordWrap(true);
+    m_snapshotPreview->setTextElideMode(Qt::ElideMiddle);
     root->addWidget(m_snapshotPreview, 1);
 
     m_snapshotPreview->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -1465,14 +1781,39 @@ void MainWindow::setDiffMode(bool on)
     if (m_btnModeToggle) {
         m_btnModeToggle->setText(on ? "Diff" : "Dual");
     }
-    if (on && m_tabWidget) m_tabWidget->setCurrentIndex(2); // switch to Diff tab
     if (!on && m_lblPeakInfo) m_lblPeakInfo->clear();
     updateView();
+}
+
+void MainWindow::closeEvent(QCloseEvent* event)
+{
+    saveSettings();
+    QMainWindow::closeEvent(event);
+}
+
+void MainWindow::mousePressEvent(QMouseEvent* event)
+{
+    QWidget* focused = QApplication::focusWidget();
+    if (qobject_cast<QLineEdit*>(focused)) {
+        focused->clearFocus();
+    }
+    QMainWindow::mousePressEvent(event);
 }
 
 void MainWindow::resizeEvent(QResizeEvent* event)
 {
     QMainWindow::resizeEvent(event);
+
+    const int w = width();
+    const bool compact = w < 720;
+    const bool ultraCompact = w < 560;
+
+    if (m_fpsPill) m_fpsPill->setVisible(!ultraCompact);
+    if (m_eccPill) m_eccPill->setVisible(!ultraCompact);
+    if (m_btnGallery) m_btnGallery->setText(compact ? QStringLiteral("▦") : QStringLiteral("▦  Snapshots"));
+
+    int sheetMax = std::max(140, height() / 2);
+    if (m_sheetWidget) m_sheetWidget->setMaximumHeight(sheetMax);
 }
 
 void MainWindow::toggleFocusView()
@@ -1511,12 +1852,16 @@ void MainWindow::refreshSnapshotPreview()
     QStringList filters = {"*.png", "*.jpg", "*.jpeg", "*.bmp"};
     QFileInfoList files = metricsDir.entryInfoList(filters, QDir::Files, QDir::Time);
 
+    const QSize grid = m_snapshotPreview->gridSize();
     for (const QFileInfo& fi : files) {
         QPixmap pix(fi.absoluteFilePath());
         if (pix.isNull()) continue;
         QListWidgetItem* item = new QListWidgetItem(
             QIcon(pix.scaled(160, 120, Qt::KeepAspectRatio, Qt::SmoothTransformation)),
             fi.fileName());
+        item->setToolTip(fi.fileName());
+        item->setTextAlignment(Qt::AlignHCenter | Qt::AlignTop);
+        if (grid.isValid()) item->setSizeHint(grid);
         m_snapshotPreview->addItem(item);
     }
 }
@@ -1594,9 +1939,22 @@ QStringList MainWindow::getLibCameraIds()
     return cameraPaths;
 }
 
-std::string MainWindow::makeGStreamerPipeline(const QString& cameraId, int width, int height, int fps)
+std::string MainWindow::makeGStreamerPipeline(const QString& cameraId, int width, int height, int fps, int camIndex)
 {
-    return QString("libcamerasrc camera-name=%1 ! "
+    QString controls;
+    if (m_manualExposure) {
+        int gainQ8     = (m_perCameraExposure && camIndex == 1) ? m_gain2Q8    : m_gainQ8;
+        int shutterUs  = (m_perCameraExposure && camIndex == 1) ? m_shutter2Us : m_shutterUs;
+        double gain = gainQ8 / 256.0;
+        if (gain < 1.0) gain = 1.0;
+        controls = QString(" ae-enable=false analogue-gain-mode=manual exposure-time-mode=manual analogue-gain=%1 exposure-time=%2")
+            .arg(gain, 0, 'f', 3)
+            .arg(shutterUs);
+    } else {
+        controls = " ae-enable=true";
+    }
+
+    return QString("libcamerasrc camera-name=%1%5 ! "
         "video/x-raw, width=%2, height=%3, framerate=%4/1, format=NV12 ! "
         "videoconvert ! "
         "video/x-raw, format=(string)BGR ! "
@@ -1605,7 +1963,19 @@ std::string MainWindow::makeGStreamerPipeline(const QString& cameraId, int width
         .arg(width)
         .arg(height)
         .arg(fps)
+        .arg(controls)
         .toStdString();
+}
+
+void MainWindow::applyExposureControls()
+{
+    // Pipeline-side controls are baked at start; for live updates we'd need
+    // libcamera-controls bus messages. Restart cameras to apply.
+    if (m_camerasOpen) {
+        m_statusBar->showMessage("Restarting cameras to apply exposure...", 2000);
+        closeCameras();
+        openCameras();
+    }
 }
 
 void MainWindow::openCameras()
@@ -1646,8 +2016,8 @@ void MainWindow::openCameras()
             return;
         }
     } else {
-        std::string p1 = makeGStreamerPipeline(camPaths[0], reqW, reqH, reqFps);
-        std::string p2 = makeGStreamerPipeline(camPaths[1], reqW, reqH, reqFps);
+        std::string p1 = makeGStreamerPipeline(camPaths[0], reqW, reqH, reqFps, 0);
+        std::string p2 = makeGStreamerPipeline(camPaths[1], reqW, reqH, reqFps, 1);
         m_worker->startCameras(p1, p2, reqW, reqH, reqFps);
     }
 
@@ -1710,8 +2080,8 @@ void MainWindow::closeCameras()
                 " font-size: 22px; font-weight: 800; }").arg(T::accent));
         }
     }
-    if (m_view1) { m_view1->clear(); m_view1->setText("Camera 1"); }
-    if (m_view2) { m_view2->clear(); m_view2->setText("Camera 2"); }
+    if (m_view1) { m_view1->setOverlayText("", false); m_view1->setPlaceholder("Camera 1"); }
+    if (m_view2) { m_view2->setOverlayText("", false); m_view2->setPlaceholder("Camera 2"); }
 
     if (m_motionIndicator) {
         m_motionIndicator->setText(QString::fromUtf8("\u25CF Idle"));
@@ -1803,27 +2173,31 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
 
 void MainWindow::onFramesProcessed(cv::Mat f1, cv::Mat f2, double focus1, double focus2, bool motionDetected, qint64 frameCount)
 {
+    if (m_worker) m_worker->m_pendingFrames.fetch_sub(1);
+
     m_frame1 = f1;
     m_frame2 = f2;
     m_lastFocus1 = focus1;
     m_lastFocus2 = focus2;
     m_frameCount = frameCount;
 
-    if (m_lblFocus1Big) m_lblFocus1Big->setText(QString::number(static_cast<int>(focus1)));
-    if (m_lblFocus2Big) m_lblFocus2Big->setText(QString::number(static_cast<int>(focus2)));
+    if (m_focusViewActive) {
+        if (m_lblFocus1Big) m_lblFocus1Big->setText(QString::number(static_cast<int>(focus1)));
+        if (m_lblFocus2Big) m_lblFocus2Big->setText(QString::number(static_cast<int>(focus2)));
 
-    if (m_seriesCam1 && m_seriesCam2 && m_chart) {
-        m_seriesCam1->append(frameCount, focus1);
-        m_seriesCam2->append(frameCount, focus2);
+        if (m_seriesCam1 && m_seriesCam2 && m_chart) {
+            m_seriesCam1->append(frameCount, focus1);
+            m_seriesCam2->append(frameCount, focus2);
 
-        int diff1 = m_seriesCam1->count() - m_maxHistory;
-        if (diff1 > 0) m_seriesCam1->removePoints(0, diff1);
-        int diff2 = m_seriesCam2->count() - m_maxHistory;
-        if (diff2 > 0) m_seriesCam2->removePoints(0, diff2);
+            int diff1 = m_seriesCam1->count() - m_maxHistory;
+            if (diff1 > 0) m_seriesCam1->removePoints(0, diff1);
+            int diff2 = m_seriesCam2->count() - m_maxHistory;
+            if (diff2 > 0) m_seriesCam2->removePoints(0, diff2);
 
-        auto axes = m_chart->axes(Qt::Horizontal);
-        if (!axes.isEmpty()) {
-            axes.first()->setRange(std::max(0LL, frameCount - m_maxHistory), frameCount);
+            auto axes = m_chart->axes(Qt::Horizontal);
+            if (!axes.isEmpty()) {
+                axes.first()->setRange(std::max(0LL, frameCount - m_maxHistory), frameCount);
+            }
         }
     }
 
@@ -1922,50 +2296,22 @@ void MainWindow::updateView()
         cv::putText(img, label, cv::Point(pt.x + 25, pt.y + 5), cv::FONT_HERSHEY_SIMPLEX, 0.6, color, 2);
     };
 
-    auto drawOSD = [](cv::Mat& img, const std::string& camName, double focusScore,
-                      const cv::Scalar& textColor, bool rightAlign) {
-        if (img.channels() == 1) cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
-        std::string text = camName + "  Focus " + std::to_string(static_cast<int>(focusScore));
-        const int font = cv::FONT_HERSHEY_SIMPLEX;
-        const double scale = std::max(0.45, img.rows / 900.0);
-        const int thick = std::max(1, static_cast<int>(img.rows / 540.0 + 0.5));
-        int base = 0;
-        cv::Size ts = cv::getTextSize(text, font, scale, thick, &base);
-        const int padX = std::max(6, img.rows / 80);
-        const int padY = std::max(4, img.rows / 110);
-        const int margin = std::max(6, img.rows / 70);
-        int x = rightAlign ? (img.cols - margin - ts.width - padX * 2) : margin;
-        int y = margin;
-        cv::Rect pill(x, y, ts.width + padX * 2, ts.height + padY * 2);
-        pill &= cv::Rect(0, 0, img.cols, img.rows);
-        if (pill.width > 0 && pill.height > 0) {
-            cv::Mat roi = img(pill);
-            cv::Mat bg(roi.size(), roi.type(), cv::Scalar(14, 16, 19));
-            cv::addWeighted(bg, 0.82, roi, 0.18, 0.0, roi);
-        }
-        cv::putText(img, text, cv::Point(x + padX, y + padY + ts.height - 1),
-                    font, scale, textColor, thick, cv::LINE_AA);
-    };
-
-    if (m_osd1) m_osd1->hide();
-    if (m_osd2) m_osd2->hide();
-    if (m_osdResult) m_osdResult->hide();
-
     if (!m_isDiffMode)
     {
         m_resultView->hide();
         m_splitter->show();
 
-        if (f1.channels() == 1) cv::cvtColor(f1, f1, cv::COLOR_GRAY2BGR);
-        if (alignedF2.channels() == 1) cv::cvtColor(alignedF2, alignedF2, cv::COLOR_GRAY2BGR);
-
-        drawOSD(f1, "CAM1", m_lastFocus1, cv::Scalar(0xb0, 0xc9, 0x4e), false);
-        drawOSD(alignedF2, "CAM2", m_lastFocus2, cv::Scalar(0x78, 0x91, 0xce), true);
-
         if (showPeaks) {
+            if (f1.channels() == 1) cv::cvtColor(f1, f1, cv::COLOR_GRAY2BGR);
+            if (alignedF2.channels() == 1) cv::cvtColor(alignedF2, alignedF2, cv::COLOR_GRAY2BGR);
             drawTarget(f1, maxLoc1, cv::Scalar(0, 255, 255), "Max 1");
             drawTarget(alignedF2, maxLoc2, cv::Scalar(0, 255, 255), "Max 2");
         }
+
+        m_view1->setOverlayColor(QColor(0x4e, 0xc9, 0xb0));
+        m_view1->setOverlayText(QString("CAM1  Focus %1").arg(static_cast<int>(m_lastFocus1)), false);
+        m_view2->setOverlayColor(QColor(0xce, 0x91, 0x78));
+        m_view2->setOverlayText(QString("CAM2  Focus %1").arg(static_cast<int>(m_lastFocus2)), true);
 
         displayMat(m_view1, f1);
         displayMat(m_view2, alignedF2);
@@ -1976,12 +2322,14 @@ void MainWindow::updateView()
         m_resultView->show();
 
         cv::Mat diff = applyDiffView(f1, alignedF2);
-        drawOSD(diff, "DIFF", 0.0, cv::Scalar(0xff, 0xff, 0xff), false);
 
         if (showPeaks) {
             drawTarget(diff, maxLoc1, cv::Scalar(0, 255, 255), "P1");
             drawTarget(diff, maxLoc2, cv::Scalar(255, 0, 255), "P2");
         }
+
+        m_resultView->setOverlayColor(QColor(0xff, 0xff, 0xff));
+        m_resultView->setOverlayText("DIFF", false);
 
         m_lastDiffResult = diff.clone();
         displayMat(m_resultView, diff);
@@ -2120,29 +2468,407 @@ double MainWindow::calculateFocus(const cv::Mat& frame)
     return stddev.val[0] * stddev.val[0];
 }
 
-void MainWindow::displayMat(QLabel* label, const cv::Mat& mat)
+void MainWindow::displayMat(GpuImageView* view, const cv::Mat& mat)
 {
-    if (mat.empty() || label == nullptr) return;
+    if (mat.empty() || view == nullptr) return;
 
-    if (mat.channels() == 1) {
-        QImage img(mat.data, mat.cols, mat.rows, static_cast<int>(mat.step), QImage::Format_Grayscale8);
-        label->setPixmap(QPixmap::fromImage(img));
+    cv::Mat src = mat;
+    const int targetW = std::max(1, view->width());
+    const int targetH = std::max(1, view->height());
+    if (src.cols > targetW * 2 || src.rows > targetH * 2) {
+        double k = std::min(static_cast<double>(targetW) / src.cols,
+                            static_cast<double>(targetH) / src.rows);
+        if (k > 0.0 && k < 1.0) {
+            cv::Mat small;
+            cv::resize(src, small, cv::Size(), k, k, cv::INTER_AREA);
+            src = small;
+        }
     }
-    else if (mat.channels() == 3) {
+
+    if (src.channels() == 1) {
+        QImage img(src.data, src.cols, src.rows, static_cast<int>(src.step), QImage::Format_Grayscale8);
+        view->setImage(img.copy());
+    }
+    else if (src.channels() == 3) {
         cv::Mat rgb;
-        cv::cvtColor(mat, rgb, cv::COLOR_BGR2RGB);
+        cv::cvtColor(src, rgb, cv::COLOR_BGR2RGB);
         QImage img(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
-        label->setPixmap(QPixmap::fromImage(img));
+        view->setImage(img.copy());
     }
+}
+
+QString MainWindow::buildSnapshotBaseName(const QString& prefix) const
+{
+    QString user = m_snapshotNameEdit ? m_snapshotNameEdit->text().trimmed() : QString();
+    QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+
+    QStringList parts;
+    auto enabled = [this](const QString& k, bool dflt = true) {
+        return m_paramInName.value(k, dflt);
+    };
+
+    if (m_chkAppendParams && m_chkAppendParams->isChecked()) {
+        if (enabled("BF") && m_chkBilateral && m_chkBilateral->isChecked()) {
+            parts << QString("BF%1").arg(m_bilateralSlider ? m_bilateralSlider->value() : m_bilateralStrength);
+        }
+        if (enabled("TB") && m_bufferSlider && m_bufferSlider->value() > 1) {
+            parts << QString("TB%1").arg(m_bufferSlider->value());
+        }
+        if (enabled("MT") && m_motionThresholdSlider && m_motionThresholdSlider->value() > 0) {
+            parts << QString("MT%1").arg(m_motionThresholdSlider->value());
+        }
+        if (enabled("FU") && m_chkFusion && m_chkFusion->isChecked()) parts << "FU";
+        if (enabled("ECC") && m_isAligned && m_chkAlign && m_chkAlign->isChecked()) parts << "ECC";
+        if (enabled("NF") && m_noiseFloorSlider && m_noiseFloorSlider->value() > 0) {
+            parts << QString("NF%1").arg(m_noiseFloorSlider->value());
+        }
+        if (enabled("ST") && m_chkStretch && m_chkStretch->isChecked()) parts << "ST";
+        if (enabled("G") && m_manualExposure) {
+            if (m_perCameraExposure) {
+                parts << QString("G1_%1x").arg(m_gainQ8  / 256.0, 0, 'f', 2);
+                parts << QString("G2_%1x").arg(m_gain2Q8 / 256.0, 0, 'f', 2);
+            } else {
+                parts << QString("G%1x").arg(m_gainQ8 / 256.0, 0, 'f', 2);
+            }
+        }
+        if (enabled("SH") && m_manualExposure) {
+            if (m_perCameraExposure) {
+                parts << QString("SH1_%1us").arg(m_shutterUs);
+                parts << QString("SH2_%1us").arg(m_shutter2Us);
+            } else {
+                parts << QString("SH%1us").arg(m_shutterUs);
+            }
+        }
+        if (enabled("CM")) {
+            switch (m_colorMode) {
+                case ColorMode::COLOR:      parts << "RGB"; break;
+                case ColorMode::GRAY_CV:    parts << "GRY"; break;
+                case ColorMode::GRAY_NATIVE: parts << "GRYN"; break;
+            }
+        }
+        if (enabled("FH") && m_chkFlipHor2 && m_chkFlipHor2->isChecked()) parts << "FH";
+        if (enabled("FV") && m_chkFlipVer2 && m_chkFlipVer2->isChecked()) parts << "FV";
+    }
+
+    QString result = prefix;
+    if (!user.isEmpty()) result += "_" + user;
+    if (!parts.isEmpty()) result += "_" + parts.join("_");
+    result += "_" + stamp;
+    return result;
+}
+
+void MainWindow::showFilenameParamsDialog()
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle("Filename parameters");
+    dlg.setStyleSheet(styleSheetText() + "QDialog { background: #1a1e24; }");
+    dlg.resize(440, 520);
+
+    QVBoxLayout* root = new QVBoxLayout(&dlg);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    QLabel* title = new QLabel("<b>Filename parameters</b>", &dlg);
+    title->setStyleSheet("padding: 20px 20px 5px 20px; font-size: 16px; color: #d8dde4;");
+    root->addWidget(title);
+
+    QLabel* hint = new QLabel("Only checked parameters appear in the filename, and only when their effect is active.", &dlg);
+    hint->setStyleSheet("padding: 0px 20px 14px 20px; color: #8a94a3; font-size: 11px;");
+    hint->setWordWrap(true);
+    root->addWidget(hint);
+
+    QScrollArea* scroll = new QScrollArea(&dlg);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setStyleSheet("QScrollArea { background: transparent; } QWidget#fpScrollContent { background: transparent; }");
+
+    QWidget* scrollContent = new QWidget();
+    scrollContent->setObjectName("fpScrollContent");
+    QVBoxLayout* listLay = new QVBoxLayout(scrollContent);
+    listLay->setContentsMargins(20, 0, 20, 20);
+    listLay->setSpacing(6);
+
+    QMap<QString, QCheckBox*> boxes;
+    for (const auto& spec : kFilenameParamSpecs) {
+        QString key = QString::fromLatin1(spec.key);
+        QFrame* row = new QFrame();
+        row->setProperty("role", "panel");
+        QHBoxLayout* rowLay = new QHBoxLayout(row);
+        rowLay->setContentsMargins(12, 6, 12, 6);
+
+        QCheckBox* cb = new QCheckBox(spec.label, row);
+        cb->setChecked(m_paramInName.value(key, true));
+        cb->setStyleSheet("font-size: 13px;");
+        rowLay->addWidget(cb, 1);
+
+        listLay->addWidget(row);
+        boxes.insert(key, cb);
+    }
+    listLay->addStretch();
+
+    scroll->setWidget(scrollContent);
+    root->addWidget(scroll, 1);
+
+    QFrame* bottomBar = new QFrame(&dlg);
+    bottomBar->setStyleSheet("background: #14171c; border-top: 1px solid #272c34;");
+    QHBoxLayout* btns = new QHBoxLayout(bottomBar);
+    btns->setContentsMargins(20, 14, 20, 14);
+
+    QPushButton* btnAll  = new QPushButton("All", bottomBar);
+    btnAll->setProperty("kind", "ghost");
+    QPushButton* btnNone = new QPushButton("None", bottomBar);
+    btnNone->setProperty("kind", "ghost");
+    QPushButton* btnOk   = new QPushButton("OK", bottomBar);
+    btnOk->setProperty("kind", "primary");
+    QPushButton* btnCancel = new QPushButton("Cancel", bottomBar);
+    btnCancel->setProperty("kind", "ghost");
+    btns->addWidget(btnAll);
+    btns->addWidget(btnNone);
+    btns->addStretch();
+    btns->addWidget(btnCancel);
+    btns->addWidget(btnOk);
+    root->addWidget(bottomBar);
+
+    connect(btnAll, &QPushButton::clicked, &dlg, [&boxes]() {
+        for (auto* cb : boxes) cb->setChecked(true);
+    });
+    connect(btnNone, &QPushButton::clicked, &dlg, [&boxes]() {
+        for (auto* cb : boxes) cb->setChecked(false);
+    });
+    connect(btnCancel, &QPushButton::clicked, &dlg, &QDialog::reject);
+    connect(btnOk, &QPushButton::clicked, &dlg, &QDialog::accept);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    for (auto it = boxes.constBegin(); it != boxes.constEnd(); ++it) {
+        m_paramInName[it.key()] = it.value()->isChecked();
+    }
+
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    s.beginGroup("FilenameParams");
+    for (auto it = m_paramInName.constBegin(); it != m_paramInName.constEnd(); ++it) {
+        s.setValue(it.key(), it.value());
+    }
+    s.endGroup();
+
+    if (m_statusBar) m_statusBar->showMessage("Filename parameter selection saved.", 3000);
+}
+
+void MainWindow::showExposureDialog()
+{
+    if (!m_manualExposure) return;
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("Manual exposure");
+    dlg.setStyleSheet(styleSheetText() + "QDialog { background: #1a1e24; }");
+    dlg.resize(480, 320);
+
+    QVBoxLayout* root = new QVBoxLayout(&dlg);
+    root->setContentsMargins(20, 20, 20, 20);
+    root->setSpacing(14);
+
+    QCheckBox* chkPerCam = new QCheckBox("Per-camera exposure (separate Cam1 / Cam2)", &dlg);
+    chkPerCam->setChecked(m_perCameraExposure);
+    chkPerCam->setStyleSheet("font-size: 12px; color: #d8dde4;");
+    root->addWidget(chkPerCam);
+
+    // Cam1 / Cam2 toggle row (shown only in per-camera mode)
+    QFrame* camToggleRow = new QFrame(&dlg);
+    camToggleRow->setProperty("role", "panel");
+    QHBoxLayout* camToggleLay = new QHBoxLayout(camToggleRow);
+    camToggleLay->setContentsMargins(14, 8, 14, 8);
+    camToggleLay->setSpacing(8);
+    QLabel* camLbl = new QLabel("Camera:", camToggleRow);
+    camLbl->setStyleSheet("font-weight: 600; font-size: 12px; color: #d8dde4;");
+    camToggleLay->addWidget(camLbl);
+    QPushButton* btnCam1 = new QPushButton("Cam1", camToggleRow);
+    QPushButton* btnCam2 = new QPushButton("Cam2", camToggleRow);
+    btnCam1->setCheckable(true);
+    btnCam2->setCheckable(true);
+    btnCam1->setCursor(Qt::PointingHandCursor);
+    btnCam2->setCursor(Qt::PointingHandCursor);
+    QString camBtnSty = QString(
+        "QPushButton { background: %1; color: %2; border: 1px solid %3; border-radius: 4px;"
+        " padding: 6px 16px; font-weight: 600; }"
+        "QPushButton:checked { background: %4; color: #0a1220; border-color: %4; }")
+        .arg(T::bg2).arg(T::text).arg(T::border).arg(T::accent);
+    btnCam1->setStyleSheet(camBtnSty);
+    btnCam2->setStyleSheet(camBtnSty);
+    btnCam1->setChecked(true);
+    camToggleLay->addWidget(btnCam1);
+    camToggleLay->addWidget(btnCam2);
+    camToggleLay->addStretch();
+    root->addWidget(camToggleRow);
+    camToggleRow->setVisible(m_perCameraExposure);
+
+    auto buildRow = [&dlg](const QString& title, QWidget* spin, QSlider* slider) -> QFrame* {
+        QFrame* row = new QFrame(&dlg);
+        row->setProperty("role", "panel");
+        QVBoxLayout* lay = new QVBoxLayout(row);
+        lay->setContentsMargins(14, 10, 14, 10);
+        lay->setSpacing(6);
+
+        QHBoxLayout* head = new QHBoxLayout();
+        QLabel* lbl = new QLabel(title, row);
+        lbl->setStyleSheet("font-weight: 600; font-size: 12px; color: #d8dde4;");
+        head->addWidget(lbl);
+        head->addStretch();
+        head->addWidget(spin);
+        lay->addLayout(head);
+        lay->addWidget(slider);
+        return row;
+    };
+
+    // Single set of editor widgets in the dialog. They proxy to whichever
+    // backing pair (Cam1 or Cam2) is currently selected.
+    QDoubleSpinBox* spnG = new QDoubleSpinBox(&dlg);
+    spnG->setRange(0.1, 10.0);
+    spnG->setDecimals(2);
+    spnG->setSingleStep(0.1);
+    spnG->setSuffix("x");
+    spnG->setKeyboardTracking(false);
+    spnG->setFixedWidth(100);
+
+    QSlider* sldG = new QSlider(Qt::Horizontal, &dlg);
+    sldG->setRange(10, 1000);
+    sldG->setSingleStep(10);
+    sldG->setPageStep(50);
+    sldG->setMinimumWidth(280);
+
+    QSpinBox* spnS = new QSpinBox(&dlg);
+    spnS->setRange(50, 30000);
+    spnS->setSingleStep(100);
+    spnS->setSuffix(" us");
+    spnS->setKeyboardTracking(false);
+    spnS->setFixedWidth(120);
+
+    QSlider* sldS = new QSlider(Qt::Horizontal, &dlg);
+    sldS->setRange(50, 30000);
+    sldS->setSingleStep(100);
+    sldS->setPageStep(1000);
+    sldS->setMinimumWidth(280);
+
+    QFrame* rowG = buildRow("Gain (0.10x – 10.00x)",   spnG, sldG);
+    QFrame* rowS = buildRow("Shutter (50 – 30000 µs)", spnS, sldS);
+    root->addWidget(rowG);
+    root->addWidget(rowS);
+
+    // activeCam2 = false → editing Cam1 / shared, true → editing Cam2.
+    bool* activeCam2 = new bool(false);
+    dlg.connect(&dlg, &QDialog::destroyed, [activeCam2]{ delete activeCam2; });
+
+    auto loadValuesIntoEditors = [this, spnG, sldG, spnS, sldS, activeCam2]() {
+        double g; int sh;
+        if (m_perCameraExposure && *activeCam2) {
+            g = m_gain2Q8 / 256.0;  sh = m_shutter2Us;
+        } else {
+            g = m_gainQ8  / 256.0;  sh = m_shutterUs;
+        }
+        g  = qBound(0.1, g, 10.0);
+        sh = qBound(50, sh, 30000);
+        QSignalBlocker bg(spnG), bgs(sldG), bs(spnS), bss(sldS);
+        spnG->setValue(g);
+        sldG->setValue(static_cast<int>(g * 100.0 + 0.5));
+        spnS->setValue(sh);
+        sldS->setValue(sh);
+    };
+    loadValuesIntoEditors();
+
+    auto pushFromEditors = [this, spnG, spnS, activeCam2]() {
+        int  gQ8 = static_cast<int>(spnG->value() * 256.0 + 0.5);
+        int  shU = spnS->value();
+        if (m_perCameraExposure && *activeCam2) {
+            m_gain2Q8    = gQ8;
+            m_shutter2Us = shU;
+            // Mirror onto cam2 backing widgets so hotkeys/labels stay in sync.
+            if (m_spnGain2)    { QSignalBlocker b(m_spnGain2);    m_spnGain2->setValue(gQ8 / 256.0); }
+            if (m_sldGain2)    { QSignalBlocker b(m_sldGain2);    m_sldGain2->setValue(static_cast<int>((gQ8 / 256.0) * 100.0 + 0.5)); }
+            if (m_spnShutter2) { QSignalBlocker b(m_spnShutter2); m_spnShutter2->setValue(shU); }
+            if (m_sldShutter2) { QSignalBlocker b(m_sldShutter2); m_sldShutter2->setValue(shU); }
+        } else {
+            m_gainQ8    = gQ8;
+            m_shutterUs = shU;
+            if (m_spnGain)    { QSignalBlocker b(m_spnGain);    m_spnGain->setValue(gQ8 / 256.0); }
+            if (m_sldGain)    { QSignalBlocker b(m_sldGain);    m_sldGain->setValue(static_cast<int>((gQ8 / 256.0) * 100.0 + 0.5)); }
+            if (m_spnShutter) { QSignalBlocker b(m_spnShutter); m_spnShutter->setValue(shU); }
+            if (m_sldShutter) { QSignalBlocker b(m_sldShutter); m_sldShutter->setValue(shU); }
+        }
+        // Pill in the top bar updates via cam1/cam2 backing widgets' valueChanged → refreshExposureLabel,
+        // but we set them with QSignalBlocker, so trigger a rebuild manually:
+        if (m_lblExposureVals) {
+            double g1 = m_gainQ8 / 256.0;
+            int    s1 = m_shutterUs;
+            if (m_perCameraExposure) {
+                double g2 = m_gain2Q8 / 256.0;
+                int    s2 = m_shutter2Us;
+                m_lblExposureVals->setText(QString("%1x * %2 // %3x * %4")
+                    .arg(g1, 0, 'f', 2).arg(s1).arg(g2, 0, 'f', 2).arg(s2));
+            } else {
+                m_lblExposureVals->setText(QString("%1x * %2").arg(g1, 0, 'f', 2).arg(s1));
+            }
+        }
+        applyExposureControls();
+    };
+
+    // Wire spin↔slider within the dialog and push to backing on each edit.
+    connect(spnG, QOverload<double>::of(&QDoubleSpinBox::valueChanged), &dlg, [sldG, pushFromEditors](double v) {
+        QSignalBlocker b(sldG);
+        sldG->setValue(qBound(sldG->minimum(), static_cast<int>(v * 100.0 + 0.5), sldG->maximum()));
+        pushFromEditors();
+    });
+    connect(sldG, &QSlider::valueChanged, &dlg, [spnG, pushFromEditors](int v) {
+        QSignalBlocker b(spnG);
+        spnG->setValue(v / 100.0);
+        pushFromEditors();
+    });
+    connect(spnS, QOverload<int>::of(&QSpinBox::valueChanged), &dlg, [sldS, pushFromEditors](int v) {
+        QSignalBlocker b(sldS);
+        sldS->setValue(qBound(sldS->minimum(), v, sldS->maximum()));
+        pushFromEditors();
+    });
+    connect(sldS, &QSlider::valueChanged, &dlg, [spnS, pushFromEditors](int v) {
+        QSignalBlocker b(spnS);
+        spnS->setValue(v);
+        pushFromEditors();
+    });
+
+    // Cam1/Cam2 toggle behaviour.
+    auto selectCam = [activeCam2, btnCam1, btnCam2, loadValuesIntoEditors](bool cam2) {
+        *activeCam2 = cam2;
+        QSignalBlocker b1(btnCam1), b2(btnCam2);
+        btnCam1->setChecked(!cam2);
+        btnCam2->setChecked(cam2);
+        loadValuesIntoEditors();
+    };
+    connect(btnCam1, &QPushButton::clicked, &dlg, [selectCam]() { selectCam(false); });
+    connect(btnCam2, &QPushButton::clicked, &dlg, [selectCam]() { selectCam(true);  });
+
+    // Per-camera checkbox: toggles the cam toggle row + reverts to Cam1 when off.
+    connect(chkPerCam, &QCheckBox::toggled, &dlg, [this, camToggleRow, selectCam](bool on) {
+        m_perCameraExposure = on;
+        camToggleRow->setVisible(on);
+        if (!on) selectCam(false);
+        else      selectCam(false); // start at Cam1 in per-camera mode too
+        applyExposureControls();
+    });
+
+    QHBoxLayout* btns = new QHBoxLayout();
+    btns->addStretch();
+    QPushButton* btnClose = new QPushButton("Close", &dlg);
+    btnClose->setProperty("kind", "primary");
+    btns->addWidget(btnClose);
+    root->addLayout(btns);
+    connect(btnClose, &QPushButton::clicked, &dlg, &QDialog::accept);
+
+    dlg.exec();
 }
 
 void MainWindow::saveSnapshot()
 {
-    int mode = m_comboSnapshotMode->currentIndex();
-    if (mode == 2) {
+    if (m_isDiffMode) {
         saveDiffSnapshot();
     } else {
-        saveDualSnapshot(mode == 0);
+        saveDualSnapshot(true);
     }
 }
 
@@ -2156,30 +2882,14 @@ void MainWindow::saveDiffSnapshot()
     QString metricsDir = QCoreApplication::applicationDirPath() + "/metrics";
     QDir().mkpath(metricsDir);
 
-    auto writeMeta = [&](const QString& jsonPath) {
-        QJsonObject obj;
-        obj["T-buffer"] = m_bufferSlider ? m_bufferSlider->value() : 0;
-        obj["Motion THR"] = m_motionThresholdSlider ? m_motionThresholdSlider->value() : 0;
-        obj["Fusion"] = (m_chkFusion && m_chkFusion->isChecked()) ? "On" : "Off";
-        obj["ECC"] = m_isAligned ? "On" : "Off";
-        obj["Bilateral Filter"] = (m_chkBilateral && m_chkBilateral->isChecked()) ? "On" : "Off";
-        QJsonDocument doc(obj);
-        QFile f(jsonPath);
-        if(f.open(QIODevice::WriteOnly)) { f.write(doc.toJson()); f.close(); }
-    };
-
-    QString baseName = m_snapshotNameEdit ? m_snapshotNameEdit->text().trimmed() : "";
-    if (baseName.isEmpty()) baseName = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    else baseName += "_" + QDateTime::currentDateTime().toString("HHmmss");
-
-    QString filename = "diff_" + baseName;
+    QString filename = buildSnapshotBaseName("diff");
     QString filePath = metricsDir + "/" + filename + ".png";
     QString jsonPath = metricsDir + "/" + filename + ".json";
 
     bool success = cv::imwrite(filePath.toStdString(), m_lastDiffResult);
 
     if (success) {
-        writeMeta(jsonPath);
+        writeSnapshotMeta(jsonPath, "diff");
         m_statusBar->showMessage("Saved snapshot: " + filePath, 4000);
     }
     else {
@@ -2197,21 +2907,7 @@ void MainWindow::saveDualSnapshot(bool combined)
     QString metricsDir = QCoreApplication::applicationDirPath() + "/metrics";
     QDir().mkpath(metricsDir);
 
-    auto writeMeta = [&](const QString& jsonPath) {
-        QJsonObject obj;
-        obj["T-buffer"] = m_bufferSlider ? m_bufferSlider->value() : 0;
-        obj["Motion THR"] = m_motionThresholdSlider ? m_motionThresholdSlider->value() : 0;
-        obj["Fusion"] = (m_chkFusion && m_chkFusion->isChecked()) ? "On" : "Off";
-        obj["ECC"] = m_isAligned ? "On" : "Off";
-        obj["Bilateral Filter"] = (m_chkBilateral && m_chkBilateral->isChecked()) ? "On" : "Off";
-        QJsonDocument doc(obj);
-        QFile f(jsonPath);
-        if(f.open(QIODevice::WriteOnly)) { f.write(doc.toJson()); f.close(); }
-    };
-
-    QString baseName = m_snapshotNameEdit ? m_snapshotNameEdit->text().trimmed() : "";
-    if (baseName.isEmpty()) baseName = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    else baseName += "_" + QDateTime::currentDateTime().toString("HHmmss");
+    QString baseName = buildSnapshotBaseName("dual");
 
     cv::Mat f1 = m_frame1.clone();
     cv::Mat f2 = m_frame2.clone();
@@ -2225,20 +2921,20 @@ void MainWindow::saveDualSnapshot(bool combined)
         }
         cv::Mat combo;
         cv::hconcat(f1, f2, combo);
-        QString filename = "dual_" + baseName;
+        QString filename = baseName;
         QString path = metricsDir + "/" + filename + ".png";
         bool ok = cv::imwrite(path.toStdString(), combo);
-        if (ok) writeMeta(metricsDir + "/" + filename + ".json");
+        if (ok) writeSnapshotMeta(metricsDir + "/" + filename + ".json", "dual_combined");
         m_statusBar->showMessage(ok ? "Saved: " + path : "Error saving: " + path, 4000);
     } else {
-        QString filename1 = "dual1_" + baseName;
-        QString filename2 = "dual2_" + baseName;
+        QString filename1 = baseName + "_cam1";
+        QString filename2 = baseName + "_cam2";
         QString path1 = metricsDir + "/" + filename1 + ".png";
         QString path2 = metricsDir + "/" + filename2 + ".png";
         bool ok1 = cv::imwrite(path1.toStdString(), f1);
         bool ok2 = cv::imwrite(path2.toStdString(), f2);
-        if (ok1) writeMeta(metricsDir + "/" + filename1 + ".json");
-        if (ok2) writeMeta(metricsDir + "/" + filename2 + ".json");
+        if (ok1) writeSnapshotMeta(metricsDir + "/" + filename1 + ".json", "dual_cam1");
+        if (ok2) writeSnapshotMeta(metricsDir + "/" + filename2 + ".json", "dual_cam2");
         if (ok1 && ok2)
             m_statusBar->showMessage("Saved cam1 and cam2 snapshots.", 4000);
         else
@@ -2246,11 +2942,82 @@ void MainWindow::saveDualSnapshot(bool combined)
     }
 }
 
-static QString settingsPath()
+void MainWindow::writeSnapshotMeta(const QString& jsonPath, const QString& mode) const
 {
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
-    QDir().mkpath(dir);
-    return dir + "/dualcam.ini";
+    QJsonObject obj;
+
+    obj["mode"]      = mode;
+    obj["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    obj["userName"]  = m_snapshotNameEdit ? m_snapshotNameEdit->text().trimmed() : QString();
+
+    // Color / flip
+    QString colorStr;
+    switch (m_colorMode) {
+        case ColorMode::COLOR:       colorStr = "RGB";        break;
+        case ColorMode::GRAY_CV:     colorStr = "GRAY_CV";    break;
+        case ColorMode::GRAY_NATIVE: colorStr = "GRAY_NATIVE"; break;
+    }
+    obj["colorMode"] = colorStr;
+    obj["flipHorizontal2"] = m_chkFlipHor2 && m_chkFlipHor2->isChecked();
+    obj["flipVertical2"]   = m_chkFlipVer2 && m_chkFlipVer2->isChecked();
+
+    // Pipeline
+    obj["timeBuffer"]      = m_bufferSlider ? m_bufferSlider->value() : 0;
+    obj["motionThreshold"] = m_motionThresholdSlider ? m_motionThresholdSlider->value() : 0;
+    obj["fusion"]          = m_chkFusion && m_chkFusion->isChecked();
+    obj["bilateralFilter"] = m_chkBilateral && m_chkBilateral->isChecked();
+    obj["bilateralStrength"] = m_bilateralSlider ? m_bilateralSlider->value() : m_bilateralStrength;
+    obj["noiseFloor"]      = m_noiseFloorSlider ? m_noiseFloorSlider->value() : m_noiseFloor;
+    obj["intensityStretch"] = m_chkStretch && m_chkStretch->isChecked();
+    obj["trackPeaks"]      = m_btnPeakIntensities && m_btnPeakIntensities->isChecked();
+
+    // Alignment
+    QJsonObject align;
+    align["enabled"]    = m_chkAlign && m_chkAlign->isChecked();
+    align["calibrated"] = m_isAligned;
+    align["activeCam"]  = m_activeAdjCam;
+    auto adjToJson = [](const ManualAdjust& a) {
+        QJsonObject o;
+        o["tx"] = a.tx; o["ty"] = a.ty; o["scale"] = a.scale;
+        o["rx"] = a.rx; o["ry"] = a.ry; o["rz"] = a.rz;
+        return o;
+    };
+    align["manualCam1"] = adjToJson(m_manualAdj1);
+    align["manualCam2"] = adjToJson(m_manualAdj2);
+    obj["alignment"] = align;
+
+    // Exposure
+    QJsonObject exposure;
+    exposure["mode"]       = m_manualExposure ? "manual" : "auto";
+    exposure["perCamera"]  = m_perCameraExposure;
+    if (m_perCameraExposure) {
+        QJsonObject c1; c1["gain"] = m_gainQ8  / 256.0; c1["shutterUs"] = m_shutterUs;
+        QJsonObject c2; c2["gain"] = m_gain2Q8 / 256.0; c2["shutterUs"] = m_shutter2Us;
+        exposure["cam1"] = c1;
+        exposure["cam2"] = c2;
+    } else {
+        exposure["gain"]      = m_gainQ8 / 256.0;
+        exposure["shutterUs"] = m_shutterUs;
+    }
+    obj["exposure"] = exposure;
+
+    // Focus / motion (last reading)
+    QJsonObject focus;
+    focus["cam1"] = m_lastFocus1;
+    focus["cam2"] = m_lastFocus2;
+    obj["focus"] = focus;
+    obj["motionActive"] = m_motionActive;
+
+    // Frame mode
+    obj["diffMode"]   = m_isDiffMode;
+    obj["frameCount"] = m_frameCount;
+
+    QJsonDocument doc(obj);
+    QFile f(jsonPath);
+    if (f.open(QIODevice::WriteOnly)) {
+        f.write(doc.toJson());
+        f.close();
+    }
 }
 
 void MainWindow::saveSettings()
@@ -2264,10 +3031,22 @@ void MainWindow::saveSettings()
     s.setValue("motionThreshold", m_motionThresholdSlider->value());
     s.setValue("fusion", m_chkFusion->isChecked());
     s.setValue("bilateral", m_chkBilateral->isChecked());
+    s.setValue("bilateralStrength", m_bilateralSlider ? m_bilateralSlider->value() : m_bilateralStrength);
     s.setValue("noiseFloor", m_noiseFloorSlider->value());
     s.setValue("stretchIntensity", m_chkStretch->isChecked());
     s.setValue("trackPeaks", m_btnPeakIntensities->isChecked());
-    s.setValue("snapshotMode", m_comboSnapshotMode->currentIndex());
+    s.setValue("appendParams", m_chkAppendParams ? m_chkAppendParams->isChecked() : false);
+    s.beginGroup("FilenameParams");
+    for (auto it = m_paramInName.constBegin(); it != m_paramInName.constEnd(); ++it) {
+        s.setValue(it.key(), it.value());
+    }
+    s.endGroup();
+    s.setValue("manualExposure", m_manualExposure);
+    s.setValue("perCameraExposure", m_perCameraExposure);
+    s.setValue("gainQ8", m_gainQ8);
+    s.setValue("shutterUs", m_shutterUs);
+    s.setValue("gain2Q8", m_gain2Q8);
+    s.setValue("shutter2Us", m_shutter2Us);
     s.setValue("maxHistory", m_historySpinBox->value());
     s.setValue("diffMode", m_isDiffMode);
     s.setValue("sheetOpen", m_sheetOpen);
@@ -2283,6 +3062,7 @@ void MainWindow::saveSettings()
     writeAdj("adj1/", m_manualAdj1);
     writeAdj("adj2/", m_manualAdj2);
     s.setValue("activeAdjCam", m_activeAdjCam);
+    s.sync();
 }
 
 void MainWindow::loadSettings()
@@ -2296,10 +3076,43 @@ void MainWindow::loadSettings()
     m_motionThresholdSlider->setValue(s.value("motionThreshold", 5).toInt());
     m_chkFusion->setChecked(s.value("fusion", false).toBool());
     m_chkBilateral->setChecked(s.value("bilateral", false).toBool());
+    if (m_bilateralSlider) m_bilateralSlider->setValue(s.value("bilateralStrength", 5).toInt());
     m_noiseFloorSlider->setValue(s.value("noiseFloor", 15).toInt());
     m_chkStretch->setChecked(s.value("stretchIntensity", false).toBool());
     m_btnPeakIntensities->setChecked(s.value("trackPeaks", false).toBool());
-    m_comboSnapshotMode->setCurrentIndex(s.value("snapshotMode", 0).toInt());
+    if (m_chkAppendParams) m_chkAppendParams->setChecked(s.value("appendParams", false).toBool());
+    s.beginGroup("FilenameParams");
+    for (const auto& spec : kFilenameParamSpecs) {
+        QString key = QString::fromLatin1(spec.key);
+        m_paramInName[key] = s.value(key, true).toBool();
+    }
+    s.endGroup();
+    m_gainQ8     = s.value("gainQ8",     256).toInt();
+    m_shutterUs  = s.value("shutterUs",  10000).toInt();
+    m_gain2Q8    = s.value("gain2Q8",    m_gainQ8).toInt();
+    m_shutter2Us = s.value("shutter2Us", m_shutterUs).toInt();
+    m_perCameraExposure = s.value("perCameraExposure", false).toBool();
+
+    double gainVal     = qBound(0.1, m_gainQ8    / 256.0, 10.0);
+    double gain2Val    = qBound(0.1, m_gain2Q8   / 256.0, 10.0);
+    int    shutterVal  = qBound(50,  m_shutterUs,  30000);
+    int    shutter2Val = qBound(50,  m_shutter2Us, 30000);
+    m_gainQ8     = static_cast<int>(gainVal  * 256.0 + 0.5);
+    m_gain2Q8    = static_cast<int>(gain2Val * 256.0 + 0.5);
+    m_shutterUs  = shutterVal;
+    m_shutter2Us = shutter2Val;
+
+    if (m_spnGain)     { QSignalBlocker b(m_spnGain);     m_spnGain->setValue(gainVal); }
+    if (m_sldGain)     { QSignalBlocker b(m_sldGain);     m_sldGain->setValue(static_cast<int>(gainVal * 100.0 + 0.5)); }
+    if (m_spnShutter)  { QSignalBlocker b(m_spnShutter);  m_spnShutter->setValue(shutterVal); }
+    if (m_sldShutter)  { QSignalBlocker b(m_sldShutter);  m_sldShutter->setValue(shutterVal); }
+    if (m_spnGain2)    { QSignalBlocker b(m_spnGain2);    m_spnGain2->setValue(gain2Val); }
+    if (m_sldGain2)    { QSignalBlocker b(m_sldGain2);    m_sldGain2->setValue(static_cast<int>(gain2Val * 100.0 + 0.5)); }
+    if (m_spnShutter2) { QSignalBlocker b(m_spnShutter2); m_spnShutter2->setValue(shutter2Val); }
+    if (m_sldShutter2) { QSignalBlocker b(m_sldShutter2); m_sldShutter2->setValue(shutter2Val); }
+
+    bool me = s.value("manualExposure", false).toBool();
+    if (m_btnExpToggle) m_btnExpToggle->setChecked(me);
     int maxH = s.value("maxHistory", 200).toInt();
     m_historySpinBox->setValue(maxH);
     m_historySlider->setValue(maxH);
@@ -2345,10 +3158,10 @@ void MainWindow::savePreset(const QString& name)
     s.setValue("motionThreshold", m_motionThresholdSlider->value());
     s.setValue("fusion", m_chkFusion->isChecked());
     s.setValue("bilateral", m_chkBilateral->isChecked());
+    s.setValue("bilateralStrength", m_bilateralSlider ? m_bilateralSlider->value() : m_bilateralStrength);
     s.setValue("noiseFloor", m_noiseFloorSlider->value());
     s.setValue("stretchIntensity", m_chkStretch->isChecked());
     s.setValue("trackPeaks", m_btnPeakIntensities->isChecked());
-    s.setValue("snapshotMode", m_comboSnapshotMode->currentIndex());
     s.setValue("diffMode", m_isDiffMode);
     auto writeAdj = [&s](const QString& prefix, const ManualAdjust& a) {
         s.setValue(prefix + "tx", a.tx);
@@ -2379,10 +3192,10 @@ void MainWindow::loadPreset(const QString& name)
     m_motionThresholdSlider->setValue(s.value("motionThreshold", 5).toInt());
     m_chkFusion->setChecked(s.value("fusion", false).toBool());
     m_chkBilateral->setChecked(s.value("bilateral", false).toBool());
+    if (m_bilateralSlider) m_bilateralSlider->setValue(s.value("bilateralStrength", 5).toInt());
     m_noiseFloorSlider->setValue(s.value("noiseFloor", 15).toInt());
     m_chkStretch->setChecked(s.value("stretchIntensity", false).toBool());
     m_btnPeakIntensities->setChecked(s.value("trackPeaks", false).toBool());
-    m_comboSnapshotMode->setCurrentIndex(s.value("snapshotMode", 0).toInt());
     bool diffMode = s.value("diffMode", m_isDiffMode).toBool();
     setDiffMode(diffMode);
     auto readAdj = [&s](const QString& prefix, ManualAdjust& a) {
@@ -2559,17 +3372,57 @@ void MainWindow::initCommands()
         {"cmd_snapshot", "Take Snapshot", "Capture", CmdType::Action, [this](){ saveSnapshot(); refreshSnapshotPreview(); }, {}},
         {"cmd_mode", "Toggle Dual / Diff Mode", "Capture", CmdType::Action, [this](){ setDiffMode(!m_isDiffMode); }, {}},
         {"cmd_focus", "Toggle Focus View", "Capture", CmdType::Action, [this](){ toggleFocusView(); }, {}},
-        
+        {"cmd_sheet", "Toggle Bottom Sheet", "Capture", CmdType::Action, [this](){ toggleSheet(); }, {}},
+        {"cmd_color_mode", "Cycle Color Mode", "Capture", CmdType::Action, [this](){
+            if (!m_comboColorMode) return;
+            int n = m_comboColorMode->count();
+            if (n > 0) m_comboColorMode->setCurrentIndex((m_comboColorMode->currentIndex() + 1) % n);
+        }, {}},
+        {"cmd_flip_h2", "Toggle Flip Horizontal (Cam2)", "Capture", CmdType::Toggle, [this](){ if (m_chkFlipHor2) m_chkFlipHor2->setChecked(!m_chkFlipHor2->isChecked()); }, {}},
+        {"cmd_flip_v2", "Toggle Flip Vertical (Cam2)", "Capture", CmdType::Toggle, [this](){ if (m_chkFlipVer2) m_chkFlipVer2->setChecked(!m_chkFlipVer2->isChecked()); }, {}},
+
+        {"cmd_exposure_toggle", "Toggle Auto / Manual Exposure", "Exposure", CmdType::Toggle, [this](){ if (m_btnExpToggle) m_btnExpToggle->setChecked(!m_btnExpToggle->isChecked()); }, {}},
+        {"cmd_gain_inc", "Gain +0.1x", "Exposure", CmdType::Action, [this](){
+            if (m_spnGain && m_manualExposure) m_spnGain->setValue(qMin(m_spnGain->maximum(), m_spnGain->value() + 0.1));
+        }, {}},
+        {"cmd_gain_dec", "Gain -0.1x", "Exposure", CmdType::Action, [this](){
+            if (m_spnGain && m_manualExposure) m_spnGain->setValue(qMax(m_spnGain->minimum(), m_spnGain->value() - 0.1));
+        }, {}},
+        {"cmd_shutter_inc", "Shutter +500us", "Exposure", CmdType::Action, [this](){
+            if (m_spnShutter && m_manualExposure) m_spnShutter->setValue(qMin(m_spnShutter->maximum(), m_spnShutter->value() + 500));
+        }, {}},
+        {"cmd_shutter_dec", "Shutter -500us", "Exposure", CmdType::Action, [this](){
+            if (m_spnShutter && m_manualExposure) m_spnShutter->setValue(qMax(m_spnShutter->minimum(), m_spnShutter->value() - 500));
+        }, {}},
+
         {"cmd_ecc", "Toggle ECC Alignment", "Pipeline", CmdType::Toggle, [this](){ if (m_chkAlign) m_chkAlign->setChecked(!m_chkAlign->isChecked()); }, {}},
         {"cmd_fusion", "Toggle Fusion", "Pipeline", CmdType::Toggle, [this](){ if (m_chkFusion) m_chkFusion->setChecked(!m_chkFusion->isChecked()); }, {}},
         {"cmd_bilateral", "Toggle Bilateral Filter", "Pipeline", CmdType::Toggle, [this](){ if (m_chkBilateral) m_chkBilateral->setChecked(!m_chkBilateral->isChecked()); }, {}},
         {"cmd_stretch", "Toggle Intensity Stretch", "Pipeline", CmdType::Toggle, [this](){ if (m_chkStretch) m_chkStretch->setChecked(!m_chkStretch->isChecked()); }, {}},
         {"cmd_peaks", "Toggle Tracking Peaks", "Pipeline", CmdType::Toggle, [this](){ if (m_btnPeakIntensities) m_btnPeakIntensities->setChecked(!m_btnPeakIntensities->isChecked()); }, {}},
+        {"cmd_calibrate", "Calibrate ECC Alignment", "Pipeline", CmdType::Action, [this](){ calibrateAlignment(); }, {}},
+        {"cmd_open_align", "Open Manual Align Dialog", "Pipeline", CmdType::Action, [this](){ if (m_btnOpenManualAlign) m_btnOpenManualAlign->click(); }, {}},
 
         {"cmd_tbuffer", "Time Buffer Size", "Pipeline Parameters", CmdType::Parameter, {}, [this, createPopup](QWidget*){ createPopup("Time Buffer Size", m_bufferSlider); }},
         {"cmd_motionthr", "Motion Threshold", "Pipeline Parameters", CmdType::Parameter, {}, [this, createPopup](QWidget*){ createPopup("Motion Threshold", m_motionThresholdSlider); }},
         {"cmd_noisefloor", "Noise Floor", "Pipeline Parameters", CmdType::Parameter, {}, [this, createPopup](QWidget*){ createPopup("Noise Floor", m_noiseFloorSlider); }},
-        
+        {"cmd_exposure_dialog", "Open Exposure Dialog", "Exposure", CmdType::Action, [this](){ if (m_manualExposure) showExposureDialog(); }, {}},
+
+        {"cmd_rename_snapshot", "Edit Snapshot Name", "Snapshot", CmdType::Action, [this](){
+            if (m_tabWidget) m_tabWidget->setCurrentIndex(3);
+            if (!m_sheetOpen) toggleSheet();
+            if (m_snapshotNameEdit) {
+                m_snapshotNameEdit->setFocus();
+                m_snapshotNameEdit->selectAll();
+            }
+        }, {}},
+        {"cmd_append_params", "Toggle Append Params", "Snapshot", CmdType::Toggle, [this](){ if (m_chkAppendParams) m_chkAppendParams->setChecked(!m_chkAppendParams->isChecked()); }, {}},
+        {"cmd_filename_config", "Configure Filename Params", "Snapshot", CmdType::Action, [this](){ showFilenameParamsDialog(); }, {}},
+
+        {"cmd_save_preset", "Save Current Preset", "Presets", CmdType::Action, [this](){ if (m_btnSavePreset) m_btnSavePreset->click(); }, {}},
+        {"cmd_load_preset", "Load Selected Preset", "Presets", CmdType::Action, [this](){ if (m_btnLoadPreset) m_btnLoadPreset->click(); }, {}},
+        {"cmd_delete_preset", "Delete Selected Preset", "Presets", CmdType::Action, [this](){ if (m_btnDeletePreset) m_btnDeletePreset->click(); }, {}},
+
         {"cmd_history", "Chart History Limit", "Options", CmdType::Parameter, {}, [this, createPopup](QWidget*){ createPopup("Chart History Limit", m_historySlider); }}
     };
 
