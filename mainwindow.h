@@ -12,6 +12,8 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/video/background_segm.hpp>
 
+#include "exif_writer.h"
+
 #include <deque>
 #include <thread>
 #include <atomic>
@@ -59,6 +61,17 @@ class QListWidget;
 
 enum class ColorMode { GRAY_NATIVE, GRAY_CV, COLOR };
 
+enum class NavItem {
+    None,
+    Capture,
+    Pipeline,
+    Diff,
+    Focus,
+    Snapshot,
+    Presets,
+    Gallery
+};
+
 class GpuImageView : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
 public:
@@ -67,6 +80,7 @@ public:
     void setPlaceholder(const QString& text);
     void setOverlayText(const QString& text, bool rightAlign);
     void setOverlayColor(const QColor& c) { m_overlayColor = c; update(); }
+    void setStretch(bool stretch) { m_stretch = stretch; update(); }
 
 protected:
     void initializeGL() override;
@@ -78,7 +92,8 @@ private:
     QString m_placeholder;
     QString m_overlayText;
     bool m_overlayRight = false;
-    QColor m_overlayColor{0x5a, 0xff, 0x8a};
+    bool m_stretch = false;
+    QColor m_overlayColor{0xe5, 0xe2, 0xe1};
 };
 
 struct ManualAdjust {
@@ -132,7 +147,7 @@ private:
     cv::VideoCapture m_cap1;
     cv::VideoCapture m_cap2;
     std::atomic<bool> m_running{false};
-    
+
     QMutex m_paramMutex;
     WorkerParams m_params;
 
@@ -166,6 +181,7 @@ protected:
     void resizeEvent(QResizeEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
     bool eventFilter(QObject* obj, QEvent* event) override;
 
 private slots:
@@ -188,19 +204,28 @@ private:
     QWidget* buildDiffTab();
     QWidget* buildSnapshotTab();
     QWidget* buildPresetsTab();
+    QWidget* buildGalleryView();
+    QWidget* buildSideNav();
     void buildAlignDialog();
     void positionFloatingButtons();
     void buildFocusChart();
     QWidget* buildFocusDataPanel();
     void toggleFocusView();
     void refreshSnapshotPreview();
+    void openPreviewWindow(const QString& imagePath, const QString& fileBase);
+    void minimizeAllDialogs();
     void updateEccPill();
     void updateFpsPill();
+    void setNavItem(NavItem item);
+    void toggleNavItem(NavItem item);
+    void setNavExpanded(bool expanded);
+    void togglePreviewMode();
+    void applyNavLabels();
 
     void saveDiffSnapshot();
     void saveDualSnapshot(bool combined);
     QString buildSnapshotBaseName(const QString& prefix) const;
-    void writeSnapshotMeta(const QString& jsonPath, const QString& mode) const;
+    ExifParams buildExifParams(const QString& mode) const;
 
     void displayMat(GpuImageView* view, const cv::Mat& mat);
     double calculateFocus(const cv::Mat& frame);
@@ -238,6 +263,10 @@ private:
     bool m_isDiffMode = false;
     bool m_sheetOpen = true;
     bool m_focusViewActive = false;
+    bool m_navExpanded = true;
+    bool m_previewMode = false;
+    NavItem m_currentNav = NavItem::Capture;
+    NavItem m_lastNonGalleryNav = NavItem::Capture;
     qint64 m_frameCount = 0;
     int m_maxHistory = 200;
 
@@ -263,9 +292,21 @@ private:
 
     QWidget* m_centralWidget;
     QWidget* m_videoArea;
-    QWidget* m_sheetWidget;
-    QTabWidget* m_tabWidget;
-    QStackedWidget* m_sheetStack;
+    QWidget* m_sheetWidget = nullptr;
+    QTabWidget* m_tabWidget = nullptr;
+    QStackedWidget* m_sheetStack = nullptr;
+    QSplitter* m_mainSplit = nullptr;
+    QSplitter* m_workSplit = nullptr;
+    QStackedWidget* m_workStack = nullptr;
+    QStackedWidget* m_bottomStack = nullptr;
+    QWidget* m_galleryView = nullptr;
+    QWidget* m_sideNav = nullptr;
+    QWidget* m_navInner = nullptr;
+    QPushButton* m_btnNavCollapse = nullptr;
+    QPushButton* m_btnPreviewMode = nullptr;
+    QPushButton* m_btnFloatingPreviewToggle = nullptr;
+    QMap<NavItem, QPushButton*> m_navButtons;
+    QListWidget* m_snapshotRecent = nullptr;
 
     QLabel* m_fpsPill;
     QLabel* m_eccPill;
@@ -275,19 +316,19 @@ private:
     QPushButton* m_btnExpToggle = nullptr;
     QPushButton* m_btnExpChange = nullptr;
     QLabel* m_lblExposureVals = nullptr;
-    QDoubleSpinBox* m_spnGain = nullptr;        // cam1 (or shared)
+    QDoubleSpinBox* m_spnGain = nullptr;
     QSpinBox* m_spnShutter = nullptr;
     QSlider* m_sldGain = nullptr;
     QSlider* m_sldShutter = nullptr;
-    QDoubleSpinBox* m_spnGain2 = nullptr;       // cam2 (per-camera mode)
+    QDoubleSpinBox* m_spnGain2 = nullptr;
     QSpinBox* m_spnShutter2 = nullptr;
     QSlider* m_sldGain2 = nullptr;
     QSlider* m_sldShutter2 = nullptr;
     bool m_manualExposure = false;
     bool m_perCameraExposure = false;
-    int m_gainQ8 = 256;        // analogue gain * 256 (cam1 / shared)
-    int m_shutterUs = 10000;   // exposure time us (cam1 / shared)
-    int m_gain2Q8 = 256;       // cam2 (per-camera mode)
+    int m_gainQ8 = 256;
+    int m_shutterUs = 10000;
+    int m_gain2Q8 = 256;
     int m_shutter2Us = 10000;
     void showExposureDialog();
 
@@ -310,12 +351,13 @@ private:
     QLabel* m_fabStreamIcon = nullptr;
     QLabel* m_fabSnapIcon = nullptr;
 
-    QPushButton* m_btnSheetHandle;
+    QPushButton* m_btnSheetHandle = nullptr;
 
     QPushButton* m_btnToggleCameras;
     QComboBox* m_comboColorMode;
     QCheckBox* m_chkFlipVer2;
     QCheckBox* m_chkFlipHor2;
+    QCheckBox* m_chkStretchView;
     QCheckBox* m_chkBilateral;
     QSlider* m_bilateralSlider;
     QLabel* m_bilateralLabel;
@@ -349,7 +391,7 @@ private:
     QLineSeries* m_seriesCam2;
 
     QWidget* m_focusDataWidget;
-    QListWidget* m_snapshotPreview;
+    QListWidget* m_snapshotPreview = nullptr;
     QLineEdit* m_snapshotNameEdit;
 
     QListWidget* m_presetList;
