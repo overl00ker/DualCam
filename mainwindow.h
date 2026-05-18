@@ -229,6 +229,7 @@ private:
 
     void displayMat(GpuImageView* view, const cv::Mat& mat);
     double calculateFocus(const cv::Mat& frame);
+    void pushWorkerParams();
 
     cv::Mat fuseCameras(const cv::Mat& a, const cv::Mat& b);
     cv::Mat applyDiffView(const cv::Mat& d1, const cv::Mat& d2);
@@ -261,7 +262,6 @@ private:
     bool m_camerasOpen = false;
     bool m_isAligned = false;
     bool m_isDiffMode = false;
-    bool m_sheetOpen = true;
     bool m_focusViewActive = false;
     bool m_navExpanded = true;
     bool m_previewMode = false;
@@ -269,10 +269,6 @@ private:
     NavItem m_lastNonGalleryNav = NavItem::Capture;
     qint64 m_frameCount = 0;
     int m_maxHistory = 200;
-
-    int m_dragStartPos = 0;
-    int m_dragStartHeight = 0;
-    bool m_isDraggingSheet = false;
 
     double m_lastFocus1 = 0.0;
     double m_lastFocus2 = 0.0;
@@ -292,8 +288,6 @@ private:
 
     QWidget* m_centralWidget;
     QWidget* m_videoArea;
-    QWidget* m_sheetWidget = nullptr;
-    QTabWidget* m_tabWidget = nullptr;
     QStackedWidget* m_sheetStack = nullptr;
     QSplitter* m_mainSplit = nullptr;
     QSplitter* m_workSplit = nullptr;
@@ -339,9 +333,6 @@ private:
     GpuImageView* m_view1;
     GpuImageView* m_view2;
     GpuImageView* m_resultView;
-    QLabel* m_osd1;
-    QLabel* m_osd2;
-    QLabel* m_osdResult;
     QSplitter* m_splitter;
     QPushButton* m_btnModeToggle;
     QPushButton* m_btnFocusToggle;
@@ -350,8 +341,6 @@ private:
     QComboBox* m_comboCamSet;
     QLabel* m_fabStreamIcon = nullptr;
     QLabel* m_fabSnapIcon = nullptr;
-
-    QPushButton* m_btnSheetHandle = nullptr;
 
     QPushButton* m_btnToggleCameras;
     QComboBox* m_comboColorMode;

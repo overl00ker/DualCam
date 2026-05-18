@@ -80,6 +80,8 @@
 #include <QEasingCurve>
 #include <QWidgetAction>
 #include <QColorDialog>
+#include <QFileDialog>
+#include <QTextStream>
 #include <QtDataVisualization/Q3DSurface>
 #include <QtDataVisualization/QSurface3DSeries>
 #include <QtDataVisualization/QSurfaceDataProxy>
@@ -171,28 +173,16 @@ void GpuImageView::paintGL()
         return;
     }
 
-    if (m_stretch) {
-
-        QSize is = m_image.size();
-        QSize ws = size();
-        double k = std::max(static_cast<double>(ws.width()) / is.width(),
-                            static_cast<double>(ws.height()) / is.height());
-        int dw = static_cast<int>(is.width() * k);
-        int dh = static_cast<int>(is.height() * k);
-        int dx = (ws.width() - dw) / 2;
-        int dy = (ws.height() - dh) / 2;
-        p.setRenderHint(QPainter::SmoothPixmapTransform, false);
-        p.drawImage(QRect(dx, dy, dw, dh), m_image);
-    } else {
-
-        QSize is = m_image.size();
-        QSize ws = size();
-        double k = std::min(static_cast<double>(ws.width()) / is.width(),
-                            static_cast<double>(ws.height()) / is.height());
-        int dw = static_cast<int>(is.width() * k);
-        int dh = static_cast<int>(is.height() * k);
-        int dx = (ws.width() - dw) / 2;
-        int dy = (ws.height() - dh) / 2;
+    {
+        const QSize is = m_image.size();
+        const QSize ws = size();
+        const double kx = static_cast<double>(ws.width())  / is.width();
+        const double ky = static_cast<double>(ws.height()) / is.height();
+        const double k  = m_stretch ? std::max(kx, ky) : std::min(kx, ky);
+        const int dw = static_cast<int>(is.width()  * k);
+        const int dh = static_cast<int>(is.height() * k);
+        const int dx = (ws.width()  - dw) / 2;
+        const int dy = (ws.height() - dh) / 2;
         p.setRenderHint(QPainter::SmoothPixmapTransform, false);
         p.drawImage(QRect(dx, dy, dw, dh), m_image);
     }
@@ -241,16 +231,18 @@ void CameraWorker::startCamerasV4L2(int id1, int id2, int w, int h, int fps) {
     m_cap1.open(id1, cv::CAP_DSHOW);
     m_cap2.open(id2, cv::CAP_DSHOW);
 #endif
-    if (m_cap1.isOpened()) {
-        m_cap1.set(cv::CAP_PROP_FRAME_WIDTH, w);
-        m_cap1.set(cv::CAP_PROP_FRAME_HEIGHT, h);
-        m_cap1.set(cv::CAP_PROP_FPS, fps);
+    if (!m_cap1.isOpened() || !m_cap2.isOpened()) {
+        emit cameraError("Failed to open one or both cameras (V4L2/DSHOW fallback)");
+        if (m_cap1.isOpened()) m_cap1.release();
+        if (m_cap2.isOpened()) m_cap2.release();
+        return;
     }
-    if (m_cap2.isOpened()) {
-        m_cap2.set(cv::CAP_PROP_FRAME_WIDTH, w);
-        m_cap2.set(cv::CAP_PROP_FRAME_HEIGHT, h);
-        m_cap2.set(cv::CAP_PROP_FPS, fps);
-    }
+    m_cap1.set(cv::CAP_PROP_FRAME_WIDTH, w);
+    m_cap1.set(cv::CAP_PROP_FRAME_HEIGHT, h);
+    m_cap1.set(cv::CAP_PROP_FPS, fps);
+    m_cap2.set(cv::CAP_PROP_FRAME_WIDTH, w);
+    m_cap2.set(cv::CAP_PROP_FRAME_HEIGHT, h);
+    m_cap2.set(cv::CAP_PROP_FPS, fps);
     m_running = true;
     start();
 }
@@ -283,7 +275,9 @@ cv::Mat CameraWorker::toWorkingFormat(const cv::Mat& frame, ColorMode mode) {
     }
     return res;
 }
-double CameraWorker::detectMotion(const cv::Mat& frame, double thr) {
+double CameraWorker::detectMotion(const cv::Mat& frame, double /*thr*/) {
+    // Caller compares the returned ratio against its own threshold;
+    // we only need the foreground-pixel fraction here.
     if (frame.empty()) return 0.0;
     cv::Mat fgMask;
     m_bgSubtractor->apply(frame, fgMask, 0.01);
@@ -407,6 +401,12 @@ static QRect displayRectFor(const QSize& widget, const QSize& image) {
     const int w = int(std::round(image.width()  * s));
     const int h = int(std::round(image.height() * s));
     return QRect((widget.width() - w) / 2, (widget.height() - h) / 2, w, h);
+}
+
+static QLabel* makeSectionLabel(const QString& t, QWidget* parent) {
+    QLabel* l = new QLabel(t.toUpper(), parent);
+    l->setProperty("role", "section");
+    return l;
 }
 }
 
@@ -705,6 +705,22 @@ static QWidget* makeProfileWindow(const cv::Mat& img, QPoint a, QPoint b, const 
 
     QVBoxLayout* lay = new QVBoxLayout(w);
     lay->setContentsMargins(8, 8, 8, 8);
+    lay->setSpacing(8);
+
+    QFrame* toolbar = new QFrame(w);
+    toolbar->setProperty("role", "card");
+    QHBoxLayout* tlay = new QHBoxLayout(toolbar);
+    tlay->setContentsMargins(10, 6, 10, 6);
+    tlay->setSpacing(10);
+    QPushButton* exportBtn = new QPushButton(QStringLiteral("Export CSV…"), toolbar);
+    exportBtn->setCursor(Qt::PointingHandCursor);
+    exportBtn->setToolTip("Export sampled line as CSV (compatible with Excel and Origin)");
+    tlay->addWidget(exportBtn);
+    tlay->addStretch();
+    QLabel* hintLbl = new QLabel(QStringLiteral("Drag on the image to update the profile."), toolbar);
+    hintLbl->setProperty("role", "faint");
+    tlay->addWidget(hintLbl);
+    lay->addWidget(toolbar);
 
     QChart* chart = new QChart();
     chart->setTitle(QString("Intensity along (%1,%2) → (%3,%4)").arg(a.x()).arg(a.y()).arg(b.x()).arg(b.y()));
@@ -747,13 +763,53 @@ static QWidget* makeProfileWindow(const cv::Mat& img, QPoint a, QPoint b, const 
         const double r = bilinear(img, 2, x, y);
         return 0.299 * r + 0.587 * g + 0.114 * b;
     };
+    // Keep raw samples so the user can export them as CSV.
+    struct ProfileSample { double dist; double xPix; double yPix; double intensity; };
+    std::vector<ProfileSample> samples;
+    samples.reserve(steps);
     for (int i = 0; i < steps; ++i) {
         const double t = double(i) / (steps - 1);
         double x, y; samplePoint(t, x, y);
-        s->append(t * length, sampleLuma(x, y));
+        const double luma = sampleLuma(x, y);
+        s->append(t * length, luma);
+        samples.push_back({ t * length, x, y, luma });
     }
     chart->addSeries(s);
     chart->legend()->setVisible(false);
+
+    QObject::connect(exportBtn, &QPushButton::clicked, w, [w, samples, title, a, b]() {
+        const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+        const QString suggested = QString("profile_%1_%2.csv")
+            .arg(title.isEmpty() ? "view" : title).arg(stamp);
+        const QString dir = QCoreApplication::applicationDirPath() + "/metrics";
+        QDir().mkpath(dir);
+        QString fileName = QFileDialog::getSaveFileName(w,
+            QStringLiteral("Export profile to CSV"),
+            dir + "/" + suggested,
+            QStringLiteral("CSV file (*.csv);;Tab-separated (*.tsv);;Text file (*.txt)"));
+        if (fileName.isEmpty()) return;
+        const bool tabSep = fileName.endsWith(".tsv", Qt::CaseInsensitive);
+        const QChar sep = tabSep ? QChar('\t') : QChar(',');
+        if (!fileName.contains('.')) fileName += tabSep ? ".tsv" : ".csv";
+
+        QFile f(fileName);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::warning(w, QStringLiteral("Export CSV"),
+                QStringLiteral("Cannot open file for writing:\n") + fileName);
+            return;
+        }
+        QTextStream out(&f);
+        out.setRealNumberPrecision(6);
+        out << "# Source: " << title << "\n";
+        out << "# Endpoints (px): (" << a.x() << ", " << a.y()
+            << ") -> (" << b.x() << ", " << b.y() << ")\n";
+        out << "# Samples: " << samples.size() << "\n";
+        out << "distance_px" << sep << "x_pix" << sep << "y_pix" << sep << "intensity\n";
+        for (const ProfileSample& sm : samples) {
+            out << sm.dist << sep << sm.xPix << sep << sm.yPix << sep << sm.intensity << "\n";
+        }
+        f.close();
+    });
 
     QValueAxis* axX = new QValueAxis();
     axX->setTitleText("distance, px");
@@ -815,14 +871,30 @@ static QWidget* makeSurfaceWindow(const cv::Mat& img, QRect roi, const QString& 
     tlay->setContentsMargins(10, 6, 10, 6);
     tlay->setSpacing(10);
 
-    QPushButton* colorBtn = new QPushButton("Color…", toolbar);
-    colorBtn->setCursor(Qt::PointingHandCursor);
-    QFrame* swatch = new QFrame(toolbar);
-    swatch->setFixedSize(28, 20);
-    swatch->setStyleSheet("background:#4ec9b0; border:1px solid rgba(255,255,255,0.15);");
+    QPushButton* lowColorBtn = new QPushButton("Low…", toolbar);
+    lowColorBtn->setCursor(Qt::PointingHandCursor);
+    QFrame* lowSwatch = new QFrame(toolbar);
+    lowSwatch->setFixedSize(28, 20);
+    QPushButton* highColorBtn = new QPushButton("High…", toolbar);
+    highColorBtn->setCursor(Qt::PointingHandCursor);
+    QFrame* highSwatch = new QFrame(toolbar);
+    highSwatch->setFixedSize(28, 20);
+    highSwatch->setStyleSheet("background:#4ec9b0; border:1px solid rgba(255,255,255,0.15);");
 
-    tlay->addWidget(colorBtn);
-    tlay->addWidget(swatch);
+    QPushButton* saveSnapBtn = new QPushButton("Save snapshot…", toolbar);
+    saveSnapBtn->setCursor(Qt::PointingHandCursor);
+    QPushButton* exportDataBtn = new QPushButton(QStringLiteral("Export CSV…"), toolbar);
+    exportDataBtn->setCursor(Qt::PointingHandCursor);
+    exportDataBtn->setToolTip("Export surface intensities as CSV (long or matrix form for Excel / Origin)");
+
+    tlay->addWidget(lowColorBtn);
+    tlay->addWidget(lowSwatch);
+    tlay->addSpacing(6);
+    tlay->addWidget(highColorBtn);
+    tlay->addWidget(highSwatch);
+    tlay->addSpacing(10);
+    tlay->addWidget(saveSnapBtn);
+    tlay->addWidget(exportDataBtn);
     QLabel* coordLbl = new QLabel(toolbar);
     coordLbl->setMinimumWidth(220);
     coordLbl->setText("Click a point to read X, Y, intensity");
@@ -898,30 +970,130 @@ static QWidget* makeSurfaceWindow(const cv::Mat& img, QRect roi, const QString& 
                           .arg(v.y(), 0, 'f', 0));
     });
 
-    auto applyGradient = [series, swatch](const QColor& c) {
+    QColor* lowColor  = new QColor(darkTheme ? QColor(58, 58, 58) : QColor(232, 232, 232));
+    QColor* highColor = new QColor(78, 201, 176);
+    QObject::connect(w, &QObject::destroyed, [lowColor, highColor]{ delete lowColor; delete highColor; });
+
+    auto applyGradient = [series, lowSwatch, highSwatch, lowColor, highColor]() {
         QLinearGradient gr;
-        gr.setColorAt(0.0, QColor(0, 0, 0));
-        gr.setColorAt(1.0, c);
+        gr.setColorAt(0.0, *lowColor);
+        gr.setColorAt(1.0, *highColor);
         series->setBaseGradient(gr);
         series->setColorStyle(Q3DTheme::ColorStyleRangeGradient);
-        swatch->setStyleSheet(QString("background:%1; border:1px solid rgba(255,255,255,0.15);").arg(c.name()));
+        lowSwatch->setStyleSheet(QString("background:%1; border:1px solid rgba(255,255,255,0.15);").arg(lowColor->name()));
+        highSwatch->setStyleSheet(QString("background:%1; border:1px solid rgba(255,255,255,0.15);").arg(highColor->name()));
     };
-    QColor initialColor(78, 201, 176);
-    applyGradient(initialColor);
+    applyGradient();
 
-    QPointer<QColorDialog> picker;
-    QObject::connect(colorBtn, &QPushButton::clicked, w, [w, applyGradient, picker, initialColor]() mutable {
-        if (picker) { picker->raise(); picker->activateWindow(); return; }
-        QColorDialog* d = new QColorDialog(initialColor, w);
+    auto openPicker = [w, applyGradient](QColor* slot, const QString& title) {
+        QColorDialog* d = new QColorDialog(*slot, w);
         d->setWindowFlag(Qt::Window);
         d->setAttribute(Qt::WA_DeleteOnClose);
         d->setOption(QColorDialog::NoButtons, true);
-        d->setWindowTitle("Surface color");
-        QObject::connect(d, &QColorDialog::currentColorChanged, w, [applyGradient](const QColor& c) {
-            if (c.isValid()) applyGradient(c);
+        d->setWindowTitle(title);
+        QObject::connect(d, &QColorDialog::currentColorChanged, w, [slot, applyGradient](const QColor& c) {
+            if (c.isValid()) { *slot = c; applyGradient(); }
         });
-        picker = d;
         d->show();
+    };
+    QObject::connect(lowColorBtn,  &QPushButton::clicked, w, [openPicker, lowColor]()  { openPicker(lowColor,  "Low color");  });
+    QObject::connect(highColorBtn, &QPushButton::clicked, w, [openPicker, highColor]() { openPicker(highColor, "High color"); });
+
+    // Capture sample grid + the resize factor so the exported coordinates can
+    // be mapped back to the original-image pixel space (we downsample for the
+    // 3D view, but a CSV with the original X/Y is more useful for analysis).
+    cv::Mat gridCopy = g.clone();
+    const double kBackX = (g.cols > 0) ? (double(r.width)  / double(g.cols)) : 1.0;
+    const double kBackY = (g.rows > 0) ? (double(r.height) / double(g.rows)) : 1.0;
+    const int    roiX0  = r.x;
+    const int    roiY0  = r.y;
+    QObject::connect(exportDataBtn, &QPushButton::clicked, w,
+        [w, gridCopy, kBackX, kBackY, roiX0, roiY0, title]() {
+        const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+        const QString suggested = QString("surface_%1_%2.csv")
+            .arg(title.isEmpty() ? "view" : title).arg(stamp);
+        const QString dir = QCoreApplication::applicationDirPath() + "/metrics";
+        QDir().mkpath(dir);
+        QString fileName = QFileDialog::getSaveFileName(w,
+            QStringLiteral("Export surface to CSV"),
+            dir + "/" + suggested,
+            QStringLiteral("Long form CSV — x,y,intensity (*.csv);;"
+                           "Matrix CSV — rows=Y, cols=X (*_matrix.csv);;"
+                           "Tab-separated long form (*.tsv)"),
+            nullptr);
+        if (fileName.isEmpty()) return;
+
+        const bool matrixForm = fileName.contains("_matrix", Qt::CaseInsensitive)
+                              || fileName.endsWith("_matrix.csv", Qt::CaseInsensitive);
+        const bool tabSep     = fileName.endsWith(".tsv", Qt::CaseInsensitive);
+        if (!fileName.contains('.')) fileName += matrixForm ? "_matrix.csv"
+                                              : (tabSep ? ".tsv" : ".csv");
+        const QChar sep = tabSep ? QChar('\t') : QChar(',');
+
+        QFile f(fileName);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::warning(w, QStringLiteral("Export CSV"),
+                QStringLiteral("Cannot open file for writing:\n") + fileName);
+            return;
+        }
+        QTextStream out(&f);
+        out << "# Source: " << title << "\n";
+        out << "# ROI offset in source image (px): x0=" << roiX0 << ", y0=" << roiY0 << "\n";
+        out << "# Grid: " << gridCopy.cols << " cols x " << gridCopy.rows << " rows\n";
+        out << "# Pixel scale (source px per sample): kx=" << kBackX << ", ky=" << kBackY << "\n";
+
+        if (matrixForm) {
+            // Header: empty corner, then X coordinates in source-image pixels.
+            out << "y\\x";
+            for (int x = 0; x < gridCopy.cols; ++x) {
+                const double sx = roiX0 + (x + 0.5) * kBackX;
+                out << sep << sx;
+            }
+            out << "\n";
+            for (int y = 0; y < gridCopy.rows; ++y) {
+                const double sy = roiY0 + (y + 0.5) * kBackY;
+                out << sy;
+                for (int x = 0; x < gridCopy.cols; ++x) {
+                    out << sep << int(gridCopy.at<uchar>(y, x));
+                }
+                out << "\n";
+            }
+        } else {
+            out << "x_pix" << sep << "y_pix" << sep << "intensity\n";
+            for (int y = 0; y < gridCopy.rows; ++y) {
+                const double sy = roiY0 + (y + 0.5) * kBackY;
+                for (int x = 0; x < gridCopy.cols; ++x) {
+                    const double sx = roiX0 + (x + 0.5) * kBackX;
+                    out << sx << sep << sy << sep << int(gridCopy.at<uchar>(y, x)) << "\n";
+                }
+            }
+        }
+        f.close();
+    });
+
+    QObject::connect(saveSnapBtn, &QPushButton::clicked, w, [w, surface, title]() {
+        QString suggested = QString("surface_%1_%2.png")
+            .arg(title.isEmpty() ? "view" : title)
+            .arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss"));
+        QString dir = QCoreApplication::applicationDirPath() + "/metrics";
+        QDir().mkpath(dir);
+        QString fileName = QFileDialog::getSaveFileName(w, "Save 3D snapshot",
+            dir + "/" + suggested,
+            "PNG image (*.png);;JPEG image (*.jpg *.jpeg)");
+        if (fileName.isEmpty()) return;
+        if (!fileName.endsWith(".png", Qt::CaseInsensitive)
+            && !fileName.endsWith(".jpg", Qt::CaseInsensitive)
+            && !fileName.endsWith(".jpeg", Qt::CaseInsensitive)) {
+            fileName += ".png";
+        }
+        QImage img = surface->renderToImage(8, surface->size());
+        if (img.isNull()) {
+            QMessageBox::warning(w, "Save 3D snapshot", "Failed to render image.");
+            return;
+        }
+        if (!img.save(fileName)) {
+            QMessageBox::warning(w, "Save 3D snapshot", "Failed to save:\n" + fileName);
+        }
     });
 
     surface->axisX()->setTitle("X");
@@ -1038,6 +1210,25 @@ QString MainWindow::styleSheetText() const
             border-radius: 0px; font-size: 11px; font-weight: 500;
         }
 
+        QMenu {
+            background: %2; color: %3; border: 1px solid %7;
+            padding: 4px 0px; font-size: 12px;
+        }
+        QMenu::item {
+            background: transparent; color: %3;
+            padding: 6px 22px 6px 18px;
+        }
+        QMenu::item:selected   { background: %6; color: %3; }
+        QMenu::item:disabled   { color: %10; }
+        QMenu::separator {
+            height: 1px; background: %7; margin: 4px 8px;
+        }
+        QMenu::indicator {
+            width: 14px; height: 14px; margin-left: 4px;
+        }
+        QMenu::indicator:non-exclusive:checked   { background: %5; border: 1px solid %5; }
+        QMenu::indicator:non-exclusive:unchecked { background: transparent; border: 1px solid %9; }
+
         /* Typography roles */
         QLabel { color: %3; }
         QLabel[role="dim"]     { color: %4;  font-size: 11px; }
@@ -1047,7 +1238,7 @@ QString MainWindow::styleSheetText() const
         QLabel[role="hero"]    { color: %3;  font-family: 'Space Mono','JetBrains Mono',monospace; font-size: 22px; font-weight: 700; }
         QLabel[role="mono"]    { color: %3;  font-family: 'Space Mono','JetBrains Mono',monospace; font-size: 11px; }
 
-        /* Pill (status indicator) â€” sourced from Mario Guzman segmented bottom bar idiom,
+        /* Pill (status indicator) -- sourced from Mario Guzman segmented bottom bar idiom,
            recolored for light-on-dark Adrenalin */
         QLabel[role="pill"] {
             background: %6; color: %4; border: 1px solid %7;
@@ -1066,7 +1257,7 @@ QString MainWindow::styleSheetText() const
         QFrame[role="panel"] { background: %2; border: 1px solid %7; border-radius: 0px; }
         QFrame[role="hud"]   { background: rgba(10,10,10,210); border: 1px solid %7; border-radius: 0px; }
 
-        /* Tabs â€” top-tab navigation idiom from AMD Adrenalin (calibration.md Source 8),
+        /* Tabs -- top-tab navigation idiom from AMD Adrenalin (calibration.md Source 8),
            hugging-left per skill anti-pattern fix (no setExpanding) */
         QTabWidget::pane { border: none; background: %2; }
         QTabBar { background: %2; qproperty-drawBase: 0; }
@@ -1081,7 +1272,7 @@ QString MainWindow::styleSheetText() const
         QTabBar::tab:selected         { color: %3; border-bottom: 2px solid %5; }
         QTabBar::tab:hover:!selected  { color: %3; }
 
-        /* Buttons â€” Apple HIG "Regular" approximation (tokens.md controlH 28),
+        /* Buttons -- Apple HIG "Regular" approximation (tokens.md controlH 28),
            but tightened to 22 min-height for Compact tier */
         QPushButton {
             background: %6; color: %3; border: 1px solid %7; border-radius: 0px;
@@ -1113,7 +1304,7 @@ QString MainWindow::styleSheetText() const
         }
         QPushButton[kind="quiet"]:hover { color: %3; }
 
-        /* Sheet handle â€” at Mario Guzman's small bottom-bar spec (22pt) */
+        /* Sheet handle -- at Mario Guzman's small bottom-bar spec (22pt) */
         QPushButton#sheetHandle {
             background: %2; border: none;
             border-top: 1px solid %7; border-bottom: 1px solid %7;
@@ -1121,7 +1312,7 @@ QString MainWindow::styleSheetText() const
         }
         QPushButton#sheetHandle:hover { background: %6; color: %3; }
 
-        /* Inputs â€” monospace, Adrenalin "telemetry" treatment */
+        /* Inputs -- monospace, Adrenalin "telemetry" treatment */
         QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
             background: %8; color: %3; border: 1px solid %7; border-radius: 0px;
             padding: 4px 8px; min-height: 22px;
@@ -1136,7 +1327,7 @@ QString MainWindow::styleSheetText() const
             font-family: 'Space Mono','JetBrains Mono',monospace; font-size: 11px;
         }
 
-        /* Checkboxes â€” small for Compact tier */
+        /* Checkboxes -- small for Compact tier */
         QCheckBox { color: %3; spacing: 6px; font-size: 12px; }
         QCheckBox::indicator {
             width: 14px; height: 14px; border-radius: 0px;
@@ -1146,14 +1337,30 @@ QString MainWindow::styleSheetText() const
         QCheckBox::indicator:checked  { background: %5; border-color: %5; }
         QCheckBox::indicator:disabled { background: %2; border-color: %7; }
 
-        /* Sliders â€” thin rectangle handle, accent-fill sub-page */
-        QSlider::groove:horizontal { background: %8; height: 2px; border-radius: 0px; }
+        /* Sliders -- rectangle handle sized to align with button baseline (22-28px),
+           accent-fill sub-page. Handle height matches QPushButton min-height so
+           sliders read as peers of the 2D/3D toggle rather than as decoration. */
+        QSlider::horizontal { min-height: 22px; }
+        QSlider::groove:horizontal { background: %8; height: 4px; border: 1px solid %7; border-radius: 0px; }
         QSlider::sub-page:horizontal { background: %5; }
         QSlider::add-page:horizontal { background: %8; }
         QSlider::handle:horizontal {
-            background: %3; width: 3px; height: 14px; margin: -7px 0; border-radius: 0px;
+            background: %3; width: 8px; height: 22px; margin: -9px 0;
+            border: 1px solid %5; border-radius: 0px;
         }
-        QSlider::handle:horizontal:hover { background: %5; }
+        QSlider::handle:horizontal:hover    { background: %5; border-color: %3; }
+        QSlider::handle:horizontal:pressed  { background: %11; border-color: %3; }
+        QSlider::handle:horizontal:disabled { background: %8; border-color: %7; }
+
+        QSlider::vertical { min-width: 22px; }
+        QSlider::groove:vertical { background: %8; width: 4px; border: 1px solid %7; border-radius: 0px; }
+        QSlider::sub-page:vertical { background: %8; }
+        QSlider::add-page:vertical { background: %5; }
+        QSlider::handle:vertical {
+            background: %3; height: 8px; width: 22px; margin: 0 -9px;
+            border: 1px solid %5; border-radius: 0px;
+        }
+        QSlider::handle:vertical:hover { background: %5; border-color: %3; }
 
         /* Lists */
         QListWidget {
@@ -1166,7 +1373,7 @@ QString MainWindow::styleSheetText() const
         QListWidget::item:selected { background: %6; color: %3; border-left: 2px solid %5; padding-left: 8px; }
         QListWidget::item:hover    { background: %6; }
 
-        /* Status bar â€” Mario small bottom-bar 22pt, Space Mono telemetry */
+        /* Status bar — Mario small bottom-bar 22pt, Space Mono telemetry */
         QStatusBar {
             background: %2; color: %4;
             border-top: 1px solid %7;
@@ -1175,13 +1382,13 @@ QString MainWindow::styleSheetText() const
         }
         QStatusBar::item { border: none; }
 
-        /* Splitter â€” 2px gap, DESIGN.md "pitch black background as natural border" */
+        /* Splitter — 2px gap, DESIGN.md "pitch black background as natural border" */
         QSplitter::handle           { background: %1; }
         QSplitter::handle:horizontal { width: 2px; }
         QSplitter::handle:vertical   { height: 2px; }
         QSplitter::handle:hover      { background: %5; }
 
-        /* Scrollbars â€” slim, hover-revealed accent */
+        /* Scrollbars — slim, hover-revealed accent */
         QScrollBar:vertical   { background: %2; width: 8px; }
         QScrollBar:horizontal { background: %2; height: 8px; }
         QScrollBar::handle:vertical   { background: %9; min-height: 24px; border-radius: 0px; }
@@ -1482,13 +1689,10 @@ void MainWindow::initUI()
 
     m_view1 = makeView("CAM 1");
     m_view2 = makeView("CAM 2");
-    m_osd1 = nullptr;
-    m_osd2 = nullptr;
     m_splitter->addWidget(m_view1);
     m_splitter->addWidget(m_view2);
 
     m_resultView = makeView("RESULT");
-    m_osdResult = nullptr;
     m_resultView->hide();
 
     vidLay->addWidget(m_splitter, 1);
@@ -1516,18 +1720,20 @@ void MainWindow::initUI()
         "QPushButton { background: rgba(20,20,20,230); border: 1px solid %1; border-radius: 0px; }"
         "QPushButton:hover { background: rgba(40,12,12,230); border: 1px solid %2; }")
         .arg(T::border).arg(T::accent));
-    {
-        m_fabStreamIcon = new QLabel(QString::fromUtf8("\u25B6"), m_btnFabStream);
-        m_fabStreamIcon->setAttribute(Qt::WA_TransparentForMouseEvents);
-        m_fabStreamIcon->setAlignment(Qt::AlignCenter);
-        m_fabStreamIcon->setStyleSheet(QString(
-            "QLabel { background: transparent; color: %1; border: none;"
-            " font-family: 'Segoe UI Symbol','Segoe UI Emoji','Arial Unicode MS';"
-            " font-size: 14px; font-weight: 700; }").arg(T::text));
-        QVBoxLayout* fabLay = new QVBoxLayout(m_btnFabStream);
-        fabLay->setContentsMargins(0, 0, 0, 0);
-        fabLay->addWidget(m_fabStreamIcon, 0, Qt::AlignCenter);
-    }
+    auto addFabIcon = [](QPushButton* btn, const QString& text, const QString& style) -> QLabel* {
+        QLabel* icon = new QLabel(text, btn);
+        icon->setAttribute(Qt::WA_TransparentForMouseEvents);
+        icon->setAlignment(Qt::AlignCenter);
+        icon->setStyleSheet(style);
+        QVBoxLayout* lay = new QVBoxLayout(btn);
+        lay->setContentsMargins(0, 0, 0, 0);
+        lay->addWidget(icon, 0, Qt::AlignCenter);
+        return icon;
+    };
+    m_fabStreamIcon = addFabIcon(m_btnFabStream, QString::fromUtf8("\u25B6"), QString(
+        "QLabel { background: transparent; color: %1; border: none;"
+        " font-family: 'Segoe UI Symbol','Segoe UI Emoji','Arial Unicode MS';"
+        " font-size: 14px; font-weight: 700; }").arg(T::text));
     connect(m_btnFabStream, &QPushButton::clicked, this, [this]() {
         if (m_camerasOpen) closeCameras();
         else openCameras();
@@ -1557,18 +1763,10 @@ void MainWindow::initUI()
         "QPushButton:hover { background: %3; border-color: %4; }"
         "QPushButton:pressed { background: %2; }")
         .arg(T::accent).arg(T::accentDim).arg(T::accentDim).arg(T::text));
-    {
-        m_fabSnapIcon = new QLabel("SNAP", m_btnFabSnapshot);
-        m_fabSnapIcon->setAttribute(Qt::WA_TransparentForMouseEvents);
-        m_fabSnapIcon->setAlignment(Qt::AlignCenter);
-        m_fabSnapIcon->setStyleSheet(QString(
-            "QLabel { background: transparent; color: %1; border: none;"
-            " font-family: 'Space Mono','JetBrains Mono',monospace;"
-            " font-size: 11px; font-weight: 800; letter-spacing: 0.10em; }").arg(T::text));
-        QVBoxLayout* snapLay = new QVBoxLayout(m_btnFabSnapshot);
-        snapLay->setContentsMargins(0, 0, 0, 0);
-        snapLay->addWidget(m_fabSnapIcon, 0, Qt::AlignCenter);
-    }
+    m_fabSnapIcon = addFabIcon(m_btnFabSnapshot, "SNAP", QString(
+        "QLabel { background: transparent; color: %1; border: none;"
+        " font-family: 'Space Mono','JetBrains Mono',monospace;"
+        " font-size: 11px; font-weight: 800; letter-spacing: 0.10em; }").arg(T::text));
     connect(m_btnFabSnapshot, &QPushButton::clicked, this, [this]() {
         saveSnapshot();
         refreshSnapshotPreview();
@@ -1647,32 +1845,15 @@ QWidget* MainWindow::buildCaptureTab()
     grid->setHorizontalSpacing(20);
     grid->setVerticalSpacing(6);
 
-    auto sectionLabel = [this](const QString& t) {
-        QLabel* l = new QLabel(t.toUpper(), this);
-        l->setProperty("role", "section");
-        return l;
-    };
-
-    auto updateWorkerParams = [this]() {
-        WorkerParams p;
-        p.colorMode = m_colorMode;
-        p.flipHor2 = m_chkFlipHor2->isChecked();
-        p.flipVer2 = m_chkFlipVer2->isChecked();
-        p.motionThr = m_motionThreshold;
-        p.bufferSize = m_bufferSize;
-        p.applyBilateral = m_chkBilateral->isChecked();
-        p.bilateralStrength = m_bilateralStrength;
-        p.noiseFloor = m_noiseFloor;
-        m_worker->setParams(p);
-    };
+    auto sectionLabel = [this](const QString& t) { return makeSectionLabel(t, this); };
 
     grid->addWidget(sectionLabel("COLOR"), 0, 0);
     m_comboColorMode = new QComboBox(this);
     m_comboColorMode->addItems({ "Gray Native", "Gray CV", "Color" });
     m_comboColorMode->setCurrentIndex(1);
-    connect(m_comboColorMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, updateWorkerParams](int i) {
+    connect(m_comboColorMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
         m_colorMode = static_cast<ColorMode>(i);
-        updateWorkerParams();
+        pushWorkerParams();
     });
     grid->addWidget(m_comboColorMode, 1, 0);
 
@@ -1682,8 +1863,8 @@ QWidget* MainWindow::buildCaptureTab()
     flipLay->setContentsMargins(0, 0, 0, 0);
     m_chkFlipHor2 = new QCheckBox("Horizontal", this);
     m_chkFlipVer2 = new QCheckBox("Vertical", this);
-    connect(m_chkFlipHor2, &QCheckBox::stateChanged, updateWorkerParams);
-    connect(m_chkFlipVer2, &QCheckBox::stateChanged, updateWorkerParams);
+    connect(m_chkFlipHor2, &QCheckBox::stateChanged, this, [this](int) { pushWorkerParams(); });
+    connect(m_chkFlipVer2, &QCheckBox::stateChanged, this, [this](int) { pushWorkerParams(); });
     flipLay->addWidget(m_chkFlipHor2);
     flipLay->addWidget(m_chkFlipVer2);
     flipLay->addStretch();
@@ -1695,18 +1876,18 @@ QWidget* MainWindow::buildCaptureTab()
     bfLay->setContentsMargins(0, 0, 0, 0);
     bfLay->setSpacing(6);
     m_chkBilateral = new QCheckBox("On", this);
-    connect(m_chkBilateral, &QCheckBox::stateChanged, updateWorkerParams);
+    connect(m_chkBilateral, &QCheckBox::stateChanged, this, [this](int) { pushWorkerParams(); });
     m_bilateralSlider = new QSlider(Qt::Horizontal, this);
     m_bilateralSlider->setRange(1, 20);
     m_bilateralSlider->setValue(m_bilateralStrength);
     m_bilateralSlider->setToolTip("Filter strength (radius & sigma)");
     m_bilateralLabel = new QLabel(QString::number(m_bilateralStrength), this);
-    m_bilateralLabel->setFixedWidth(24);
+    m_bilateralLabel->setFixedWidth(28);
     m_bilateralLabel->setAlignment(Qt::AlignCenter);
-    connect(m_bilateralSlider, &QSlider::valueChanged, this, [this, updateWorkerParams](int v) {
+    connect(m_bilateralSlider, &QSlider::valueChanged, this, [this](int v) {
         m_bilateralStrength = v;
         m_bilateralLabel->setText(QString::number(v));
-        updateWorkerParams();
+        pushWorkerParams();
     });
     bfLay->addWidget(m_chkBilateral);
     bfLay->addWidget(m_bilateralSlider, 1);
@@ -1738,28 +1919,11 @@ QWidget* MainWindow::buildPipelineTab()
     root->setContentsMargins(14, 12, 14, 12);
     root->setSpacing(10);
 
-    auto updateWorkerParams = [this]() {
-        WorkerParams p;
-        p.colorMode = m_colorMode;
-        p.flipHor2 = m_chkFlipHor2->isChecked();
-        p.flipVer2 = m_chkFlipVer2->isChecked();
-        p.motionThr = m_motionThreshold;
-        p.bufferSize = m_bufferSize;
-        p.applyBilateral = m_chkBilateral->isChecked();
-        p.bilateralStrength = m_bilateralStrength;
-        p.noiseFloor = m_noiseFloor;
-        m_worker->setParams(p);
-    };
-
     QGridLayout* row1 = new QGridLayout();
     row1->setHorizontalSpacing(20);
     row1->setVerticalSpacing(4);
 
-    auto sectionLabel = [this](const QString& t) {
-        QLabel* l = new QLabel(t.toUpper(), this);
-        l->setProperty("role", "section");
-        return l;
-    };
+    auto sectionLabel = [this](const QString& t) { return makeSectionLabel(t, this); };
 
     row1->addWidget(sectionLabel("T-BUFFER"), 0, 0);
     QWidget* bufBox = new QWidget(this);
@@ -1771,10 +1935,10 @@ QWidget* MainWindow::buildPipelineTab()
     m_bufferLabel = new QLabel(QString::number(m_bufferSize), this);
     m_bufferLabel->setFixedWidth(28);
     m_bufferLabel->setAlignment(Qt::AlignCenter);
-    connect(m_bufferSlider, &QSlider::valueChanged, this, [this, updateWorkerParams](int v) {
+    connect(m_bufferSlider, &QSlider::valueChanged, this, [this](int v) {
         m_bufferSize = v;
         m_bufferLabel->setText(QString::number(v));
-        updateWorkerParams();
+        pushWorkerParams();
     });
     bufLay->addWidget(m_bufferSlider, 1);
     bufLay->addWidget(m_bufferLabel);
@@ -1790,10 +1954,10 @@ QWidget* MainWindow::buildPipelineTab()
     m_motionThresholdLabel = new QLabel(QString("%1%").arg(m_motionThreshold * 100, 0, 'f', 0), this);
     m_motionThresholdLabel->setFixedWidth(40);
     m_motionThresholdLabel->setAlignment(Qt::AlignCenter);
-    connect(m_motionThresholdSlider, &QSlider::valueChanged, this, [this, updateWorkerParams](int v) {
+    connect(m_motionThresholdSlider, &QSlider::valueChanged, this, [this](int v) {
         m_motionThreshold = static_cast<double>(v) / 100.0;
         m_motionThresholdLabel->setText(QString("%1%").arg(v));
-        updateWorkerParams();
+        pushWorkerParams();
     });
     motLay->addWidget(m_motionThresholdSlider, 1);
     motLay->addWidget(m_motionThresholdLabel);
@@ -1878,24 +2042,7 @@ QWidget* MainWindow::buildDiffTab()
     grid->setHorizontalSpacing(20);
     grid->setVerticalSpacing(6);
 
-    auto updateWorkerParams = [this]() {
-        WorkerParams p;
-        p.colorMode = m_colorMode;
-        p.flipHor2 = m_chkFlipHor2->isChecked();
-        p.flipVer2 = m_chkFlipVer2->isChecked();
-        p.motionThr = m_motionThreshold;
-        p.bufferSize = m_bufferSize;
-        p.applyBilateral = m_chkBilateral->isChecked();
-        p.bilateralStrength = m_bilateralStrength;
-        p.noiseFloor = m_noiseFloor;
-        m_worker->setParams(p);
-    };
-
-    auto sectionLabel = [this](const QString& t) {
-        QLabel* l = new QLabel(t.toUpper(), this);
-        l->setProperty("role", "section");
-        return l;
-    };
+    auto sectionLabel = [this](const QString& t) { return makeSectionLabel(t, this); };
 
     grid->addWidget(sectionLabel("NOISE FLOOR"), 0, 0);
     QWidget* nfBox = new QWidget(this);
@@ -1907,10 +2054,10 @@ QWidget* MainWindow::buildDiffTab()
     m_noiseFloorLabel = new QLabel(QString::number(m_noiseFloor), this);
     m_noiseFloorLabel->setFixedWidth(28);
     m_noiseFloorLabel->setAlignment(Qt::AlignCenter);
-    connect(m_noiseFloorSlider, &QSlider::valueChanged, this, [this, updateWorkerParams](int v) {
+    connect(m_noiseFloorSlider, &QSlider::valueChanged, this, [this](int v) {
         m_noiseFloor = v;
         m_noiseFloorLabel->setText(QString::number(v));
-        updateWorkerParams();
+        pushWorkerParams();
     });
     nfLay->addWidget(m_noiseFloorSlider, 1);
     nfLay->addWidget(m_noiseFloorLabel);
@@ -1974,7 +2121,8 @@ void MainWindow::buildFocusChart()
 
     QValueAxis* axisY = new QValueAxis;
     axisY->setTitleText("Focus Score");
-    axisY->setRange(0, 5000);
+    // Initial range; autoscaled in onFramesProcessed based on observed max.
+    axisY->setRange(0, 100);
     axisY->setLabelsColor(QColor(T::text));
     axisY->setTitleBrush(QBrush(QColor(T::textDim)));
     axisY->setGridLineColor(QColor(T::border));
@@ -2165,6 +2313,7 @@ QWidget* MainWindow::buildSnapshotTab()
         QListWidgetItem* item = m_snapshotRecent->itemAt(pos);
         if (!item) return;
         QMenu menu(this);
+        menu.setStyleSheet(styleSheetText());
         QAction* openAct = menu.addAction("Preview");
         QAction* renameAct = menu.addAction("Rename");
         QAction* dltAct = menu.addAction("Delete");
@@ -2349,7 +2498,7 @@ QWidget* MainWindow::buildSideNav()
         b->setText(QString("%1   %2")
                    .arg(QString::fromLatin1(spec.glyph),
                         QString::fromLatin1(spec.label)));
-        b->setToolTip(QString("%1 â€” %2")
+        b->setToolTip(QString("%1 — %2")
                       .arg(QString::fromLatin1(spec.label),
                            QString::fromLatin1(spec.tip)));
         b->setStyleSheet(QString(
@@ -2702,6 +2851,13 @@ void MainWindow::openPreviewWindow(const QString& imagePath, const QString& file
     canvas->onRectSelected([this, analysisSrc, fileBase, dlgPtr, themeBtn](QRect r) {
         const bool dark = themeBtn->value() == 1;
         QWidget* w = makeSurfaceWindow(analysisSrc, r, fileBase, dark, this);
+        // After the 3D surface window closes, ask camera views to repaint —
+        // workaround for GL backbuffer being invalidated on close.
+        connect(w, &QObject::destroyed, this, [this]() {
+            if (m_view1) m_view1->update();
+            if (m_view2) m_view2->update();
+            if (m_resultView) m_resultView->update();
+        });
         w->show();
     });
 
@@ -2786,13 +2942,13 @@ void MainWindow::buildAlignDialog()
     m_alignDialog->setModal(false);
     m_alignDialog->resize(620, 460);
 
+    // Local overrides only bump the dialog's typography and control padding;
+    // sliders inherit the global proportional sizing from styleSheetText().
     m_alignDialog->setStyleSheet(styleSheetText() + QString(R"(
         QDialog QLabel { font-size: 12px; font-weight: 600; }
         QDialog QComboBox { font-size: 12px; padding: 4px 10px; min-height: 24px; }
         QDialog QDoubleSpinBox { font-size: 12px; padding: 4px 8px; min-height: 24px; }
         QDialog QPushButton { font-size: 12px; font-weight: 600; padding: 6px 16px; min-height: 26px; }
-        QDialog QSlider::groove:horizontal { height: 3px; }
-        QDialog QSlider::handle:horizontal { width: 4px; height: 16px; margin: -8px 0; }
     )"));
 
     QVBoxLayout* root = new QVBoxLayout(m_alignDialog);
@@ -2978,10 +3134,8 @@ void MainWindow::resizeEvent(QResizeEvent* event)
 
     if (m_fpsPill) m_fpsPill->setVisible(!ultraCompact);
     if (m_eccPill) m_eccPill->setVisible(!ultraCompact);
-    if (m_btnGallery) m_btnGallery->setText(compact ? QStringLiteral("â¤“") : QStringLiteral("Snapshots"));
-
-    int sheetMax = std::max(132, height() / 2);
-    if (m_sheetWidget) m_sheetWidget->setMaximumHeight(sheetMax);
+    // Compact view: use a small camera glyph in place of the word "Snapshots".
+    if (m_btnGallery) m_btnGallery->setText(compact ? QStringLiteral("▣") : QStringLiteral("Snapshots"));
 }
 
 void MainWindow::toggleFocusView()
@@ -3214,7 +3368,8 @@ void MainWindow::openCameras()
     m_seriesCam2->clear();
 
     m_chart->axes(Qt::Horizontal).first()->setRange(0, m_maxHistory);
-    m_chart->axes(Qt::Vertical).first()->setRange(0, 1000);
+    // Y range autoscales as data arrives; start small so an empty axis isn't huge.
+    m_chart->axes(Qt::Vertical).first()->setRange(0, 100);
 
     m_btnFabStream->setObjectName("fabStreamStop");
     m_btnFabStream->style()->unpolish(m_btnFabStream);
@@ -3314,42 +3469,8 @@ cv::Mat MainWindow::applyDiffView(const cv::Mat& d1, const cv::Mat& d2)
 
 bool MainWindow::eventFilter(QObject* obj, QEvent* event)
 {
-    if (obj == m_btnSheetHandle) {
-        if (event->type() == QEvent::MouseButtonPress) {
-            QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
-            if (mouseEvent->button() == Qt::LeftButton) {
-                m_dragStartPos = mouseEvent->globalPosition().toPoint().y();
-                m_dragStartHeight = m_sheetWidget->height();
-                m_isDraggingSheet = true;
-                return true;
-            }
-        } else if (event->type() == QEvent::MouseMove) {
-            if (m_isDraggingSheet) {
-                QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
-                int delta = m_dragStartPos - mouseEvent->globalPosition().toPoint().y();
-                int newHeight = m_dragStartHeight + delta;
-                int maxH = this->height() / 2;
-                if (newHeight < 132) newHeight = 132;
-                if (newHeight > maxH) newHeight = maxH;
-
-                m_sheetWidget->setFixedHeight(newHeight);
-                return true;
-            }
-        } else if (event->type() == QEvent::MouseButtonRelease) {
-            if (m_isDraggingSheet) {
-                QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
-                int delta = m_dragStartPos - mouseEvent->globalPosition().toPoint().y();
-                m_isDraggingSheet = false;
-                if (std::abs(delta) < 5) {
-                    toggleSheet();
-                }
-                return true;
-            }
-        }
-    } else if (obj == m_videoArea) {
-        if (event->type() == QEvent::Resize) {
-            positionFloatingButtons();
-        }
+    if (obj == m_videoArea && event->type() == QEvent::Resize) {
+        positionFloatingButtons();
     }
     return QMainWindow::eventFilter(obj, event);
 }
@@ -3382,6 +3503,42 @@ void MainWindow::onFramesProcessed(cv::Mat f1, cv::Mat f2, double focus1, double
             auto axes = m_chart->axes(Qt::Horizontal);
             if (!axes.isEmpty()) {
                 axes.first()->setRange(std::max(0LL, frameCount - m_maxHistory), frameCount);
+            }
+
+            // Autoscale Y to the visible window. We round up to a "nice" value
+            // (1/2/5 * 10^k) so the axis labels stay readable, and keep small
+            // headroom so the trace doesn't kiss the top. Hysteresis: only
+            // shrink when the new ceiling is at least 30% smaller than current,
+            // so the axis doesn't jitter every frame.
+            auto seriesMax = [](QLineSeries* s) {
+                double m = 0.0;
+                const auto pts = s->points();
+                for (const QPointF& p : pts) if (p.y() > m) m = p.y();
+                return m;
+            };
+            const double rawMax = std::max(seriesMax(m_seriesCam1), seriesMax(m_seriesCam2));
+            auto niceCeil = [](double v) {
+                if (v <= 0.0) return 100.0;
+                const double padded = v * 1.10;
+                const double scale  = std::pow(10.0, std::floor(std::log10(padded)));
+                const double m      = padded / scale;
+                double rounded;
+                if      (m <= 1.0) rounded = 1.0;
+                else if (m <= 2.0) rounded = 2.0;
+                else if (m <= 5.0) rounded = 5.0;
+                else               rounded = 10.0;
+                return rounded * scale;
+            };
+            const double targetMax = niceCeil(rawMax);
+            auto vaxes = m_chart->axes(Qt::Vertical);
+            if (!vaxes.isEmpty()) {
+                QValueAxis* yAx = qobject_cast<QValueAxis*>(vaxes.first());
+                if (yAx) {
+                    const double currentMax = yAx->max();
+                    if (targetMax > currentMax || targetMax < currentMax * 0.7) {
+                        yAx->setRange(0.0, targetMax);
+                    }
+                }
             }
         }
     }
@@ -3538,6 +3695,19 @@ void MainWindow::calibrateAlignment()
         return;
     }
 
+    if (!m_manualAdj1.isIdentity()) {
+        cv::Mat H = buildManualHomography(m_manualAdj1, f1.size());
+        cv::Mat warped;
+        cv::warpPerspective(f1, warped, H, f1.size(), cv::INTER_LINEAR);
+        f1 = warped;
+    }
+    if (!m_manualAdj2.isIdentity()) {
+        cv::Mat H = buildManualHomography(m_manualAdj2, f2.size());
+        cv::Mat warped;
+        cv::warpPerspective(f2, warped, H, f2.size(), cv::INTER_LINEAR);
+        f2 = warped;
+    }
+
     cv::Mat gray1, gray2;
     if (f1.channels() == 3) cv::cvtColor(f1, gray1, cv::COLOR_BGR2GRAY);
     else gray1 = f1.clone();
@@ -3563,57 +3733,131 @@ void MainWindow::calibrateAlignment()
         cv::Mat warpMatrix;
         bool success = false;
 
-        try {
-            auto sift = cv::SIFT::create();
+        auto isHomographySane = [](const cv::Mat& H, const cv::Size& imgSz) -> bool {
+            if (H.empty() || H.rows != 3 || H.cols != 3) return false;
+            cv::Mat Hd;
+            H.convertTo(Hd, CV_64F);
+            double det = cv::determinant(Hd);
+            if (!std::isfinite(det) || std::abs(det) < 1e-4 || std::abs(det) > 1e4) return false;
+
+            std::vector<cv::Point2f> corners = {
+                {0.f, 0.f},
+                {static_cast<float>(imgSz.width - 1), 0.f},
+                {static_cast<float>(imgSz.width - 1), static_cast<float>(imgSz.height - 1)},
+                {0.f, static_cast<float>(imgSz.height - 1)}
+            };
+            std::vector<cv::Point2f> warped;
+            cv::perspectiveTransform(corners, warped, Hd);
+            for (const auto& p : warped) {
+                if (!std::isfinite(p.x) || !std::isfinite(p.y)) return false;
+                if (std::abs(p.x) > 4.0 * imgSz.width || std::abs(p.y) > 4.0 * imgSz.height) return false;
+            }
+            auto edgeLen = [](cv::Point2f a, cv::Point2f b) {
+                return std::hypot(a.x - b.x, a.y - b.y);
+            };
+            double e0 = edgeLen(warped[0], warped[1]);
+            double e1 = edgeLen(warped[1], warped[2]);
+            double e2 = edgeLen(warped[2], warped[3]);
+            double e3 = edgeLen(warped[3], warped[0]);
+            double srcE0 = imgSz.width;
+            double srcE1 = imgSz.height;
+            auto ratio = [](double a, double b) { return (a > b) ? (a / b) : (b / a); };
+            if (ratio(e0, srcE0) > 5.0 || ratio(e2, srcE0) > 5.0) return false;
+            if (ratio(e1, srcE1) > 5.0 || ratio(e3, srcE1) > 5.0) return false;
+            if (ratio(e0, e2) > 4.0 || ratio(e1, e3) > 4.0) return false;
+            return true;
+        };
+
+        const cv::Size imgSz = gray1.size();
+
+        auto runWithDetector = [&](cv::Ptr<cv::Feature2D> detector,
+                                   cv::Ptr<cv::DescriptorMatcher> matcher,
+                                   float loweRatio,
+                                   const QString& tag,
+                                   QString& outErr,
+                                   QString& outModel,
+                                   cv::Mat& outWarp) -> bool {
             std::vector<cv::KeyPoint> kp1, kp2;
             cv::Mat des1, des2;
-            sift->detectAndCompute(gray1, cv::noArray(), kp1, des1);
-            sift->detectAndCompute(gray2, cv::noArray(), kp2, des2);
+            detector->detectAndCompute(gray1, cv::noArray(), kp1, des1);
+            detector->detectAndCompute(gray2, cv::noArray(), kp2, des2);
 
-            if (des1.empty() || des2.empty() || kp1.size() < 8 || kp2.size() < 8) {
-                errorMsg = "SIFT: insufficient keypoints";
-            } else {
-                cv::Ptr<cv::flann::IndexParams> indexParams =
-                    cv::makePtr<cv::flann::KDTreeIndexParams>(5);
-                cv::Ptr<cv::flann::SearchParams> searchParams =
-                    cv::makePtr<cv::flann::SearchParams>(50);
-                cv::FlannBasedMatcher matcher(indexParams, searchParams);
+            if (des1.empty() || des2.empty() || kp1.size() < 16 || kp2.size() < 16) {
+                outErr = tag + ": insufficient keypoints";
+                return false;
+            }
 
-                std::vector<std::vector<cv::DMatch>> knn;
-                matcher.knnMatch(des2, des1, knn, 2);
+            std::vector<std::vector<cv::DMatch>> knn;
+            matcher->knnMatch(des2, des1, knn, 2);
 
-                std::vector<cv::Point2f> ptsSrc, ptsDst;
-                ptsSrc.reserve(knn.size());
-                ptsDst.reserve(knn.size());
-                const float ratio = 0.75f;
-                for (const auto& pair : knn) {
-                    if (pair.size() < 2) continue;
-                    if (pair[0].distance < ratio * pair[1].distance) {
-                        ptsSrc.push_back(kp2[pair[0].queryIdx].pt);
-                        ptsDst.push_back(kp1[pair[0].trainIdx].pt);
-                    }
+            std::vector<cv::Point2f> ptsSrc, ptsDst;
+            ptsSrc.reserve(knn.size());
+            ptsDst.reserve(knn.size());
+            for (const auto& pair : knn) {
+                if (pair.size() < 2) continue;
+                if (pair[0].distance < loweRatio * pair[1].distance) {
+                    ptsSrc.push_back(kp2[pair[0].queryIdx].pt);
+                    ptsDst.push_back(kp1[pair[0].trainIdx].pt);
                 }
+            }
 
-                if (ptsSrc.size() < 12) {
-                    errorMsg = QString("SIFT: only %1 good matches").arg(static_cast<int>(ptsSrc.size()));
+            if (ptsSrc.size() < 12) {
+                outErr = QString("%1: only %2 good matches").arg(tag).arg(static_cast<int>(ptsSrc.size()));
+                return false;
+            }
+
+            cv::Mat inliers;
+            cv::Mat H = cv::findHomography(ptsSrc, ptsDst, cv::RANSAC, 3.0, inliers, 5000, 0.999);
+            int inlierCount = cv::countNonZero(inliers);
+            double inlierRatio = static_cast<double>(inlierCount) / static_cast<double>(ptsSrc.size());
+
+            if (H.empty() || inlierCount < 10 || inlierRatio < 0.30) {
+                outErr = QString("%1: %2/%3 inliers (%4%)")
+                           .arg(tag).arg(inlierCount).arg(static_cast<int>(ptsSrc.size()))
+                           .arg(static_cast<int>(inlierRatio * 100));
+                return false;
+            }
+
+            if (!isHomographySane(H, imgSz)) {
+                outErr = QString("%1: homography rejected (geometry sanity check failed — likely repetitive pattern)").arg(tag);
+                return false;
+            }
+
+            H.convertTo(outWarp, CV_32F);
+            outModel = QString("%1 %2/%3 in (%4%)")
+                         .arg(tag).arg(inlierCount).arg(static_cast<int>(ptsSrc.size()))
+                         .arg(static_cast<int>(inlierRatio * 100));
+            std::cerr << "[align] " << tag.toStdString()
+                      << " H =\n" << H << "\n"
+                      << "  inliers " << inlierCount << "/" << ptsSrc.size()
+                      << ", img " << imgSz.width << "x" << imgSz.height << std::endl;
+            return true;
+        };
+
+        try {
+            auto sift = cv::SIFT::create(0, 3, 0.04, 10.0, 1.6);
+            cv::Ptr<cv::flann::IndexParams> indexParams = cv::makePtr<cv::flann::KDTreeIndexParams>(5);
+            cv::Ptr<cv::flann::SearchParams> searchParams = cv::makePtr<cv::flann::SearchParams>(50);
+            cv::Ptr<cv::DescriptorMatcher> flann = cv::makePtr<cv::FlannBasedMatcher>(indexParams, searchParams);
+
+            success = runWithDetector(sift, flann, 0.75f, "SIFT", errorMsg, modelUsed, warpMatrix);
+
+            if (!success) {
+                auto orb = cv::ORB::create(4000);
+                cv::Ptr<cv::DescriptorMatcher> bf = cv::BFMatcher::create(cv::NORM_HAMMING, false);
+                QString orbErr, orbModel;
+                cv::Mat orbWarp;
+                if (runWithDetector(orb, bf, 0.75f, "ORB", orbErr, orbModel, orbWarp)) {
+                    success = true;
+                    warpMatrix = orbWarp;
+                    modelUsed = orbModel;
                 } else {
-                    cv::Mat inliers;
-                    cv::Mat H = cv::findHomography(ptsSrc, ptsDst, cv::RANSAC, 3.0, inliers);
-                    int inlierCount = cv::countNonZero(inliers);
-                    if (!H.empty() && inlierCount >= 12) {
-                        H.convertTo(warpMatrix, CV_32F);
-                        modelUsed = QString("SIFT %1/%2 inliers")
-                                    .arg(inlierCount).arg(static_cast<int>(ptsSrc.size()));
-                        success = true;
-                    } else {
-                        errorMsg = QString("SIFT: only %1 inliers from %2 matches")
-                                   .arg(inlierCount).arg(static_cast<int>(ptsSrc.size()));
-                    }
+                    errorMsg += " | " + orbErr;
                 }
             }
         }
         catch (const cv::Exception& e) {
-            errorMsg = QString("SIFT stage failed: ") + QString::fromStdString(e.what());
+            errorMsg = QString("Feature stage failed: ") + QString::fromStdString(e.what());
         }
 
         cv::Mat resultMatrix = success ? warpMatrix : cv::Mat();
@@ -3648,6 +3892,21 @@ double MainWindow::calculateFocus(const cv::Mat& frame)
     cv::Scalar mean, stddev;
     cv::meanStdDev(lap, mean, stddev);
     return stddev.val[0] * stddev.val[0];
+}
+
+void MainWindow::pushWorkerParams()
+{
+    if (!m_worker) return;
+    WorkerParams p;
+    p.colorMode         = m_colorMode;
+    p.flipHor2          = m_chkFlipHor2 && m_chkFlipHor2->isChecked();
+    p.flipVer2          = m_chkFlipVer2 && m_chkFlipVer2->isChecked();
+    p.motionThr         = m_motionThreshold;
+    p.bufferSize        = m_bufferSize;
+    p.applyBilateral    = m_chkBilateral && m_chkBilateral->isChecked();
+    p.bilateralStrength = m_bilateralStrength;
+    p.noiseFloor        = m_noiseFloor;
+    m_worker->setParams(p);
 }
 
 void MainWindow::displayMat(GpuImageView* view, const cv::Mat& mat)
@@ -3932,8 +4191,8 @@ void MainWindow::showExposureDialog()
     sldS->setPageStep(1000);
     sldS->setMinimumWidth(280);
 
-    QFrame* rowG = buildRow("Gain (0.10x â€“ 10.00x)",   spnG, sldG);
-    QFrame* rowS = buildRow("Shutter (50 â€“ 30000 Âµs)", spnS, sldS);
+    QFrame* rowG = buildRow("Gain (0.10x – 10.00x)",   spnG, sldG);
+    QFrame* rowS = buildRow("Shutter (50 – 30000 µs)", spnS, sldS);
     root->addWidget(rowG);
     root->addWidget(rowS);
 
@@ -4026,8 +4285,7 @@ void MainWindow::showExposureDialog()
     connect(chkPerCam, &QCheckBox::toggled, &dlg, [this, camToggleRow, selectCam](bool on) {
         m_perCameraExposure = on;
         camToggleRow->setVisible(on);
-        if (!on) selectCam(false);
-        else      selectCam(false);
+        selectCam(false);
         applyExposureControls();
     });
 
@@ -4244,7 +4502,7 @@ void MainWindow::saveSettings()
     s.setValue("shutter2Us", m_shutter2Us);
     s.setValue("maxHistory", m_historySpinBox->value());
     s.setValue("diffMode", m_isDiffMode);
-    s.setValue("sheetOpen", m_sheetOpen);
+    s.setValue("sheetOpen", m_currentNav != NavItem::None);
 
     auto writeAdj = [&s](const QString& prefix, const ManualAdjust& a) {
         s.setValue(prefix + "tx", a.tx);
@@ -4317,7 +4575,7 @@ void MainWindow::loadSettings()
     setDiffMode(diffMode);
 
     bool sheetOpen = s.value("sheetOpen", true).toBool();
-    if (sheetOpen != m_sheetOpen) toggleSheet();
+    if (sheetOpen != (m_currentNav != NavItem::None)) toggleSheet();
 
     auto readAdj = [&s](const QString& prefix, ManualAdjust& a) {
         a.tx    = s.value(prefix + "tx",    0.0).toDouble();
@@ -4613,8 +4871,7 @@ void MainWindow::initCommands()
         {"cmd_exposure_dialog", "Open Exposure Dialog", "Exposure", CmdType::Action, [this](){ if (m_manualExposure) showExposureDialog(); }, {}},
 
         {"cmd_rename_snapshot", "Edit Snapshot Name", "Snapshot", CmdType::Action, [this](){
-            if (m_tabWidget) m_tabWidget->setCurrentIndex(3);
-            if (!m_sheetOpen) toggleSheet();
+            setNavItem(NavItem::Snapshot);
             if (m_snapshotNameEdit) {
                 m_snapshotNameEdit->setFocus();
                 m_snapshotNameEdit->selectAll();
