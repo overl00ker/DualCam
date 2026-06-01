@@ -1,4 +1,12 @@
 #include "mainwindow.h"
+#ifndef DUALCAM_SEPARATE_VIEWER
+#include "viewer_dialogs.h"
+#endif
+
+#include <QPropertyAnimation>
+#include <QParallelAnimationGroup>
+#include <QGraphicsOpacityEffect>
+#include <QVariantAnimation>
 
 #include <QApplication>
 #include <QWidget>
@@ -40,6 +48,7 @@
 #include <QCloseEvent>
 #include <QJsonObject>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QMenu>
 #include <QAction>
 #include <QInputDialog>
@@ -82,15 +91,7 @@
 #include <QColorDialog>
 #include <QFileDialog>
 #include <QTextStream>
-#include <QtDataVisualization/Q3DSurface>
-#include <QtDataVisualization/QSurface3DSeries>
-#include <QtDataVisualization/QSurfaceDataProxy>
-#include <QtDataVisualization/QValue3DAxis>
-#include <QtDataVisualization/QAbstract3DInputHandler>
-#include <QtDataVisualization/Q3DInputHandler>
-#include <QtDataVisualization/Q3DCamera>
-#include <QtDataVisualization/Q3DScene>
-#include <QtDataVisualization/Q3DTheme>
+#include <QProcess>
 #include <QLinearGradient>
 #include <QtCharts/QChartView>
 #include <QtCharts/QLineSeries>
@@ -248,6 +249,8 @@ void CameraWorker::startCamerasV4L2(int id1, int id2, int w, int h, int fps) {
 }
 void CameraWorker::stopCameras() {
     m_running = false;
+    if (m_cap1.isOpened()) m_cap1.release();
+    if (m_cap2.isOpened()) m_cap2.release();
     if (!wait(2000)) {
         requestInterruption();
         if (!wait(1000)) {
@@ -255,8 +258,6 @@ void CameraWorker::stopCameras() {
             wait();
         }
     }
-    if (m_cap1.isOpened()) m_cap1.release();
-    if (m_cap2.isOpened()) m_cap2.release();
 }
 void CameraWorker::setParams(const WorkerParams& p) {
     m_paramMutex.lock();
@@ -276,8 +277,7 @@ cv::Mat CameraWorker::toWorkingFormat(const cv::Mat& frame, ColorMode mode) {
     return res;
 }
 double CameraWorker::detectMotion(const cv::Mat& frame, double /*thr*/) {
-    // Caller compares the returned ratio against its own threshold;
-    // we only need the foreground-pixel fraction here.
+
     if (frame.empty()) return 0.0;
     cv::Mat fgMask;
     m_bgSubtractor->apply(frame, fgMask, 0.01);
@@ -609,71 +609,6 @@ private:
     QPropertyAnimation* m_anim = nullptr;
 };
 
-class SurfaceInputHandler : public QAbstract3DInputHandler {
-    Q_OBJECT
-public:
-    explicit SurfaceInputHandler(QObject* parent = nullptr) : QAbstract3DInputHandler(parent) {}
-    void onClick(std::function<void(QPoint)> cb) { m_clickCb = std::move(cb); }
-protected:
-    void mousePressEvent(QMouseEvent* ev, const QPoint& pos) override {
-        QAbstract3DInputHandler::mousePressEvent(ev, pos);
-        m_last = pos;
-        if (ev->button() == Qt::LeftButton) {
-            m_lmbDown = true;
-            m_pressPos = pos;
-            m_rotating = false;
-        }
-        if (ev->button() == Qt::RightButton) m_panning = true;
-    }
-    void mouseReleaseEvent(QMouseEvent* ev, const QPoint& pos) override {
-        QAbstract3DInputHandler::mouseReleaseEvent(ev, pos);
-        if (ev->button() == Qt::LeftButton) {
-            if (m_lmbDown && !m_rotating && m_clickCb) m_clickCb(m_pressPos);
-            m_lmbDown = false;
-            m_rotating = false;
-        }
-        if (ev->button() == Qt::RightButton) m_panning = false;
-    }
-    void mouseMoveEvent(QMouseEvent* ev, const QPoint& pos) override {
-        QAbstract3DInputHandler::mouseMoveEvent(ev, pos);
-        if (!scene() || !scene()->activeCamera()) return;
-        Q3DCamera* cam = scene()->activeCamera();
-        const QPoint d = pos - m_last;
-        m_last = pos;
-        if (m_lmbDown && !m_rotating) {
-            const QPoint t = pos - m_pressPos;
-            if (std::abs(t.x()) + std::abs(t.y()) > 4) m_rotating = true;
-        }
-        if (m_rotating) {
-            cam->setXRotation(cam->xRotation() + d.x() * 0.5f);
-            cam->setYRotation(cam->yRotation() + d.y() * 0.5f);
-        } else if (m_panning) {
-            QVector3D tg = cam->target();
-            const float lo = -1.0f, hi = 1.0f;
-            float nx = std::clamp(tg.x() - d.x() * 0.004f, lo, hi);
-            float ny = std::clamp(tg.y() + d.y() * 0.004f, lo, hi);
-            tg.setX(nx);
-            tg.setY(ny);
-            cam->setTarget(tg);
-        }
-    }
-    void wheelEvent(QWheelEvent* ev) override {
-        QAbstract3DInputHandler::wheelEvent(ev);
-        if (!scene() || !scene()->activeCamera()) return;
-        Q3DCamera* cam = scene()->activeCamera();
-        float zl = cam->zoomLevel();
-        zl += ev->angleDelta().y() * 0.05f;
-        cam->setZoomLevel(std::clamp(zl, 30.0f, 500.0f));
-    }
-private:
-    bool m_lmbDown = false;
-    bool m_rotating = false;
-    bool m_panning  = false;
-    QPoint m_last;
-    QPoint m_pressPos;
-    std::function<void(QPoint)> m_clickCb;
-};
-
 static cv::Mat qImageToBGR(const QImage& src) {
     if (src.isNull()) return cv::Mat();
     QImage img = src.format() == QImage::Format_Grayscale8
@@ -691,421 +626,6 @@ static cv::Mat qImageToBGR(const QImage& src) {
     return bgr;
 }
 
-static QWidget* makeProfileWindow(const cv::Mat& img, QPoint a, QPoint b, const QString& title, bool darkTheme, QWidget* parent) {
-    QDialog* w = new QDialog(parent, Qt::Window);
-    w->setAttribute(Qt::WA_DeleteOnClose);
-    w->setWindowTitle(QString("Profile: %1").arg(title));
-    w->resize(720, 420);
-
-    const QColor bgCol     = darkTheme ? QColor("#0e0e0e") : QColor("#fafafa");
-    const QColor textCol   = darkTheme ? QColor("#e5e2e1") : QColor("#101010");
-    const QColor axisCol   = darkTheme ? QColor("#c8c6c5") : QColor("#404040");
-    const QColor seriesCol = darkTheme ? QColor("#e5e2e1") : QColor("#101010");
-    const QColor viewBg    = darkTheme ? QColor("#050505") : QColor("#ffffff");
-
-    QVBoxLayout* lay = new QVBoxLayout(w);
-    lay->setContentsMargins(8, 8, 8, 8);
-    lay->setSpacing(8);
-
-    QFrame* toolbar = new QFrame(w);
-    toolbar->setProperty("role", "card");
-    QHBoxLayout* tlay = new QHBoxLayout(toolbar);
-    tlay->setContentsMargins(10, 6, 10, 6);
-    tlay->setSpacing(10);
-    QPushButton* exportBtn = new QPushButton(QStringLiteral("Export CSV…"), toolbar);
-    exportBtn->setCursor(Qt::PointingHandCursor);
-    exportBtn->setToolTip("Export sampled line as CSV (compatible with Excel and Origin)");
-    tlay->addWidget(exportBtn);
-    tlay->addStretch();
-    QLabel* hintLbl = new QLabel(QStringLiteral("Drag on the image to update the profile."), toolbar);
-    hintLbl->setProperty("role", "faint");
-    tlay->addWidget(hintLbl);
-    lay->addWidget(toolbar);
-
-    QChart* chart = new QChart();
-    chart->setTitle(QString("Intensity along (%1,%2) → (%3,%4)").arg(a.x()).arg(a.y()).arg(b.x()).arg(b.y()));
-    chart->legend()->setVisible(true);
-    chart->setBackgroundBrush(QBrush(bgCol));
-    chart->setTitleBrush(QBrush(textCol));
-
-    const double dx = b.x() - a.x();
-    const double dy = b.y() - a.y();
-    const double length = std::hypot(dx, dy);
-    const int steps = std::max(2, int(std::ceil(length)));
-
-    auto samplePoint = [&](double t, double& xr, double& yr) {
-        xr = a.x() + t * dx;
-        yr = a.y() + t * dy;
-    };
-    auto bilinear = [&](const cv::Mat& m, int channel, double x, double y) -> double {
-        if (x < 0) x = 0; if (y < 0) y = 0;
-        if (x > m.cols - 1) x = m.cols - 1;
-        if (y > m.rows - 1) y = m.rows - 1;
-        int x0 = int(std::floor(x)), x1 = std::min(x0 + 1, m.cols - 1);
-        int y0 = int(std::floor(y)), y1 = std::min(y0 + 1, m.rows - 1);
-        double fx = x - x0, fy = y - y0;
-        auto px = [&](int xx, int yy) -> double {
-            if (m.channels() == 1) return m.at<uchar>(yy, xx);
-            return m.at<cv::Vec3b>(yy, xx)[channel];
-        };
-        double v00 = px(x0, y0), v10 = px(x1, y0), v01 = px(x0, y1), v11 = px(x1, y1);
-        return (1 - fx) * (1 - fy) * v00 + fx * (1 - fy) * v10
-             + (1 - fx) * fy * v01 + fx * fy * v11;
-    };
-
-    QLineSeries* s = new QLineSeries();
-    s->setName("Intensity");
-    QPen pen(seriesCol); pen.setWidth(2); s->setPen(pen);
-    auto sampleLuma = [&](double x, double y) -> double {
-        if (img.channels() == 1) return bilinear(img, 0, x, y);
-        const double b = bilinear(img, 0, x, y);
-        const double g = bilinear(img, 1, x, y);
-        const double r = bilinear(img, 2, x, y);
-        return 0.299 * r + 0.587 * g + 0.114 * b;
-    };
-    // Keep raw samples so the user can export them as CSV.
-    struct ProfileSample { double dist; double xPix; double yPix; double intensity; };
-    std::vector<ProfileSample> samples;
-    samples.reserve(steps);
-    for (int i = 0; i < steps; ++i) {
-        const double t = double(i) / (steps - 1);
-        double x, y; samplePoint(t, x, y);
-        const double luma = sampleLuma(x, y);
-        s->append(t * length, luma);
-        samples.push_back({ t * length, x, y, luma });
-    }
-    chart->addSeries(s);
-    chart->legend()->setVisible(false);
-
-    QObject::connect(exportBtn, &QPushButton::clicked, w, [w, samples, title, a, b]() {
-        const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-        const QString suggested = QString("profile_%1_%2.csv")
-            .arg(title.isEmpty() ? "view" : title).arg(stamp);
-        const QString dir = QCoreApplication::applicationDirPath() + "/metrics";
-        QDir().mkpath(dir);
-        QString fileName = QFileDialog::getSaveFileName(w,
-            QStringLiteral("Export profile to CSV"),
-            dir + "/" + suggested,
-            QStringLiteral("CSV file (*.csv);;Tab-separated (*.tsv);;Text file (*.txt)"));
-        if (fileName.isEmpty()) return;
-        const bool tabSep = fileName.endsWith(".tsv", Qt::CaseInsensitive);
-        const QChar sep = tabSep ? QChar('\t') : QChar(',');
-        if (!fileName.contains('.')) fileName += tabSep ? ".tsv" : ".csv";
-
-        QFile f(fileName);
-        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            QMessageBox::warning(w, QStringLiteral("Export CSV"),
-                QStringLiteral("Cannot open file for writing:\n") + fileName);
-            return;
-        }
-        QTextStream out(&f);
-        out.setRealNumberPrecision(6);
-        out << "# Source: " << title << "\n";
-        out << "# Endpoints (px): (" << a.x() << ", " << a.y()
-            << ") -> (" << b.x() << ", " << b.y() << ")\n";
-        out << "# Samples: " << samples.size() << "\n";
-        out << "distance_px" << sep << "x_pix" << sep << "y_pix" << sep << "intensity\n";
-        for (const ProfileSample& sm : samples) {
-            out << sm.dist << sep << sm.xPix << sep << sm.yPix << sep << sm.intensity << "\n";
-        }
-        f.close();
-    });
-
-    QValueAxis* axX = new QValueAxis();
-    axX->setTitleText("distance, px");
-    axX->setRange(0, length);
-    axX->setLabelsBrush(QBrush(axisCol));
-    axX->setTitleBrush(QBrush(axisCol));
-    QValueAxis* axY = new QValueAxis();
-    axY->setTitleText("intensity");
-    axY->setRange(0, 255);
-    axY->setLabelsBrush(QBrush(axisCol));
-    axY->setTitleBrush(QBrush(axisCol));
-    chart->addAxis(axX, Qt::AlignBottom);
-    chart->addAxis(axY, Qt::AlignLeft);
-    for (QAbstractSeries* s : chart->series()) {
-        s->attachAxis(axX);
-        s->attachAxis(axY);
-    }
-
-    QChartView* view = new QChartView(chart, w);
-    view->setRenderHint(QPainter::Antialiasing);
-    view->setBackgroundBrush(QBrush(viewBg));
-    lay->addWidget(view, 1);
-    return w;
-}
-
-static QWidget* makeSurfaceWindow(const cv::Mat& img, QRect roi, const QString& title, bool darkTheme, QWidget* parent) {
-    QDialog* w = new QDialog(parent, Qt::Window);
-    w->setAttribute(Qt::WA_DeleteOnClose);
-    w->setWindowTitle(QString("Surface: %1").arg(title));
-    w->resize(800, 640);
-
-    QVBoxLayout* lay = new QVBoxLayout(w);
-    lay->setContentsMargins(8, 8, 8, 8);
-    lay->setSpacing(8);
-
-    cv::Rect bounds(0, 0, img.cols, img.rows);
-    cv::Rect r(roi.x(), roi.y(), roi.width(), roi.height());
-    r = r & bounds;
-    if (r.width < 2 || r.height < 2) {
-        lay->addWidget(new QLabel("ROI too small."));
-        return w;
-    }
-
-    cv::Mat sub = img(r);
-    cv::Mat gray;
-    if (sub.channels() == 1) gray = sub;
-    else cv::cvtColor(sub, gray, cv::COLOR_BGR2GRAY);
-
-    const int maxSide = 96;
-    cv::Mat g;
-    if (gray.cols > maxSide || gray.rows > maxSide) {
-        double k = double(maxSide) / std::max(gray.cols, gray.rows);
-        cv::resize(gray, g, cv::Size(), k, k, cv::INTER_AREA);
-    } else g = gray;
-
-    QFrame* toolbar = new QFrame(w);
-    toolbar->setProperty("role", "card");
-    QHBoxLayout* tlay = new QHBoxLayout(toolbar);
-    tlay->setContentsMargins(10, 6, 10, 6);
-    tlay->setSpacing(10);
-
-    QPushButton* lowColorBtn = new QPushButton("Low…", toolbar);
-    lowColorBtn->setCursor(Qt::PointingHandCursor);
-    QFrame* lowSwatch = new QFrame(toolbar);
-    lowSwatch->setFixedSize(28, 20);
-    QPushButton* highColorBtn = new QPushButton("High…", toolbar);
-    highColorBtn->setCursor(Qt::PointingHandCursor);
-    QFrame* highSwatch = new QFrame(toolbar);
-    highSwatch->setFixedSize(28, 20);
-    highSwatch->setStyleSheet("background:#4ec9b0; border:1px solid rgba(255,255,255,0.15);");
-
-    QPushButton* saveSnapBtn = new QPushButton("Save snapshot…", toolbar);
-    saveSnapBtn->setCursor(Qt::PointingHandCursor);
-    QPushButton* exportDataBtn = new QPushButton(QStringLiteral("Export CSV…"), toolbar);
-    exportDataBtn->setCursor(Qt::PointingHandCursor);
-    exportDataBtn->setToolTip("Export surface intensities as CSV (long or matrix form for Excel / Origin)");
-
-    tlay->addWidget(lowColorBtn);
-    tlay->addWidget(lowSwatch);
-    tlay->addSpacing(6);
-    tlay->addWidget(highColorBtn);
-    tlay->addWidget(highSwatch);
-    tlay->addSpacing(10);
-    tlay->addWidget(saveSnapBtn);
-    tlay->addWidget(exportDataBtn);
-    QLabel* coordLbl = new QLabel(toolbar);
-    coordLbl->setMinimumWidth(220);
-    coordLbl->setText("Click a point to read X, Y, intensity");
-    coordLbl->setProperty("role", "faint");
-    tlay->addSpacing(12);
-    tlay->addWidget(coordLbl);
-    QLabel* hint = new QLabel("LMB click=pick / drag=rotate · RMB pan · wheel zoom", toolbar);
-    hint->setProperty("role", "faint");
-    tlay->addSpacing(12);
-    tlay->addWidget(hint, 1);
-    lay->addWidget(toolbar);
-
-    Q3DSurface* surface = new Q3DSurface();
-    surface->setSelectionMode(QAbstract3DGraph::SelectionItem);
-    SurfaceInputHandler* inputHandler = new SurfaceInputHandler(surface);
-    inputHandler->onClick([surface](QPoint p) {
-        if (surface->scene()) surface->scene()->setSelectionQueryPosition(p);
-    });
-    surface->setActiveInputHandler(inputHandler);
-
-    Q3DTheme* theme = new Q3DTheme(darkTheme ? Q3DTheme::ThemeQt : Q3DTheme::ThemePrimaryColors);
-    if (darkTheme) {
-        theme->setBackgroundColor(QColor("#050505"));
-        theme->setWindowColor(QColor("#050505"));
-        theme->setLabelTextColor(QColor("#e5e2e1"));
-        theme->setLabelBackgroundColor(QColor(20, 20, 20, 200));
-        theme->setLabelBorderEnabled(false);
-        theme->setGridLineColor(QColor(255, 255, 255, 40));
-    } else {
-        theme->setBackgroundColor(QColor("#ffffff"));
-        theme->setWindowColor(QColor("#fafafa"));
-        theme->setLabelTextColor(QColor("#101010"));
-        theme->setLabelBackgroundColor(QColor(245, 245, 245, 220));
-        theme->setGridLineColor(QColor(0, 0, 0, 60));
-    }
-    surface->setActiveTheme(theme);
-
-    QWidget* container = QWidget::createWindowContainer(surface, w);
-    container->setMinimumSize(400, 300);
-    container->setFocusPolicy(Qt::StrongFocus);
-    lay->addWidget(container, 1);
-
-    QSurfaceDataArray* data = new QSurfaceDataArray();
-    data->reserve(g.rows);
-    for (int y = 0; y < g.rows; ++y) {
-        QSurfaceDataRow* row = new QSurfaceDataRow(g.cols);
-        for (int x = 0; x < g.cols; ++x) {
-            const double z = g.at<uchar>(y, x);
-            (*row)[x].setPosition(QVector3D(float(x), float(z), float(y)));
-        }
-        data->append(row);
-    }
-    QSurface3DSeries* series = new QSurface3DSeries();
-    series->setDrawMode(QSurface3DSeries::DrawSurfaceAndWireframe);
-    series->setFlatShadingEnabled(false);
-    QSurfaceDataProxy* proxy = new QSurfaceDataProxy();
-    proxy->resetArray(data);
-    series->setDataProxy(proxy);
-
-    QObject::connect(series, &QSurface3DSeries::selectedPointChanged, w, [series, proxy, coordLbl](const QPoint& p) {
-        if (p == QSurface3DSeries::invalidSelectionPosition() || !proxy->array()) {
-            coordLbl->setText("Click a point to read X, Y, intensity");
-            return;
-        }
-        const QSurfaceDataArray* arr = proxy->array();
-        if (p.x() < 0 || p.x() >= arr->size()) return;
-        const QSurfaceDataRow* row = arr->at(p.x());
-        if (!row || p.y() < 0 || p.y() >= row->size()) return;
-        const QVector3D v = row->at(p.y()).position();
-        coordLbl->setText(QString("X=%1  Y=%2  intensity=%3")
-                          .arg(v.x(), 0, 'f', 0)
-                          .arg(v.z(), 0, 'f', 0)
-                          .arg(v.y(), 0, 'f', 0));
-    });
-
-    QColor* lowColor  = new QColor(darkTheme ? QColor(58, 58, 58) : QColor(232, 232, 232));
-    QColor* highColor = new QColor(78, 201, 176);
-    QObject::connect(w, &QObject::destroyed, [lowColor, highColor]{ delete lowColor; delete highColor; });
-
-    auto applyGradient = [series, lowSwatch, highSwatch, lowColor, highColor]() {
-        QLinearGradient gr;
-        gr.setColorAt(0.0, *lowColor);
-        gr.setColorAt(1.0, *highColor);
-        series->setBaseGradient(gr);
-        series->setColorStyle(Q3DTheme::ColorStyleRangeGradient);
-        lowSwatch->setStyleSheet(QString("background:%1; border:1px solid rgba(255,255,255,0.15);").arg(lowColor->name()));
-        highSwatch->setStyleSheet(QString("background:%1; border:1px solid rgba(255,255,255,0.15);").arg(highColor->name()));
-    };
-    applyGradient();
-
-    auto openPicker = [w, applyGradient](QColor* slot, const QString& title) {
-        QColorDialog* d = new QColorDialog(*slot, w);
-        d->setWindowFlag(Qt::Window);
-        d->setAttribute(Qt::WA_DeleteOnClose);
-        d->setOption(QColorDialog::NoButtons, true);
-        d->setWindowTitle(title);
-        QObject::connect(d, &QColorDialog::currentColorChanged, w, [slot, applyGradient](const QColor& c) {
-            if (c.isValid()) { *slot = c; applyGradient(); }
-        });
-        d->show();
-    };
-    QObject::connect(lowColorBtn,  &QPushButton::clicked, w, [openPicker, lowColor]()  { openPicker(lowColor,  "Low color");  });
-    QObject::connect(highColorBtn, &QPushButton::clicked, w, [openPicker, highColor]() { openPicker(highColor, "High color"); });
-
-    // Capture sample grid + the resize factor so the exported coordinates can
-    // be mapped back to the original-image pixel space (we downsample for the
-    // 3D view, but a CSV with the original X/Y is more useful for analysis).
-    cv::Mat gridCopy = g.clone();
-    const double kBackX = (g.cols > 0) ? (double(r.width)  / double(g.cols)) : 1.0;
-    const double kBackY = (g.rows > 0) ? (double(r.height) / double(g.rows)) : 1.0;
-    const int    roiX0  = r.x;
-    const int    roiY0  = r.y;
-    QObject::connect(exportDataBtn, &QPushButton::clicked, w,
-        [w, gridCopy, kBackX, kBackY, roiX0, roiY0, title]() {
-        const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-        const QString suggested = QString("surface_%1_%2.csv")
-            .arg(title.isEmpty() ? "view" : title).arg(stamp);
-        const QString dir = QCoreApplication::applicationDirPath() + "/metrics";
-        QDir().mkpath(dir);
-        QString fileName = QFileDialog::getSaveFileName(w,
-            QStringLiteral("Export surface to CSV"),
-            dir + "/" + suggested,
-            QStringLiteral("Long form CSV — x,y,intensity (*.csv);;"
-                           "Matrix CSV — rows=Y, cols=X (*_matrix.csv);;"
-                           "Tab-separated long form (*.tsv)"),
-            nullptr);
-        if (fileName.isEmpty()) return;
-
-        const bool matrixForm = fileName.contains("_matrix", Qt::CaseInsensitive)
-                              || fileName.endsWith("_matrix.csv", Qt::CaseInsensitive);
-        const bool tabSep     = fileName.endsWith(".tsv", Qt::CaseInsensitive);
-        if (!fileName.contains('.')) fileName += matrixForm ? "_matrix.csv"
-                                              : (tabSep ? ".tsv" : ".csv");
-        const QChar sep = tabSep ? QChar('\t') : QChar(',');
-
-        QFile f(fileName);
-        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            QMessageBox::warning(w, QStringLiteral("Export CSV"),
-                QStringLiteral("Cannot open file for writing:\n") + fileName);
-            return;
-        }
-        QTextStream out(&f);
-        out << "# Source: " << title << "\n";
-        out << "# ROI offset in source image (px): x0=" << roiX0 << ", y0=" << roiY0 << "\n";
-        out << "# Grid: " << gridCopy.cols << " cols x " << gridCopy.rows << " rows\n";
-        out << "# Pixel scale (source px per sample): kx=" << kBackX << ", ky=" << kBackY << "\n";
-
-        if (matrixForm) {
-            // Header: empty corner, then X coordinates in source-image pixels.
-            out << "y\\x";
-            for (int x = 0; x < gridCopy.cols; ++x) {
-                const double sx = roiX0 + (x + 0.5) * kBackX;
-                out << sep << sx;
-            }
-            out << "\n";
-            for (int y = 0; y < gridCopy.rows; ++y) {
-                const double sy = roiY0 + (y + 0.5) * kBackY;
-                out << sy;
-                for (int x = 0; x < gridCopy.cols; ++x) {
-                    out << sep << int(gridCopy.at<uchar>(y, x));
-                }
-                out << "\n";
-            }
-        } else {
-            out << "x_pix" << sep << "y_pix" << sep << "intensity\n";
-            for (int y = 0; y < gridCopy.rows; ++y) {
-                const double sy = roiY0 + (y + 0.5) * kBackY;
-                for (int x = 0; x < gridCopy.cols; ++x) {
-                    const double sx = roiX0 + (x + 0.5) * kBackX;
-                    out << sx << sep << sy << sep << int(gridCopy.at<uchar>(y, x)) << "\n";
-                }
-            }
-        }
-        f.close();
-    });
-
-    QObject::connect(saveSnapBtn, &QPushButton::clicked, w, [w, surface, title]() {
-        QString suggested = QString("surface_%1_%2.png")
-            .arg(title.isEmpty() ? "view" : title)
-            .arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss"));
-        QString dir = QCoreApplication::applicationDirPath() + "/metrics";
-        QDir().mkpath(dir);
-        QString fileName = QFileDialog::getSaveFileName(w, "Save 3D snapshot",
-            dir + "/" + suggested,
-            "PNG image (*.png);;JPEG image (*.jpg *.jpeg)");
-        if (fileName.isEmpty()) return;
-        if (!fileName.endsWith(".png", Qt::CaseInsensitive)
-            && !fileName.endsWith(".jpg", Qt::CaseInsensitive)
-            && !fileName.endsWith(".jpeg", Qt::CaseInsensitive)) {
-            fileName += ".png";
-        }
-        QImage img = surface->renderToImage(8, surface->size());
-        if (img.isNull()) {
-            QMessageBox::warning(w, "Save 3D snapshot", "Failed to render image.");
-            return;
-        }
-        if (!img.save(fileName)) {
-            QMessageBox::warning(w, "Save 3D snapshot", "Failed to save:\n" + fileName);
-        }
-    });
-
-    surface->axisX()->setTitle("X");
-    surface->axisY()->setTitle("intensity");
-    surface->axisZ()->setTitle("Y");
-    surface->axisX()->setTitleVisible(true);
-    surface->axisY()->setTitleVisible(true);
-    surface->axisZ()->setTitleVisible(true);
-    surface->axisY()->setRange(0.0f, 255.0f);
-    surface->addSeries(series);
-    return w;
-}
 
 namespace T {
     static const char* bg0 = "#050505";
@@ -1283,6 +803,17 @@ QString MainWindow::styleSheetText() const
         QPushButton:pressed  { background: %7; }
         QPushButton:disabled { color: %10; background: %2; border-color: %7; }
         QPushButton:checked  { background: %11; border-color: %5; color: %3; }
+
+        QToolButton {
+            background: %6; color: %3; border: 1px solid %7; border-radius: 0px;
+            padding: 5px 12px; min-height: 22px;
+            font-size: 12px; font-weight: 500;
+        }
+        QToolButton:hover    { background: %8; border-color: %9; color: %3; }
+        QToolButton:pressed  { background: %7; color: %3; }
+        QToolButton:checked  { background: %11; border-color: %5; color: %3; }
+        QToolButton:disabled { color: %10; background: %2; border-color: %7; }
+        QToolButton::menu-indicator { image: none; }
 
         QPushButton[kind="primary"] {
             background: %5; color: %3; border: 1px solid %5;
@@ -1462,6 +993,9 @@ void MainWindow::initUI()
             connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
             lay->addWidget(box);
 
+            if (m_animDialogsEnabled) {
+                animateDialogEntry(&dlg, m_comboCamSet, m_animSpeedMs);
+            }
             if (dlg.exec() == QDialog::Accepted) {
                 QString label = QString("%1x%2 @ %3 FPS \u2605").arg(spinW->value()).arg(spinH->value()).arg(spinF->value());
                 m_comboCamSet->setItemText(index, label);
@@ -1800,7 +1334,7 @@ void MainWindow::initUI()
     m_focusDataWidget = buildFocusDataPanel();
     m_bottomStack->addWidget(m_focusDataWidget);
     m_bottomStack->addWidget(buildSnapshotTab());
-    m_bottomStack->addWidget(buildPresetsTab());
+    m_bottomStack->addWidget(buildSettingsTab());
     m_workSplit->addWidget(m_bottomStack);
 
     m_workSplit->setStretchFactor(0, 1);
@@ -1810,6 +1344,48 @@ void MainWindow::initUI()
 
     m_galleryView = buildGalleryView();
     m_workStack->addWidget(m_galleryView);
+
+    connect(m_bottomStack, &QStackedWidget::currentChanged, this, [this](int index) {
+        QWidget* w = m_bottomStack->widget(index);
+        if (!w) return;
+        if (!m_animTabsEnabled) {
+            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(w->graphicsEffect());
+            if (effect) effect->setOpacity(1.0);
+            return;
+        }
+        QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(w->graphicsEffect());
+        if (!effect) {
+            effect = new QGraphicsOpacityEffect(w);
+            w->setGraphicsEffect(effect);
+        }
+        QPropertyAnimation* anim = new QPropertyAnimation(effect, "opacity", w);
+        anim->setDuration(m_animSpeedMs * 8 / 10);
+        anim->setStartValue(0.0);
+        anim->setEndValue(1.0);
+        anim->setEasingCurve(QEasingCurve::OutQuad);
+        anim->start(QAbstractAnimation::DeleteWhenStopped);
+    });
+
+    connect(m_workStack, &QStackedWidget::currentChanged, this, [this](int index) {
+        QWidget* w = m_workStack->widget(index);
+        if (!w) return;
+        if (!m_animTabsEnabled) {
+            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(w->graphicsEffect());
+            if (effect) effect->setOpacity(1.0);
+            return;
+        }
+        QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(w->graphicsEffect());
+        if (!effect) {
+            effect = new QGraphicsOpacityEffect(w);
+            w->setGraphicsEffect(effect);
+        }
+        QPropertyAnimation* anim = new QPropertyAnimation(effect, "opacity", w);
+        anim->setDuration(m_animSpeedMs);
+        anim->setStartValue(0.0);
+        anim->setEndValue(1.0);
+        anim->setEasingCurve(QEasingCurve::OutQuad);
+        anim->start(QAbstractAnimation::DeleteWhenStopped);
+    });
 
     m_mainSplit->addWidget(m_workStack);
     m_mainSplit->setStretchFactor(0, 0);
@@ -2011,8 +1587,12 @@ QWidget* MainWindow::buildPipelineTab()
     connect(m_btnOpenManualAlign, &QPushButton::clicked, this, [this]() {
         if (m_alignDialog) {
             applyAdjustToWidgets();
-            m_alignDialog->show();
-            m_alignDialog->raise();
+            if (m_animDialogsEnabled) {
+                animateDialogEntry(m_alignDialog, m_btnOpenManualAlign, m_animSpeedMs);
+            } else {
+                m_alignDialog->show();
+                m_alignDialog->raise();
+            }
         }
     });
 
@@ -2121,7 +1701,7 @@ void MainWindow::buildFocusChart()
 
     QValueAxis* axisY = new QValueAxis;
     axisY->setTitleText("Focus Score");
-    // Initial range; autoscaled in onFramesProcessed based on observed max.
+
     axisY->setRange(0, 100);
     axisY->setLabelsColor(QColor(T::text));
     axisY->setTitleBrush(QBrush(QColor(T::textDim)));
@@ -2344,13 +1924,14 @@ QWidget* MainWindow::buildSnapshotTab()
     return page;
 }
 
-QWidget* MainWindow::buildPresetsTab()
+QWidget* MainWindow::buildSettingsTab()
 {
     QWidget* page = new QWidget(this);
     QVBoxLayout* root = new QVBoxLayout(page);
     root->setContentsMargins(14, 14, 14, 14);
     root->setSpacing(10);
 
+    // Left card for Presets save
     QFrame* saveCard = new QFrame(this);
     saveCard->setProperty("role", "card");
     QHBoxLayout* saveLay = new QHBoxLayout(saveCard);
@@ -2373,7 +1954,6 @@ QWidget* MainWindow::buildPresetsTab()
 
     saveLay->addWidget(m_presetNameEdit, 1);
     saveLay->addWidget(m_btnSavePreset);
-    root->addWidget(saveCard);
 
     m_presetList = new QListWidget(this);
     m_presetList->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -2403,7 +1983,76 @@ QWidget* MainWindow::buildPresetsTab()
     listBtnCol->addWidget(m_btnDeletePreset);
     listBtnCol->addStretch();
     listRow->addLayout(listBtnCol);
-    root->addLayout(listRow, 1);
+
+    // Right card for Animations
+    QFrame* animCard = new QFrame(this);
+    animCard->setProperty("role", "card");
+    QVBoxLayout* animLay = new QVBoxLayout(animCard);
+    animLay->setContentsMargins(14, 14, 14, 14);
+    animLay->setSpacing(8);
+
+    QLabel* animTitle = new QLabel("Animation Options", animCard);
+    animTitle->setStyleSheet(QString("font-weight: bold; font-size: 13px; color: %1;").arg(T::accent));
+    animLay->addWidget(animTitle);
+
+    QHBoxLayout* speedRow = new QHBoxLayout();
+    QLabel* speedLbl = new QLabel("Transition Speed:", animCard);
+    QSlider* speedSlider = new QSlider(Qt::Horizontal, animCard);
+    speedSlider->setRange(50, 1000);
+    speedSlider->setValue(m_animSpeedMs);
+    QLabel* speedValLbl = new QLabel(QString("%1 ms").arg(m_animSpeedMs), animCard);
+    speedValLbl->setFixedWidth(60);
+    
+    connect(speedSlider, &QSlider::valueChanged, this, [this, speedValLbl](int val) {
+        m_animSpeedMs = val;
+        speedValLbl->setText(QString("%1 ms").arg(val));
+    });
+    
+    speedRow->addWidget(speedLbl);
+    speedRow->addWidget(speedSlider, 1);
+    speedRow->addWidget(speedValLbl);
+    animLay->addLayout(speedRow);
+
+    QCheckBox* chkSidebar = new QCheckBox("Animate Sidebar", animCard);
+    chkSidebar->setChecked(m_animSidebarEnabled);
+    connect(chkSidebar, &QCheckBox::toggled, this, [this](bool checked) { m_animSidebarEnabled = checked; });
+    animLay->addWidget(chkSidebar);
+
+    QCheckBox* chkFABs = new QCheckBox("Animate Floating Buttons", animCard);
+    chkFABs->setChecked(m_animFABsEnabled);
+    connect(chkFABs, &QCheckBox::toggled, this, [this](bool checked) { m_animFABsEnabled = checked; });
+    animLay->addWidget(chkFABs);
+
+    QCheckBox* chkBottom = new QCheckBox("Animate Bottom Panel", animCard);
+    chkBottom->setChecked(m_animBottomPanelEnabled);
+    connect(chkBottom, &QCheckBox::toggled, this, [this](bool checked) { m_animBottomPanelEnabled = checked; });
+    animLay->addWidget(chkBottom);
+
+    QCheckBox* chkTabs = new QCheckBox("Animate Tab Fade-ins", animCard);
+    chkTabs->setChecked(m_animTabsEnabled);
+    connect(chkTabs, &QCheckBox::toggled, this, [this](bool checked) { m_animTabsEnabled = checked; });
+    animLay->addWidget(chkTabs);
+
+    QCheckBox* chkDialogs = new QCheckBox("Animate Pop-up Dialogs", animCard);
+    chkDialogs->setChecked(m_animDialogsEnabled);
+    connect(chkDialogs, &QCheckBox::toggled, this, [this](bool checked) { m_animDialogsEnabled = checked; });
+    animLay->addWidget(chkDialogs);
+
+    animLay->addStretch();
+
+    // Side-by-side layout
+    QHBoxLayout* mainRow = new QHBoxLayout();
+    mainRow->setSpacing(14);
+
+    QVBoxLayout* leftCol = new QVBoxLayout();
+    leftCol->setSpacing(10);
+    leftCol->addWidget(saveCard);
+    leftCol->addLayout(listRow, 1);
+
+    mainRow->addLayout(leftCol, 1);
+    mainRow->addWidget(animCard, 1);
+
+    root->addLayout(mainRow, 1);
 
     return page;
 }
@@ -2421,7 +2070,7 @@ static const NavSpec kNavSpecs[] = {
     { NavItem::Diff,     "D",  "Diff",      "Diff mode parameters" },
     { NavItem::Focus,    "F",  "Focus",     "Focus telemetry & chart" },
     { NavItem::Snapshot, "S",  "Snapshot",  "Capture & recent shots" },
-    { NavItem::Presets,  "R",  "Presets",   "Save / load configurations" },
+    { NavItem::Presets,  "R",  "Settings",   "Presets & animation settings" },
 };
 
 static int navIndexInBottomStack(NavItem item)
@@ -2571,13 +2220,39 @@ void MainWindow::applyNavLabels()
 void MainWindow::setNavExpanded(bool expanded)
 {
     m_navExpanded = expanded;
-    if (m_mainSplit) {
-        QList<int> sizes = m_mainSplit->sizes();
-        int total = sizes.size() == 2 ? (sizes[0] + sizes[1]) : width();
-        int navW = expanded ? 200 : 56;
-        m_mainSplit->setSizes({ navW, std::max(300, total - navW) });
+    if (!m_mainSplit) {
+        applyNavLabels();
+        return;
     }
-    applyNavLabels();
+    QList<int> sizes = m_mainSplit->sizes();
+    if (sizes.size() < 2) {
+        applyNavLabels();
+        return;
+    }
+    int total = sizes[0] + sizes[1];
+    int startW = sizes[0];
+    int endW = expanded ? 200 : 56;
+
+    if (!m_animSidebarEnabled) {
+        m_mainSplit->setSizes({ endW, std::max(300, total - endW) });
+        applyNavLabels();
+        return;
+    }
+
+    QVariantAnimation* anim = new QVariantAnimation(this);
+    anim->setDuration(m_animSpeedMs);
+    anim->setStartValue(startW);
+    anim->setEndValue(endW);
+    anim->setEasingCurve(QEasingCurve::OutQuad);
+    connect(anim, &QVariantAnimation::valueChanged, this, [this, total](const QVariant& value) {
+        int w = value.toInt();
+        m_mainSplit->setSizes({ w, std::max(300, total - w) });
+    });
+    connect(anim, &QVariantAnimation::finished, this, &MainWindow::applyNavLabels);
+    if (expanded) {
+        applyNavLabels();
+    }
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
 }
 
 void MainWindow::setNavItem(NavItem item)
@@ -2588,9 +2263,67 @@ void MainWindow::setNavItem(NavItem item)
         it.value()->setChecked(it.key() == item);
     }
 
+    auto animateBottomStack = [this](bool show) {
+        if (!m_bottomStack || !m_workSplit) return;
+        
+        QList<int> sizes = m_workSplit->sizes();
+        if (sizes.size() < 2) {
+            m_bottomStack->setVisible(show);
+            return;
+        }
+
+        int totalH = sizes[0] + sizes[1];
+        int startH = sizes[1];
+        int targetH = 260;
+
+        if (!m_animBottomPanelEnabled) {
+            m_bottomStack->setVisible(show);
+            if (show) {
+                m_workSplit->setSizes({ totalH - targetH, targetH });
+            } else {
+                m_workSplit->setSizes({ totalH, 0 });
+            }
+            return;
+        }
+
+        if (show) {
+            if (!m_bottomStack->isVisible()) {
+                m_bottomStack->setMinimumHeight(0);
+                m_bottomStack->setVisible(true);
+                QVariantAnimation* anim = new QVariantAnimation(this);
+                anim->setDuration(m_animSpeedMs);
+                anim->setStartValue(0);
+                anim->setEndValue(targetH);
+                anim->setEasingCurve(QEasingCurve::OutQuad);
+                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalH](const QVariant& val) {
+                    int h = val.toInt();
+                    m_workSplit->setSizes({ totalH - h, h });
+                });
+                anim->start(QAbstractAnimation::DeleteWhenStopped);
+            }
+        } else {
+            if (m_bottomStack->isVisible()) {
+                m_bottomStack->setMinimumHeight(0);
+                QVariantAnimation* anim = new QVariantAnimation(this);
+                anim->setDuration(m_animSpeedMs);
+                anim->setStartValue(startH);
+                anim->setEndValue(0);
+                anim->setEasingCurve(QEasingCurve::OutQuad);
+                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalH](const QVariant& val) {
+                    int h = val.toInt();
+                    m_workSplit->setSizes({ totalH - h, h });
+                });
+                connect(anim, &QVariantAnimation::finished, this, [this]() {
+                    m_bottomStack->setVisible(false);
+                });
+                anim->start(QAbstractAnimation::DeleteWhenStopped);
+            }
+        }
+    };
+
     if (item == NavItem::Gallery) {
         if (m_workStack) m_workStack->setCurrentIndex(1);
-        if (m_bottomStack) m_bottomStack->setVisible(true);
+        animateBottomStack(true);
 
         if (m_btnFabStream)   m_btnFabStream->hide();
         if (m_btnFabSnapshot) m_btnFabSnapshot->hide();
@@ -2602,14 +2335,13 @@ void MainWindow::setNavItem(NavItem item)
     if (m_workStack) m_workStack->setCurrentIndex(0);
 
     if (item == NavItem::None) {
-
-        if (m_bottomStack) m_bottomStack->setVisible(false);
+        animateBottomStack(false);
     } else {
         if (m_bottomStack) {
-            m_bottomStack->setVisible(true);
             int idx = navIndexInBottomStack(item);
             if (idx >= 0) m_bottomStack->setCurrentIndex(idx);
         }
+        animateBottomStack(true);
         m_lastNonGalleryNav = item;
     }
 
@@ -2645,16 +2377,141 @@ void MainWindow::toggleNavItem(NavItem item)
 void MainWindow::togglePreviewMode()
 {
     m_previewMode = !m_previewMode;
-    if (m_previewMode) {
-        if (m_sideNav) m_sideNav->hide();
-        if (m_bottomStack) m_bottomStack->hide();
-        if (m_statusBar) m_statusBar->hide();
-    } else {
-        if (m_sideNav) m_sideNav->show();
-        if (m_bottomStack) m_bottomStack->setVisible(m_currentNav != NavItem::None);
-        if (m_statusBar) m_statusBar->show();
-    }
     if (m_btnPreviewMode) m_btnPreviewMode->setChecked(m_previewMode);
+
+    if (!m_animSidebarEnabled) {
+        if (m_previewMode) {
+            if (m_sideNav) m_sideNav->hide();
+            if (m_bottomStack) m_bottomStack->hide();
+            if (m_statusBar) m_statusBar->hide();
+        } else {
+            if (m_sideNav) m_sideNav->show();
+            if (m_bottomStack) m_bottomStack->setVisible(m_currentNav != NavItem::None);
+            if (m_statusBar) m_statusBar->show();
+        }
+        positionFloatingButtons();
+        return;
+    }
+
+    if (m_previewMode) {
+        if (m_mainSplit && m_sideNav && m_sideNav->isVisible()) {
+            m_sideNav->setMinimumWidth(0);
+            QList<int> sizes = m_mainSplit->sizes();
+            if (sizes.size() >= 2) {
+                int startW = sizes[0];
+                int totalW = sizes[0] + sizes[1];
+                QVariantAnimation* anim = new QVariantAnimation(this);
+                anim->setDuration(m_animSpeedMs);
+                anim->setStartValue(startW);
+                anim->setEndValue(0);
+                anim->setEasingCurve(QEasingCurve::OutQuad);
+                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalW](const QVariant& val) {
+                    int w = val.toInt();
+                    m_mainSplit->setSizes({ w, totalW - w });
+                });
+                connect(anim, &QVariantAnimation::finished, this, [this]() {
+                    m_sideNav->hide();
+                });
+                anim->start(QAbstractAnimation::DeleteWhenStopped);
+            }
+        }
+
+        if (m_workSplit && m_bottomStack && m_bottomStack->isVisible()) {
+            m_bottomStack->setMinimumHeight(0);
+            QList<int> sizes = m_workSplit->sizes();
+            if (sizes.size() >= 2) {
+                int startH = sizes[1];
+                int totalH = sizes[0] + sizes[1];
+                QVariantAnimation* anim = new QVariantAnimation(this);
+                anim->setDuration(m_animSpeedMs);
+                anim->setStartValue(startH);
+                anim->setEndValue(0);
+                anim->setEasingCurve(QEasingCurve::OutQuad);
+                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalH](const QVariant& val) {
+                    int h = val.toInt();
+                    m_workSplit->setSizes({ totalH - h, h });
+                });
+                connect(anim, &QVariantAnimation::finished, this, [this]() {
+                    m_bottomStack->hide();
+                });
+                anim->start(QAbstractAnimation::DeleteWhenStopped);
+            }
+        }
+
+        if (m_statusBar && m_statusBar->isVisible()) {
+            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(m_statusBar->graphicsEffect());
+            if (!effect) {
+                effect = new QGraphicsOpacityEffect(m_statusBar);
+                m_statusBar->setGraphicsEffect(effect);
+            }
+            QPropertyAnimation* fade = new QPropertyAnimation(effect, "opacity", m_statusBar);
+            fade->setDuration(m_animSpeedMs);
+            fade->setStartValue(1.0);
+            fade->setEndValue(0.0);
+            connect(fade, &QPropertyAnimation::finished, this, [this]() {
+                m_statusBar->hide();
+            });
+            fade->start(QAbstractAnimation::DeleteWhenStopped);
+        }
+    } else {
+        if (m_mainSplit && m_sideNav) {
+            m_sideNav->setMinimumWidth(0);
+            m_sideNav->show();
+            QList<int> sizes = m_mainSplit->sizes();
+            if (sizes.size() >= 2) {
+                int totalW = sizes[0] + sizes[1];
+                int targetW = m_navExpanded ? 200 : 56;
+                QVariantAnimation* anim = new QVariantAnimation(this);
+                anim->setDuration(m_animSpeedMs);
+                anim->setStartValue(0);
+                anim->setEndValue(targetW);
+                anim->setEasingCurve(QEasingCurve::OutQuad);
+                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalW](const QVariant& val) {
+                    int w = val.toInt();
+                    m_mainSplit->setSizes({ w, totalW - w });
+                });
+                connect(anim, &QVariantAnimation::finished, this, [this]() {
+                    m_sideNav->setMinimumWidth(56);
+                });
+                anim->start(QAbstractAnimation::DeleteWhenStopped);
+            }
+        }
+
+        if (m_workSplit && m_bottomStack && m_currentNav != NavItem::None) {
+            m_bottomStack->setMinimumHeight(0);
+            m_bottomStack->show();
+            QList<int> sizes = m_workSplit->sizes();
+            if (sizes.size() >= 2) {
+                int totalH = sizes[0] + sizes[1];
+                int targetH = 260;
+                QVariantAnimation* anim = new QVariantAnimation(this);
+                anim->setDuration(m_animSpeedMs);
+                anim->setStartValue(0);
+                anim->setEndValue(targetH);
+                anim->setEasingCurve(QEasingCurve::OutQuad);
+                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalH](const QVariant& val) {
+                    int h = val.toInt();
+                    m_workSplit->setSizes({ totalH - h, h });
+                });
+                anim->start(QAbstractAnimation::DeleteWhenStopped);
+            }
+        }
+
+        if (m_statusBar) {
+            m_statusBar->show();
+            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(m_statusBar->graphicsEffect());
+            if (!effect) {
+                effect = new QGraphicsOpacityEffect(m_statusBar);
+                m_statusBar->setGraphicsEffect(effect);
+            }
+            QPropertyAnimation* fade = new QPropertyAnimation(effect, "opacity", m_statusBar);
+            fade->setDuration(m_animSpeedMs);
+            fade->setStartValue(0.0);
+            fade->setEndValue(1.0);
+            fade->start(QAbstractAnimation::DeleteWhenStopped);
+        }
+    }
+
     positionFloatingButtons();
 }
 
@@ -2735,13 +2592,269 @@ QWidget* MainWindow::buildGalleryView()
     return page;
 }
 
+void MainWindow::recreateGpuViews()
+{
+    if (!m_splitter || !m_videoArea) return;
+
+    QList<int> sizes = m_splitter->sizes();
+    int resultIdx = -1;
+    if (QLayout* lay = m_videoArea->layout()) {
+        for (int i = 0; i < lay->count(); ++i) {
+            if (lay->itemAt(i)->widget() == m_resultView) { resultIdx = i; break; }
+        }
+    }
+
+    bool resultVisible = m_resultView && m_resultView->isVisible();
+
+    auto* oldView1 = m_view1;
+    auto* oldView2 = m_view2;
+    auto* oldResult = m_resultView;
+
+    auto makeFresh = [this](const QString& placeholder) {
+        GpuImageView* v = new GpuImageView(this);
+        v->setMinimumSize(160, 120);
+        v->setPlaceholder(placeholder);
+        return v;
+    };
+    m_view1     = makeFresh("CAM 1");
+    m_view2     = makeFresh("CAM 2");
+    m_resultView = makeFresh("RESULT");
+
+    m_splitter->insertWidget(0, m_view1);
+    m_splitter->insertWidget(1, m_view2);
+    if (sizes.size() >= 2) m_splitter->setSizes(sizes);
+
+    if (resultIdx >= 0 && m_videoArea->layout()) {
+        QBoxLayout* bl = qobject_cast<QBoxLayout*>(m_videoArea->layout());
+        if (bl) bl->insertWidget(resultIdx, m_resultView, 1);
+    }
+    m_resultView->setVisible(resultVisible);
+
+    if (oldView1)  oldView1->deleteLater();
+    if (oldView2)  oldView2->deleteLater();
+    if (oldResult) oldResult->deleteLater();
+
+    if (m_isDiffMode && !m_lastDiffResult.empty()) {
+        m_resultView->setOverlayColor(QColor(0xff, 0xff, 0xff));
+        m_resultView->setOverlayText("DIFF", false);
+        displayMat(m_resultView, m_lastDiffResult);
+    } else if (!m_frame1.empty() && !m_frame2.empty()) {
+        m_view1->setOverlayColor(QColor(0x4e, 0xc9, 0xb0));
+        m_view1->setOverlayText(QString("CAM1  Focus %1").arg(static_cast<int>(m_lastFocus1)), false);
+        m_view2->setOverlayColor(QColor(0xce, 0x91, 0x78));
+        m_view2->setOverlayText(QString("CAM2  Focus %1").arg(static_cast<int>(m_lastFocus2)), true);
+        displayMat(m_view1, m_frame1);
+        displayMat(m_view2, m_frame2);
+    }
+}
+
+#ifdef DUALCAM_SEPARATE_VIEWER
+static QString viewerExecutablePath()
+{
+    QString dir = QCoreApplication::applicationDirPath();
+    QString exe = dir + "/DualCamViewer";
+#ifdef Q_OS_WIN
+    exe += ".exe";
+#endif
+    return exe;
+}
+
+static bool spawnViewer(const QString& mode, const QJsonObject& obj, QString& errOut)
+{
+    QString tmpDir = QDir::tempPath();
+    QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz");
+    QString payloadPath = QString("%1/dualcam_%2_%3.json").arg(tmpDir, mode, stamp);
+
+    QFile f(payloadPath);
+    if (!f.open(QIODevice::WriteOnly)) {
+        errOut = "Cannot write payload to " + payloadPath;
+        return false;
+    }
+    f.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    f.close();
+
+    QString exe = viewerExecutablePath();
+    if (!QFile::exists(exe)) {
+        QFile::remove(payloadPath);
+        errOut = "Viewer not found: " + exe;
+        return false;
+    }
+    QStringList args { "--mode", mode, "--payload", payloadPath };
+    if (!QProcess::startDetached(exe, args)) {
+        QFile::remove(payloadPath);
+        errOut = "QProcess::startDetached failed.";
+        return false;
+    }
+    return true;
+}
+#endif
+
+void MainWindow::launchProfileViewer(const cv::Mat& img, QPoint a, QPoint b,
+                                     const QString& title, bool darkTheme,
+                                     QWidget* parent)
+{
+    const double dx = b.x() - a.x();
+    const double dy = b.y() - a.y();
+    const double length = std::hypot(dx, dy);
+    const int steps = std::max(2, int(std::ceil(length)));
+
+    auto bilinear = [&](const cv::Mat& m, int channel, double x, double y) -> double {
+        if (x < 0) x = 0; if (y < 0) y = 0;
+        if (x > m.cols - 1) x = m.cols - 1;
+        if (y > m.rows - 1) y = m.rows - 1;
+        int x0 = int(std::floor(x)), x1 = std::min(x0 + 1, m.cols - 1);
+        int y0 = int(std::floor(y)), y1 = std::min(y0 + 1, m.rows - 1);
+        double fx = x - x0, fy = y - y0;
+        auto px = [&](int xx, int yy) -> double {
+            if (m.channels() == 1) return m.at<uchar>(yy, xx);
+            return m.at<cv::Vec3b>(yy, xx)[channel];
+        };
+        double v00 = px(x0, y0), v10 = px(x1, y0), v01 = px(x0, y1), v11 = px(x1, y1);
+        return (1 - fx) * (1 - fy) * v00 + fx * (1 - fy) * v10
+             + (1 - fx) * fy * v01 + fx * fy * v11;
+    };
+    auto sampleLuma = [&](double x, double y) -> double {
+        if (img.channels() == 1) return bilinear(img, 0, x, y);
+        const double bb = bilinear(img, 0, x, y);
+        const double gg = bilinear(img, 1, x, y);
+        const double rr = bilinear(img, 2, x, y);
+        return 0.299 * rr + 0.587 * gg + 0.114 * bb;
+    };
+
+    QJsonArray samples;
+    for (int i = 0; i < steps; ++i) {
+        const double t = double(i) / (steps - 1);
+        const double x = a.x() + t * dx;
+        const double y = a.y() + t * dy;
+        const double luma = sampleLuma(x, y);
+        QJsonArray row { t * length, x, y, luma };
+        samples.append(row);
+    }
+
+    QJsonObject obj;
+    obj["title"]   = title;
+    obj["dark"]    = darkTheme;
+    obj["ax"]      = a.x();
+    obj["ay"]      = a.y();
+    obj["bx"]      = b.x();
+    obj["by"]      = b.y();
+    obj["length"]  = length;
+    obj["samples"] = samples;
+
+#ifndef DUALCAM_SEPARATE_VIEWER
+    QDialog* dlg = makeProfileDialog(obj, parent ? parent : this);
+    if (m_animDialogsEnabled) {
+        animateDialogEntry(dlg, nullptr, m_animSpeedMs);
+    } else {
+        dlg->show();
+    }
+#else
+    QString err;
+    if (!spawnViewer("profile", obj, err)) {
+        if (m_statusBar) m_statusBar->showMessage("Viewer error: " + err, 5000);
+    }
+#endif
+}
+
+void MainWindow::launchSurfaceViewer(const cv::Mat& img, QRect roi,
+                                     const QString& title, bool darkTheme,
+                                     QWidget* parent)
+{
+    cv::Rect bounds(0, 0, img.cols, img.rows);
+    cv::Rect r(roi.x(), roi.y(), roi.width(), roi.height());
+    r = r & bounds;
+    if (r.width < 2 || r.height < 2) {
+        if (m_statusBar) m_statusBar->showMessage("ROI too small.", 3000);
+        return;
+    }
+
+    cv::Mat sub = img(r);
+    cv::Mat gray;
+    if (sub.channels() == 1) gray = sub;
+    else cv::cvtColor(sub, gray, cv::COLOR_BGR2GRAY);
+
+    const int maxSide = 96;
+    cv::Mat g;
+    if (gray.cols > maxSide || gray.rows > maxSide) {
+        double k = double(maxSide) / std::max(gray.cols, gray.rows);
+        cv::resize(gray, g, cv::Size(), k, k, cv::INTER_AREA);
+    } else g = gray.clone();
+
+    const int cols = g.cols;
+    const int rows = g.rows;
+    QByteArray gridBytes;
+    gridBytes.resize(cols * rows);
+    for (int y = 0; y < rows; ++y) {
+        std::memcpy(gridBytes.data() + y * cols, g.ptr<uchar>(y), cols);
+    }
+
+    const double kBackX = (cols > 0) ? (double(r.width)  / double(cols)) : 1.0;
+    const double kBackY = (rows > 0) ? (double(r.height) / double(rows)) : 1.0;
+
+    QJsonObject obj;
+    obj["title"] = title;
+    obj["dark"]  = darkTheme;
+    obj["roiX"]  = r.x;
+    obj["roiY"]  = r.y;
+    obj["kx"]    = kBackX;
+    obj["ky"]    = kBackY;
+    obj["cols"]  = cols;
+    obj["rows"]  = rows;
+    obj["grid"]  = QString::fromLatin1(gridBytes.toBase64());
+
+#ifndef DUALCAM_SEPARATE_VIEWER
+    QDialog* dlg = makeSurfaceDialog(obj, parent ? parent : this);
+    if (m_animDialogsEnabled) {
+        animateDialogEntry(dlg, nullptr, m_animSpeedMs);
+    } else {
+        dlg->show();
+    }
+#else
+    QString err;
+    if (!spawnViewer("surface", obj, err)) {
+        if (m_statusBar) m_statusBar->showMessage("Viewer error: " + err, 5000);
+    }
+#endif
+}
+
+void MainWindow::restoreMainViewAfterChildClose()
+{
+    QTimer::singleShot(0, this, [this]() {
+        auto kick = [](QOpenGLWidget* v) {
+            if (!v) return;
+            v->hide();
+            v->show();
+            v->update();
+        };
+        kick(m_view1);
+        kick(m_view2);
+        kick(m_resultView);
+        this->update();
+        this->activateWindow();
+        this->raise();
+
+        QTimer::singleShot(50, this, [this]() {
+            if (m_isDiffMode && !m_lastDiffResult.empty()) {
+                displayMat(m_resultView, m_lastDiffResult);
+            } else if (!m_frame1.empty() && !m_frame2.empty()) {
+                displayMat(m_view1, m_frame1);
+                displayMat(m_view2, m_frame2);
+            }
+        });
+    });
+}
+
 void MainWindow::openPreviewWindow(const QString& imagePath, const QString& fileBase)
 {
-    QDialog* dlg = new QDialog(this, Qt::Window);
+    QDialog* dlg = new QDialog(nullptr, Qt::Window);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
     dlg->setWindowTitle("Preview: " + fileBase);
     dlg->setStyleSheet(styleSheetText());
     dlg->resize(this->width() * 2 / 3, this->height() * 2 / 3);
+
+    connect(dlg, &QObject::destroyed, this, [this]() {
+        restoreMainViewAfterChildClose();
+    });
 
     QVBoxLayout* root = new QVBoxLayout(dlg);
     root->setContentsMargins(8, 8, 8, 8);
@@ -2845,20 +2958,11 @@ void MainWindow::openPreviewWindow(const QString& imagePath, const QString& file
     QPointer<QDialog> dlgPtr(dlg);
     canvas->onLineSelected([this, analysisSrc, fileBase, dlgPtr, themeBtn](QPoint a, QPoint b) {
         const bool dark = themeBtn->value() == 1;
-        QWidget* w = makeProfileWindow(analysisSrc, a, b, fileBase, dark, this);
-        w->show();
+        launchProfileViewer(analysisSrc, a, b, fileBase, dark, dlgPtr.data());
     });
     canvas->onRectSelected([this, analysisSrc, fileBase, dlgPtr, themeBtn](QRect r) {
         const bool dark = themeBtn->value() == 1;
-        QWidget* w = makeSurfaceWindow(analysisSrc, r, fileBase, dark, this);
-        // After the 3D surface window closes, ask camera views to repaint —
-        // workaround for GL backbuffer being invalidated on close.
-        connect(w, &QObject::destroyed, this, [this]() {
-            if (m_view1) m_view1->update();
-            if (m_view2) m_view2->update();
-            if (m_resultView) m_resultView->update();
-        });
-        w->show();
+        launchSurfaceViewer(analysisSrc, r, fileBase, dark, dlgPtr.data());
     });
 
     QFrame* metaFrame = new QFrame(dlg);
@@ -2917,9 +3021,13 @@ void MainWindow::openPreviewWindow(const QString& imagePath, const QString& file
     }
     body->addWidget(metaFrame, 1);
 
-    dlg->show();
-    dlg->raise();
-    dlg->activateWindow();
+    if (m_animDialogsEnabled) {
+        animateDialogEntry(dlg, m_snapshotPreview, m_animSpeedMs);
+    } else {
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
+    }
 }
 
 void MainWindow::minimizeAllDialogs()
@@ -2935,6 +3043,88 @@ void MainWindow::minimizeAllDialogs()
     if (m_statusBar) m_statusBar->showMessage(QString("Minimized %1 dialog(s).").arg(count), 1500);
 }
 
+void MainWindow::animateDialogEntry(QDialog* dlg, QWidget* triggerWidget, int durationMs)
+{
+    if (!dlg) return;
+
+    QWidget* parent = dlg->parentWidget();
+    if (!parent) parent = QApplication::activeWindow();
+
+    QSize targetSize = dlg->sizeHint();
+    if (targetSize.width() < 100 || targetSize.height() < 100) {
+        targetSize = dlg->size();
+    }
+    QRect targetGeo(QPoint(0, 0), targetSize);
+    if (parent) {
+        QPoint center = parent->geometry().center();
+        targetGeo.moveCenter(center);
+    } else {
+        QPoint center = QApplication::primaryScreen()->geometry().center();
+        targetGeo.moveCenter(center);
+    }
+
+    QPoint startPos;
+    if (triggerWidget) {
+        startPos = triggerWidget->mapToGlobal(triggerWidget->rect().center());
+    } else {
+        startPos = QCursor::pos();
+    }
+
+    QRect startGeo(startPos, QSize(10, 10));
+
+    const QObjectList children = dlg->children();
+    QList<QWidget*> childWidgets;
+    for (QObject* child : children) {
+        QWidget* cw = qobject_cast<QWidget*>(child);
+        if (cw && cw->parentWidget() == dlg && !cw->isHidden()) {
+            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(cw->graphicsEffect());
+            if (!effect) {
+                effect = new QGraphicsOpacityEffect(cw);
+                cw->setGraphicsEffect(effect);
+            }
+            effect->setOpacity(0.0);
+            cw->setProperty("isFaded", false);
+            childWidgets.append(cw);
+        }
+    }
+
+    dlg->setGeometry(startGeo);
+    dlg->show();
+    dlg->raise();
+    dlg->activateWindow();
+
+    QPropertyAnimation* geomAnim = new QPropertyAnimation(dlg, "geometry", dlg);
+    geomAnim->setDuration(durationMs);
+    geomAnim->setStartValue(startGeo);
+    geomAnim->setEndValue(targetGeo);
+    geomAnim->setEasingCurve(QEasingCurve::OutQuad);
+
+    QObject::connect(geomAnim, &QPropertyAnimation::valueChanged, dlg, [childWidgets, targetGeo](const QVariant& value) {
+        QRect current = value.toRect();
+        double progress = double(current.width()) / targetGeo.width();
+        if (progress >= 0.33) {
+            for (QWidget* cw : childWidgets) {
+                if (cw && !cw->property("isFaded").toBool()) {
+                    cw->setProperty("isFaded", true);
+                    QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(cw->graphicsEffect());
+                    if (effect) {
+                        QPropertyAnimation* fade = new QPropertyAnimation(effect, "opacity", cw);
+                        fade->setDuration(150);
+                        fade->setStartValue(0.0);
+                        fade->setEndValue(1.0);
+                        connect(fade, &QPropertyAnimation::finished, cw, [cw]() {
+                            cw->setGraphicsEffect(nullptr);
+                        });
+                        fade->start(QAbstractAnimation::DeleteWhenStopped);
+                    }
+                }
+            }
+        }
+    });
+
+    geomAnim->start(QAbstractAnimation::DeleteWhenStopped);
+}
+
 void MainWindow::buildAlignDialog()
 {
     m_alignDialog = new QDialog(this);
@@ -2942,8 +3132,7 @@ void MainWindow::buildAlignDialog()
     m_alignDialog->setModal(false);
     m_alignDialog->resize(620, 460);
 
-    // Local overrides only bump the dialog's typography and control padding;
-    // sliders inherit the global proportional sizing from styleSheetText().
+
     m_alignDialog->setStyleSheet(styleSheetText() + QString(R"(
         QDialog QLabel { font-size: 12px; font-weight: 600; }
         QDialog QComboBox { font-size: 12px; padding: 4px 10px; min-height: 24px; }
@@ -3031,49 +3220,113 @@ void MainWindow::positionFloatingButtons()
     if (!m_videoArea) return;
     const int w = m_videoArea->width();
     const int h = m_videoArea->height();
-
     const int pad = 10;
-
     const bool camerasHidden = (m_currentNav == NavItem::Gallery);
 
-    if (m_btnModeToggle) {
-        if (!camerasHidden) {
-            m_btnModeToggle->show();
-            m_btnModeToggle->move(w / 2 - m_btnModeToggle->width() / 2,
-                                  h - pad - m_btnModeToggle->height());
-            m_btnModeToggle->raise();
-        } else {
-            m_btnModeToggle->hide();
+    auto animateButton = [this](QWidget* btn, bool show, const QPoint& targetPos) {
+        if (!btn) return;
+
+        bool currentlyVisible = btn->isVisible() && (btn->graphicsEffect() ? qobject_cast<QGraphicsOpacityEffect*>(btn->graphicsEffect())->opacity() > 0.1 : true);
+
+        if (!m_animFABsEnabled) {
+            btn->move(targetPos);
+            btn->setVisible(show);
+            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(btn->graphicsEffect());
+            if (effect) effect->setOpacity(1.0);
+            return;
         }
+
+        if (show) {
+            if (currentlyVisible) {
+                if (btn->pos() != targetPos) {
+                    QPropertyAnimation* posAnim = new QPropertyAnimation(btn, "pos", btn);
+                    posAnim->setDuration(m_animSpeedMs);
+                    posAnim->setStartValue(btn->pos());
+                    posAnim->setEndValue(targetPos);
+                    posAnim->setEasingCurve(QEasingCurve::OutQuad);
+                    posAnim->start(QAbstractAnimation::DeleteWhenStopped);
+                }
+                QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(btn->graphicsEffect());
+                if (effect) effect->setOpacity(1.0);
+            } else {
+                btn->show();
+                btn->raise();
+
+                QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(btn->graphicsEffect());
+                if (!effect) {
+                    effect = new QGraphicsOpacityEffect(btn);
+                    btn->setGraphicsEffect(effect);
+                }
+                effect->setOpacity(0.0);
+
+                QPropertyAnimation* opacityAnim = new QPropertyAnimation(effect, "opacity", btn);
+                opacityAnim->setDuration(m_animSpeedMs);
+                opacityAnim->setStartValue(0.0);
+                opacityAnim->setEndValue(1.0);
+                opacityAnim->setEasingCurve(QEasingCurve::OutQuad);
+
+                QPropertyAnimation* posAnim = new QPropertyAnimation(btn, "pos", btn);
+                posAnim->setDuration(m_animSpeedMs);
+                QPoint startPos = targetPos + QPoint(0, 25);
+                posAnim->setStartValue(startPos);
+                posAnim->setEndValue(targetPos);
+                posAnim->setEasingCurve(QEasingCurve::OutQuad);
+
+                QParallelAnimationGroup* group = new QParallelAnimationGroup(btn);
+                group->addAnimation(opacityAnim);
+                group->addAnimation(posAnim);
+                group->start(QAbstractAnimation::DeleteWhenStopped);
+            }
+        } else {
+            if (currentlyVisible) {
+                QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(btn->graphicsEffect());
+                if (!effect) {
+                    effect = new QGraphicsOpacityEffect(btn);
+                    btn->setGraphicsEffect(effect);
+                }
+
+                QPropertyAnimation* opacityAnim = new QPropertyAnimation(effect, "opacity", btn);
+                opacityAnim->setDuration(m_animSpeedMs);
+                opacityAnim->setStartValue(effect->opacity());
+                opacityAnim->setEndValue(0.0);
+                opacityAnim->setEasingCurve(QEasingCurve::OutQuad);
+
+                QPropertyAnimation* posAnim = new QPropertyAnimation(btn, "pos", btn);
+                posAnim->setDuration(m_animSpeedMs);
+                QPoint endPos = btn->pos() + QPoint(0, 25);
+                posAnim->setStartValue(btn->pos());
+                posAnim->setEndValue(endPos);
+                posAnim->setEasingCurve(QEasingCurve::OutQuad);
+
+                QParallelAnimationGroup* group = new QParallelAnimationGroup(btn);
+                group->addAnimation(opacityAnim);
+                group->addAnimation(posAnim);
+
+                QObject::connect(group, &QParallelAnimationGroup::finished, btn, [btn]() {
+                    btn->hide();
+                });
+                group->start(QAbstractAnimation::DeleteWhenStopped);
+            } else {
+                btn->hide();
+            }
+        }
+    };
+
+    if (m_btnModeToggle) {
+        QPoint target(w / 2 - m_btnModeToggle->width() / 2, h - pad - m_btnModeToggle->height());
+        animateButton(m_btnModeToggle, !camerasHidden, target);
     }
     if (m_btnFabStream) {
-        if (!camerasHidden) {
-            m_btnFabStream->show();
-            m_btnFabStream->move(pad, h - pad - m_btnFabStream->height());
-            m_btnFabStream->raise();
-        } else {
-            m_btnFabStream->hide();
-        }
+        QPoint target(pad, h - pad - m_btnFabStream->height());
+        animateButton(m_btnFabStream, !camerasHidden, target);
     }
     if (m_btnFabSnapshot) {
-        if (!camerasHidden) {
-            m_btnFabSnapshot->show();
-            m_btnFabSnapshot->move(w - pad - m_btnFabSnapshot->width(),
-                                   h - pad - m_btnFabSnapshot->height());
-            m_btnFabSnapshot->raise();
-        } else {
-            m_btnFabSnapshot->hide();
-        }
+        QPoint target(w - pad - m_btnFabSnapshot->width(), h - pad - m_btnFabSnapshot->height());
+        animateButton(m_btnFabSnapshot, !camerasHidden, target);
     }
-
     if (m_btnFloatingPreviewToggle) {
-        if (m_previewMode) {
-            m_btnFloatingPreviewToggle->show();
-            m_btnFloatingPreviewToggle->move(pad, pad);
-            m_btnFloatingPreviewToggle->raise();
-        } else {
-            m_btnFloatingPreviewToggle->hide();
-        }
+        QPoint target(pad, pad);
+        animateButton(m_btnFloatingPreviewToggle, m_previewMode, target);
     }
 }
 
@@ -3134,7 +3387,7 @@ void MainWindow::resizeEvent(QResizeEvent* event)
 
     if (m_fpsPill) m_fpsPill->setVisible(!ultraCompact);
     if (m_eccPill) m_eccPill->setVisible(!ultraCompact);
-    // Compact view: use a small camera glyph in place of the word "Snapshots".
+
     if (m_btnGallery) m_btnGallery->setText(compact ? QStringLiteral("▣") : QStringLiteral("Snapshots"));
 }
 
@@ -3368,7 +3621,7 @@ void MainWindow::openCameras()
     m_seriesCam2->clear();
 
     m_chart->axes(Qt::Horizontal).first()->setRange(0, m_maxHistory);
-    // Y range autoscales as data arrives; start small so an empty axis isn't huge.
+
     m_chart->axes(Qt::Vertical).first()->setRange(0, 100);
 
     m_btnFabStream->setObjectName("fabStreamStop");
@@ -3505,11 +3758,7 @@ void MainWindow::onFramesProcessed(cv::Mat f1, cv::Mat f2, double focus1, double
                 axes.first()->setRange(std::max(0LL, frameCount - m_maxHistory), frameCount);
             }
 
-            // Autoscale Y to the visible window. We round up to a "nice" value
-            // (1/2/5 * 10^k) so the axis labels stay readable, and keep small
-            // headroom so the trace doesn't kiss the top. Hysteresis: only
-            // shrink when the new ceiling is at least 30% smaller than current,
-            // so the axis doesn't jitter every frame.
+
             auto seriesMax = [](QLineSeries* s) {
                 double m = 0.0;
                 const auto pts = s->points();
@@ -4083,6 +4332,9 @@ void MainWindow::showFilenameParamsDialog()
     connect(btnCancel, &QPushButton::clicked, &dlg, &QDialog::reject);
     connect(btnOk, &QPushButton::clicked, &dlg, &QDialog::accept);
 
+    if (m_animDialogsEnabled) {
+        animateDialogEntry(&dlg, m_btnConfigParams, m_animSpeedMs);
+    }
     if (dlg.exec() != QDialog::Accepted) return;
 
     for (auto it = boxes.constBegin(); it != boxes.constEnd(); ++it) {
@@ -4297,7 +4549,12 @@ void MainWindow::showExposureDialog()
     root->addLayout(btns);
     connect(btnClose, &QPushButton::clicked, &dlg, &QDialog::accept);
 
-    dlg.exec();
+    if (m_animDialogsEnabled) {
+        animateDialogEntry(&dlg, m_btnExpChange, m_animSpeedMs);
+        dlg.exec();
+    } else {
+        dlg.exec();
+    }
 }
 
 void MainWindow::saveSnapshot()
@@ -4515,12 +4772,25 @@ void MainWindow::saveSettings()
     writeAdj("adj1/", m_manualAdj1);
     writeAdj("adj2/", m_manualAdj2);
     s.setValue("activeAdjCam", m_activeAdjCam);
+    s.setValue("animSpeedMs", m_animSpeedMs);
+    s.setValue("animSidebarEnabled", m_animSidebarEnabled);
+    s.setValue("animFABsEnabled", m_animFABsEnabled);
+    s.setValue("animBottomPanelEnabled", m_animBottomPanelEnabled);
+    s.setValue("animTabsEnabled", m_animTabsEnabled);
+    s.setValue("animDialogsEnabled", m_animDialogsEnabled);
     s.sync();
 }
 
 void MainWindow::loadSettings()
 {
     QSettings s(settingsPath(), QSettings::IniFormat);
+    m_animSpeedMs            = s.value("animSpeedMs", 220).toInt();
+    m_animSidebarEnabled     = s.value("animSidebarEnabled", true).toBool();
+    m_animFABsEnabled        = s.value("animFABsEnabled", true).toBool();
+    m_animBottomPanelEnabled = s.value("animBottomPanelEnabled", true).toBool();
+    m_animTabsEnabled        = s.value("animTabsEnabled", true).toBool();
+    m_animDialogsEnabled     = s.value("animDialogsEnabled", true).toBool();
+
     m_comboColorMode->setCurrentIndex(s.value("colorMode", 1).toInt());
     m_chkFlipVer2->setChecked(s.value("flipVer2", false).toBool());
     m_chkFlipHor2->setChecked(s.value("flipHor2", false).toBool());
@@ -5165,6 +5435,9 @@ void MainWindow::showActionsMenu()
 
     root->addWidget(bottomBar);
 
+    if (m_animDialogsEnabled) {
+        animateDialogEntry(&dlg, m_btnHelp, m_animSpeedMs);
+    }
     dlg.exec();
 }
 

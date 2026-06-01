@@ -68,6 +68,9 @@ std::vector<uint8_t> insertExif(const std::vector<uint8_t>& jpegData, const Exif
     addString(ifd0, 0x0131, params.software);
 
     if (params.exposureTimeDen > 0) {
+        while (extraData.size() % 4 != 0) {
+            extraData.push_back(0);
+        }
         IfdEntry e;
         e.tag = 0x829A;
         e.format = 5;
@@ -203,7 +206,7 @@ std::string readExifDescription(const std::vector<uint8_t>& jpegData) {
                         return s;
                     }
                     uint32_t off = r32(e + 8);
-                    if (off + cnt > tiffLen) return {};
+                    if (uint64_t(off) + cnt > tiffLen) return {};
                     std::string s(reinterpret_cast<const char*>(tiff + off), cnt);
                     if (!s.empty() && s.back() == '\0') s.pop_back();
                     return s;

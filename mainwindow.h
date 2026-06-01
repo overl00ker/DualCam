@@ -203,7 +203,7 @@ private:
     QWidget* buildPipelineTab();
     QWidget* buildDiffTab();
     QWidget* buildSnapshotTab();
-    QWidget* buildPresetsTab();
+    QWidget* buildSettingsTab();
     QWidget* buildGalleryView();
     QWidget* buildSideNav();
     void buildAlignDialog();
@@ -213,7 +213,16 @@ private:
     void toggleFocusView();
     void refreshSnapshotPreview();
     void openPreviewWindow(const QString& imagePath, const QString& fileBase);
+    void restoreMainViewAfterChildClose();
+    void recreateGpuViews();
+    void launchProfileViewer(const cv::Mat& img, QPoint a, QPoint b,
+                             const QString& title, bool darkTheme,
+                             QWidget* parent = nullptr);
+    void launchSurfaceViewer(const cv::Mat& img, QRect roi,
+                             const QString& title, bool darkTheme,
+                             QWidget* parent = nullptr);
     void minimizeAllDialogs();
+    void animateDialogEntry(QDialog* dlg, QWidget* triggerWidget, int durationMs);
     void updateEccPill();
     void updateFpsPill();
     void setNavItem(NavItem item);
@@ -398,6 +407,13 @@ private:
     QSlider* m_sldAdjRy; QDoubleSpinBox* m_spnAdjRy;
     QSlider* m_sldAdjRz; QDoubleSpinBox* m_spnAdjRz;
     QPushButton* m_btnResetAdj;
+
+    int m_animSpeedMs = 220;
+    bool m_animSidebarEnabled = true;
+    bool m_animFABsEnabled = true;
+    bool m_animBottomPanelEnabled = true;
+    bool m_animTabsEnabled = true;
+    bool m_animDialogsEnabled = true;
 
     QStatusBar* m_statusBar;
 
