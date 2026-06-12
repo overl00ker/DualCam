@@ -169,6 +169,8 @@ public:
     ~MainWindow();
 
     void initCommands();
+    void showQuickTour();
+    void showHelpDialog();
     void showActionsMenu();
     void applyShortcut(const QString& id, const QKeySequence& seq);
     void executeCommand(const QString& id);
@@ -207,7 +209,7 @@ private:
     QWidget* buildGalleryView();
     QWidget* buildSideNav();
     void buildAlignDialog();
-    void positionFloatingButtons();
+    void positionFloatingButtons(bool animate = true);
     void buildFocusChart();
     QWidget* buildFocusDataPanel();
     void toggleFocusView();
@@ -315,6 +317,7 @@ private:
     QLabel* m_eccPill;
     QPushButton* m_btnGallery;
     QPushButton* m_btnHelp;
+    QPushButton* m_btnHelpDocs = nullptr;
 
     QPushButton* m_btnExpToggle = nullptr;
     QPushButton* m_btnExpChange = nullptr;

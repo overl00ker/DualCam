@@ -284,14 +284,22 @@ QDialog* makeSurfaceDialog(const QJsonObject& obj, QWidget* parent) {
     });
     surface->setActiveInputHandler(inputHandler);
 
-    Q3DTheme* theme = new Q3DTheme(darkTheme ? Q3DTheme::ThemeQt : Q3DTheme::ThemePrimaryColors);
+    Q3DTheme* theme = new Q3DTheme(darkTheme ? Q3DTheme::ThemeEbony : Q3DTheme::ThemePrimaryColors);
     if (darkTheme) {
-        theme->setBackgroundColor(QColor("#050505"));
-        theme->setWindowColor(QColor("#050505"));
-        theme->setLabelTextColor(QColor("#e5e2e1"));
-        theme->setLabelBackgroundColor(QColor(20, 20, 20, 200));
+        /* No "aquarium": the bright back/side walls are what made the dark
+           view ugly. Floating grid on the window background instead. */
+        theme->setBackgroundEnabled(false);
+        theme->setWindowColor(QColor("#0a0a0a"));
+        theme->setLabelTextColor(QColor("#f2efee"));
+        theme->setLabelBackgroundEnabled(false);
         theme->setLabelBorderEnabled(false);
-        theme->setGridLineColor(QColor(255, 255, 255, 40));
+        theme->setGridLineColor(QColor(255, 255, 255, 34));
+        theme->setAmbientLightStrength(0.55f);
+        theme->setLightStrength(4.5f);
+        theme->setHighlightLightStrength(2.0f);
+        QFont axisFont("Space Mono");
+        axisFont.setPointSize(13);
+        theme->setFont(axisFont);
     } else {
         theme->setBackgroundColor(QColor("#ffffff"));
         theme->setWindowColor(QColor("#fafafa"));
@@ -300,6 +308,14 @@ QDialog* makeSurfaceDialog(const QJsonObject& obj, QWidget* parent) {
         theme->setGridLineColor(QColor(0, 0, 0, 60));
     }
     surface->setActiveTheme(theme);
+
+    /* Default camera: closer and at a readable isometric angle instead of
+       the far-away default. */
+    if (surface->scene() && surface->scene()->activeCamera()) {
+        Q3DCamera* cam = surface->scene()->activeCamera();
+        cam->setCameraPreset(Q3DCamera::CameraPresetIsometricLeftHigh);
+        cam->setZoomLevel(145.0f);
+    }
 
     QWidget* container = QWidget::createWindowContainer(surface, w);
     container->setMinimumSize(400, 300);
@@ -320,6 +336,10 @@ QDialog* makeSurfaceDialog(const QJsonObject& obj, QWidget* parent) {
     QSurface3DSeries* series = new QSurface3DSeries();
     series->setDrawMode(QSurface3DSeries::DrawSurfaceAndWireframe);
     series->setFlatShadingEnabled(false);
+    if (darkTheme) {
+        series->setWireframeColor(QColor(255, 255, 255, 26));
+        series->setSingleHighlightColor(QColor("#d4564a"));
+    }
     QSurfaceDataProxy* proxy = new QSurfaceDataProxy();
     proxy->resetArray(data);
     series->setDataProxy(proxy);
@@ -340,8 +360,8 @@ QDialog* makeSurfaceDialog(const QJsonObject& obj, QWidget* parent) {
                           .arg(v.y(), 0, 'f', 0));
     });
 
-    QColor* lowColor  = new QColor(darkTheme ? QColor(58, 58, 58) : QColor(232, 232, 232));
-    QColor* highColor = new QColor(78, 201, 176);
+    QColor* lowColor  = new QColor(darkTheme ? QColor(24, 32, 29) : QColor(232, 232, 232));
+    QColor* highColor = new QColor(93, 202, 165);
     QObject::connect(w, &QObject::destroyed, [lowColor, highColor]{ delete lowColor; delete highColor; });
 
     auto applyGradient = [series, lowSwatch, highSwatch, lowColor, highColor]() {

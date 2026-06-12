@@ -5,6 +5,7 @@
 
 #include <QPropertyAnimation>
 #include <QParallelAnimationGroup>
+#include <QPainterPath>
 #include <QGraphicsOpacityEffect>
 #include <QVariantAnimation>
 
@@ -631,20 +632,21 @@ namespace T {
     static const char* bg0 = "#050505";
     static const char* bg1 = "#0e0e0e";
     static const char* bg2 = "#1a1a1a";
-    static const char* bg3 = "#2a2a2a";
-    static const char* bgHover = "#353534";
-    static const char* border = "rgba(255, 255, 255, 0.05)";
-    static const char* borderStrong = "rgba(255, 255, 255, 0.1)";
-    static const char* text = "#e5e2e1";
-    static const char* textDim = "#c8c6c5";
-    static const char* textFaint = "#b7b5b4";
-    static const char* accent = "#500b0b";
-    static const char* accentDim = "#450d0d";
-    static const char* ok = "#ffdad6";
-    static const char* warn = "#ffb3ae";
-    static const char* err = "#ffb4ab";
-    static const char* cam1 = "#c8c6c5";
-    static const char* cam2 = "#a38b89";
+    static const char* bg3 = "#262626";
+    static const char* bgHover = "#303030";
+    static const char* border = "rgba(255, 255, 255, 0.06)";
+    static const char* borderStrong = "rgba(255, 255, 255, 0.14)";
+    static const char* text = "#f2efee";
+    static const char* textDim = "#b8b5b3";
+    static const char* textFaint = "#8a8784";
+    static const char* accent = "#d4564a";      /* bright coral-red: highlights, borders, checked */
+    static const char* accentDim = "#7e2c24";   /* dark red: fills, pressed */
+    static const char* onAccent = "#1f0a08";    /* dark text on bright accent fill */
+    static const char* ok = "#7ed492";
+    static const char* warn = "#f0b860";
+    static const char* err = "#f07d72";
+    static const char* cam1 = "#5dcaa5";
+    static const char* cam2 = "#f0997b";
 }
 
 static void setPillState(QLabel* lbl, const char* state, const QString& text = QString())
@@ -707,6 +709,13 @@ MainWindow::MainWindow(QWidget* parent)
     initCommands();
     loadSettings();
     refreshPresetList();
+
+    {
+        QSettings s(settingsPath(), QSettings::IniFormat);
+        if (!s.value("tourShown", false).toBool()) {
+            QTimer::singleShot(600, this, [this]() { showQuickTour(); });
+        }
+    }
 }
 
 MainWindow::~MainWindow()
@@ -727,16 +736,16 @@ QString MainWindow::styleSheetText() const
         QWidget { color: %3; font-family: 'Inter','Segoe UI Variable','Segoe UI',sans-serif; font-size: 12px; }
         QToolTip {
             background: %6; color: %3; border: 1px solid %9; padding: 4px 8px;
-            border-radius: 0px; font-size: 11px; font-weight: 500;
+            border-radius: 6px; font-size: 11px; font-weight: 500;
         }
 
         QMenu {
-            background: %2; color: %3; border: 1px solid %7;
-            padding: 4px 0px; font-size: 12px;
+            background: %2; color: %3; border: 1px solid %9;
+            border-radius: 8px; padding: 5px 4px; font-size: 12px;
         }
         QMenu::item {
             background: transparent; color: %3;
-            padding: 6px 22px 6px 18px;
+            padding: 6px 22px 6px 14px; border-radius: 5px; margin: 1px 2px;
         }
         QMenu::item:selected   { background: %6; color: %3; }
         QMenu::item:disabled   { color: %10; }
@@ -762,20 +771,20 @@ QString MainWindow::styleSheetText() const
            recolored for light-on-dark Adrenalin */
         QLabel[role="pill"] {
             background: %6; color: %4; border: 1px solid %7;
-            border-radius: 0px; padding: 2px 8px;
+            border-radius: 9px; padding: 2px 10px;
             font-family: 'Space Mono','JetBrains Mono',monospace;
             font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
         }
-        QLabel[role="pill"][pillState="ok"]   { color: #cde6c8; background: #143022; border-color: #1f5036; }
-        QLabel[role="pill"][pillState="warn"] { color: #f5c98a; background: #2a2310; border-color: #5a4823; }
-        QLabel[role="pill"][pillState="err"]  { color: #f5b3a8; background: #2a1414; border-color: %5; }
+        QLabel[role="pill"][pillState="ok"]   { color: #8fe0a4; background: #10291a; border-color: #2a6b40; }
+        QLabel[role="pill"][pillState="warn"] { color: #f5c98a; background: #2a2310; border-color: #7a5f2c; }
+        QLabel[role="pill"][pillState="err"]  { color: #f5a89e; background: #2e1310; border-color: %5; }
         QLabel[role="pill"][pillState="info"] { color: %3;      background: %6;      border-color: %5; }
         QLabel[role="pill"][pillState="idle"] { color: %4;      background: %6;      border-color: %7; }
 
         /* Frames */
-        QFrame[role="card"]  { background: %6; border: 1px solid %7; border-radius: 0px; }
-        QFrame[role="panel"] { background: %2; border: 1px solid %7; border-radius: 0px; }
-        QFrame[role="hud"]   { background: rgba(10,10,10,210); border: 1px solid %7; border-radius: 0px; }
+        QFrame[role="card"]  { background: %6; border: 1px solid %7; border-radius: 8px; }
+        QFrame[role="panel"] { background: %2; border: 1px solid %7; border-radius: 8px; }
+        QFrame[role="hud"]   { background: rgba(10,10,10,215); border: 1px solid %9; border-radius: 8px; }
 
         /* Tabs -- top-tab navigation idiom from AMD Adrenalin (calibration.md Source 8),
            hugging-left per skill anti-pattern fix (no setExpanding) */
@@ -795,7 +804,7 @@ QString MainWindow::styleSheetText() const
         /* Buttons -- Apple HIG "Regular" approximation (tokens.md controlH 28),
            but tightened to 22 min-height for Compact tier */
         QPushButton {
-            background: %6; color: %3; border: 1px solid %7; border-radius: 0px;
+            background: %6; color: %3; border: 1px solid %7; border-radius: 6px;
             padding: 5px 12px; min-height: 22px;
             font-size: 12px; font-weight: 500;
         }
@@ -805,7 +814,7 @@ QString MainWindow::styleSheetText() const
         QPushButton:checked  { background: %11; border-color: %5; color: %3; }
 
         QToolButton {
-            background: %6; color: %3; border: 1px solid %7; border-radius: 0px;
+            background: %6; color: %3; border: 1px solid %7; border-radius: 6px;
             padding: 5px 12px; min-height: 22px;
             font-size: 12px; font-weight: 500;
         }
@@ -816,11 +825,11 @@ QString MainWindow::styleSheetText() const
         QToolButton::menu-indicator { image: none; }
 
         QPushButton[kind="primary"] {
-            background: %5; color: %3; border: 1px solid %5;
+            background: %5; color: %12; border: 1px solid %5;
             font-weight: 600; padding: 6px 18px; min-height: 24px;
         }
-        QPushButton[kind="primary"]:hover    { background: %11; border-color: %11; }
-        QPushButton[kind="primary"]:pressed  { background: %5; }
+        QPushButton[kind="primary"]:hover    { background: #e0695d; border-color: #e0695d; }
+        QPushButton[kind="primary"]:pressed  { background: %11; color: %3; border-color: %11; }
         QPushButton[kind="primary"]:disabled { background: %11; color: %10; border-color: %7; }
 
         QPushButton[kind="ghost"] {
@@ -845,9 +854,9 @@ QString MainWindow::styleSheetText() const
 
         /* Inputs -- monospace, Adrenalin "telemetry" treatment */
         QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-            background: %8; color: %3; border: 1px solid %7; border-radius: 0px;
+            background: %8; color: %3; border: 1px solid %7; border-radius: 6px;
             padding: 4px 8px; min-height: 22px;
-            selection-background-color: %5; selection-color: %3;
+            selection-background-color: %5; selection-color: %12;
             font-family: 'Space Mono','JetBrains Mono',monospace; font-size: 11px;
         }
         QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: %5; }
@@ -861,7 +870,7 @@ QString MainWindow::styleSheetText() const
         /* Checkboxes -- small for Compact tier */
         QCheckBox { color: %3; spacing: 6px; font-size: 12px; }
         QCheckBox::indicator {
-            width: 14px; height: 14px; border-radius: 0px;
+            width: 15px; height: 15px; border-radius: 4px;
             background: %8; border: 1px solid %9;
         }
         QCheckBox::indicator:hover    { border-color: %5; }
@@ -872,30 +881,30 @@ QString MainWindow::styleSheetText() const
            accent-fill sub-page. Handle height matches QPushButton min-height so
            sliders read as peers of the 2D/3D toggle rather than as decoration. */
         QSlider::horizontal { min-height: 22px; }
-        QSlider::groove:horizontal { background: %8; height: 4px; border: 1px solid %7; border-radius: 0px; }
-        QSlider::sub-page:horizontal { background: %5; }
-        QSlider::add-page:horizontal { background: %8; }
+        QSlider::groove:horizontal { background: %8; height: 4px; border: none; border-radius: 2px; }
+        QSlider::sub-page:horizontal { background: %5; border-radius: 2px; }
+        QSlider::add-page:horizontal { background: %8; border-radius: 2px; }
         QSlider::handle:horizontal {
-            background: %3; width: 8px; height: 22px; margin: -9px 0;
-            border: 1px solid %5; border-radius: 0px;
+            background: %3; width: 14px; height: 14px; margin: -5px 0;
+            border: 2px solid %5; border-radius: 8px;
         }
         QSlider::handle:horizontal:hover    { background: %5; border-color: %3; }
         QSlider::handle:horizontal:pressed  { background: %11; border-color: %3; }
         QSlider::handle:horizontal:disabled { background: %8; border-color: %7; }
 
         QSlider::vertical { min-width: 22px; }
-        QSlider::groove:vertical { background: %8; width: 4px; border: 1px solid %7; border-radius: 0px; }
-        QSlider::sub-page:vertical { background: %8; }
-        QSlider::add-page:vertical { background: %5; }
+        QSlider::groove:vertical { background: %8; width: 4px; border: none; border-radius: 2px; }
+        QSlider::sub-page:vertical { background: %8; border-radius: 2px; }
+        QSlider::add-page:vertical { background: %5; border-radius: 2px; }
         QSlider::handle:vertical {
-            background: %3; height: 8px; width: 22px; margin: 0 -9px;
-            border: 1px solid %5; border-radius: 0px;
+            background: %3; height: 14px; width: 14px; margin: 0 -5px;
+            border: 2px solid %5; border-radius: 8px;
         }
         QSlider::handle:vertical:hover { background: %5; border-color: %3; }
 
         /* Lists */
         QListWidget {
-            background: %2; color: %3; border: 1px solid %7; border-radius: 0px;
+            background: %2; color: %3; border: 1px solid %7; border-radius: 6px;
             outline: 0; font-size: 12px;
         }
         QListWidget::item {
@@ -922,14 +931,14 @@ QString MainWindow::styleSheetText() const
         /* Scrollbars — slim, hover-revealed accent */
         QScrollBar:vertical   { background: %2; width: 8px; }
         QScrollBar:horizontal { background: %2; height: 8px; }
-        QScrollBar::handle:vertical   { background: %9; min-height: 24px; border-radius: 0px; }
-        QScrollBar::handle:horizontal { background: %9; min-width:  24px; border-radius: 0px; }
+        QScrollBar::handle:vertical   { background: %9; min-height: 24px; border-radius: 4px; }
+        QScrollBar::handle:horizontal { background: %9; min-width:  24px; border-radius: 4px; }
         QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background: %5; }
         QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
         QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 
         /* Group box (rare) */
-        QGroupBox { border: 1px solid %7; border-radius: 0px; margin-top: 14px; padding: 10px; font-size: 11px; }
+        QGroupBox { border: 1px solid %7; border-radius: 8px; margin-top: 14px; padding: 10px; font-size: 11px; }
         QGroupBox::title { subcontrol-origin: margin; left: 10px; color: %4; }
     )")
         .arg(T::bg0)
@@ -942,14 +951,18 @@ QString MainWindow::styleSheetText() const
         .arg(T::bg3)
         .arg(T::borderStrong)
         .arg(T::textFaint)
-        .arg(T::accentDim);
+        .arg(T::accentDim)
+        .arg(T::onAccent);
 }
 
 void MainWindow::initUI()
 {
     setWindowTitle("DualCam Analysis Tool");
     setMinimumSize(560, 420);
-    setStyleSheet(styleSheetText());
+    /* Application-wide stylesheet: tooltips, QMessageBox and other top-level
+       popups don't inherit a window-level stylesheet, which left them with
+       the native palette (dark-on-dark text on Windows dark theme). */
+    qApp->setStyleSheet(styleSheetText());
 
     m_centralWidget = new QWidget(this);
     m_centralWidget->setObjectName("root");
@@ -1021,12 +1034,18 @@ void MainWindow::initUI()
         m_statusBar->showMessage("Snapshots folder: " + dir, 4000);
     });
 
-    m_btnHelp = new QPushButton("?", this);
+    m_btnHelp = new QPushButton("HK's", this);
     m_btnHelp->setProperty("kind", "ghost");
-    m_btnHelp->setFixedWidth(28);
     m_btnHelp->setCursor(Qt::PointingHandCursor);
-    m_btnHelp->setToolTip("Actions & Hotkeys Menu");
+    m_btnHelp->setToolTip("Actions & Hotkeys — run any action or bind a key");
     connect(m_btnHelp, &QPushButton::clicked, this, &MainWindow::showActionsMenu);
+
+    m_btnHelpDocs = new QPushButton("?", this);
+    m_btnHelpDocs->setProperty("kind", "ghost");
+    m_btnHelpDocs->setFixedWidth(28);
+    m_btnHelpDocs->setCursor(Qt::PointingHandCursor);
+    m_btnHelpDocs->setToolTip("Help & Tips — overview of the app and the interactive tour");
+    connect(m_btnHelpDocs, &QPushButton::clicked, this, &MainWindow::showHelpDialog);
 
     topLay->addWidget(m_comboCamSet);
 
@@ -1036,10 +1055,10 @@ void MainWindow::initUI()
     m_btnExpToggle->setToolTip("Toggle automatic / manual exposure");
     m_btnExpToggle->setFixedWidth(56);
     m_btnExpToggle->setStyleSheet(QString(
-        "QPushButton { background: %1; color: %2; border: 1px solid %3; border-radius: 0px;"
+        "QPushButton { background: %1; color: %2; border: 1px solid %3; border-radius: 6px;"
         " padding: 3px 8px; font-weight: 700; font-size: 10px; letter-spacing: 0.10em; font-family: 'Space Mono',monospace; }"
-        "QPushButton:checked { background: %4; color: %2; border-color: %4; }")
-        .arg(T::bg2).arg(T::text).arg(T::border).arg(T::accent));
+        "QPushButton:checked { background: %4; color: %5; border-color: %4; }")
+        .arg(T::bg2).arg(T::text).arg(T::border).arg(T::accent).arg(T::onAccent));
 
     auto buildGainSpin = [this](int q8) {
         auto* s = new QDoubleSpinBox(this);
@@ -1094,7 +1113,7 @@ void MainWindow::initUI()
     m_lblExposureVals = new QLabel(this);
     m_lblExposureVals->setProperty("role", "mono");
     m_lblExposureVals->setStyleSheet(QString(
-        "QLabel { background: %1; color: %2; border: 1px solid %3; border-radius: 0px;"
+        "QLabel { background: %1; color: %2; border: 1px solid %3; border-radius: 6px;"
         " padding: 3px 8px; font-family: 'Space Mono',monospace; font-size: 11px; }")
         .arg(T::bg2).arg(T::text).arg(T::border));
     m_lblExposureVals->setToolTip("Current gain * shutter (manual mode)");
@@ -1201,6 +1220,7 @@ void MainWindow::initUI()
     topLay->addSpacing(4);
     topLay->addWidget(m_btnGallery);
     topLay->addWidget(m_btnHelp);
+    topLay->addWidget(m_btnHelpDocs);
 
     rootLayout->addWidget(topStrip);
 
@@ -1238,8 +1258,8 @@ void MainWindow::initUI()
     m_btnFloatingPreviewToggle->setCursor(Qt::PointingHandCursor);
     m_btnFloatingPreviewToggle->setFixedSize(32, 32);
     m_btnFloatingPreviewToggle->setStyleSheet(QString(
-        "QPushButton { background: rgba(10,10,10,210); color: %1; border: 1px solid %2; border-radius: 0px; font-weight: bold; font-family: 'Space Mono',monospace; }"
-        "QPushButton:hover { background: rgba(26,26,26,230); color: %3; border-color: %4; }")
+        "QPushButton { background: #0c0c0c; color: %1; border: 1px solid %2; border-radius: 8px; font-weight: bold; font-family: 'Space Mono',monospace; }"
+        "QPushButton:hover { background: #1a1a1a; color: %3; border-color: %4; }")
         .arg(T::textDim, T::border, T::text, T::accent));
     m_btnFloatingPreviewToggle->setToolTip("Show Sidebar");
     connect(m_btnFloatingPreviewToggle, &QPushButton::clicked, this, &MainWindow::togglePreviewMode);
@@ -1251,10 +1271,10 @@ void MainWindow::initUI()
     m_btnFabStream->setCursor(Qt::PointingHandCursor);
     m_btnFabStream->setToolTip("Start streaming");
     m_btnFabStream->setStyleSheet(QString(
-        "QPushButton { background: rgba(20,20,20,230); border: 1px solid %1; border-radius: 0px; }"
-        "QPushButton:hover { background: rgba(40,12,12,230); border: 1px solid %2; }")
-        .arg(T::border).arg(T::accent));
-    auto addFabIcon = [](QPushButton* btn, const QString& text, const QString& style) -> QLabel* {
+        "QPushButton { background: #161616; border: 1px solid %1; border-radius: 20px; }"
+        "QPushButton:hover { background: #2e0e0b; border: 1px solid %2; }")
+        .arg(T::borderStrong).arg(T::accent));
+    auto addFabIcon =[](QPushButton* btn, const QString& text, const QString& style) -> QLabel* {
         QLabel* icon = new QLabel(text, btn);
         icon->setAttribute(Qt::WA_TransparentForMouseEvents);
         icon->setAlignment(Qt::AlignCenter);
@@ -1279,10 +1299,10 @@ void MainWindow::initUI()
     m_btnModeToggle->setCursor(Qt::PointingHandCursor);
     m_btnModeToggle->setStyleSheet(QString(
         "QPushButton { background: %1; color: %2; border: 1px solid %3;"
-        " border-radius: 0px; padding: 3px 18px; font-weight: 700; font-size: 10px;"
+        " border-radius: 13px; padding: 3px 18px; font-weight: 700; font-size: 10px;"
         " letter-spacing: 0.12em; min-width: 68px; font-family: 'Space Mono',monospace; }"
-        "QPushButton:hover { background: %4; }")
-        .arg(T::accent).arg(T::text).arg(T::accent).arg(T::accentDim));
+        "QPushButton:hover { background: %4; color: %5; border-color: %4; }")
+        .arg(T::accentDim).arg(T::text).arg(T::accent).arg(T::accent).arg(T::onAccent));
     connect(m_btnModeToggle, &QPushButton::clicked, this, [this]() {
         setDiffMode(!m_isDiffMode);
     });
@@ -1293,14 +1313,14 @@ void MainWindow::initUI()
     m_btnFabSnapshot->setCursor(Qt::PointingHandCursor);
     m_btnFabSnapshot->setToolTip("Save snapshot");
     m_btnFabSnapshot->setStyleSheet(QString(
-        "QPushButton { background: %1; border: 1px solid %2; border-radius: 0px; }"
-        "QPushButton:hover { background: %3; border-color: %4; }"
-        "QPushButton:pressed { background: %2; }")
-        .arg(T::accent).arg(T::accentDim).arg(T::accentDim).arg(T::text));
+        "QPushButton { background: %1; border: 1px solid %1; border-radius: 20px; }"
+        "QPushButton:hover { background: #e0695d; border-color: #e0695d; }"
+        "QPushButton:pressed { background: %2; border-color: %2; }")
+        .arg(T::accent).arg(T::accentDim));
     m_fabSnapIcon = addFabIcon(m_btnFabSnapshot, "SNAP", QString(
         "QLabel { background: transparent; color: %1; border: none;"
         " font-family: 'Space Mono','JetBrains Mono',monospace;"
-        " font-size: 11px; font-weight: 800; letter-spacing: 0.10em; }").arg(T::text));
+        " font-size: 10px; font-weight: 800; letter-spacing: 0.08em; }").arg(T::onAccent));
     connect(m_btnFabSnapshot, &QPushButton::clicked, this, [this]() {
         saveSnapshot();
         refreshSnapshotPreview();
@@ -1320,6 +1340,11 @@ void MainWindow::initUI()
     m_mainSplit->addWidget(m_sideNav);
 
     m_workStack = new QStackedWidget(this);
+
+    /* The "show sidebar" floating toggle lives on the work stack (not the
+       video area) so it stays reachable from the Gallery page too — without
+       it, leaving preview mode from Gallery required a hotkey. */
+    if (m_btnFloatingPreviewToggle) m_btnFloatingPreviewToggle->setParent(m_workStack);
 
     m_workSplit = new QSplitter(Qt::Vertical, m_workStack);
     m_workSplit->setHandleWidth(2);
@@ -1345,12 +1370,15 @@ void MainWindow::initUI()
     m_galleryView = buildGalleryView();
     m_workStack->addWidget(m_galleryView);
 
-    connect(m_bottomStack, &QStackedWidget::currentChanged, this, [this](int index) {
-        QWidget* w = m_bottomStack->widget(index);
+    /* Page fade on tab switch. Pages containing QOpenGLWidget views are
+       NEVER animated through QGraphicsOpacityEffect: the effect rasterizes
+       the whole subtree on the CPU every frame (jank) and composites GL
+       content as black. The effect is also detached once the fade ends so
+       it doesn't tax every later repaint. */
+    auto fadeInPage = [this](QWidget* w, int durationMs) {
         if (!w) return;
-        if (!m_animTabsEnabled) {
-            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(w->graphicsEffect());
-            if (effect) effect->setOpacity(1.0);
+        if (!m_animTabsEnabled || w->findChild<QOpenGLWidget*>()) {
+            if (w->graphicsEffect()) w->setGraphicsEffect(nullptr);
             return;
         }
         QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(w->graphicsEffect());
@@ -1359,32 +1387,22 @@ void MainWindow::initUI()
             w->setGraphicsEffect(effect);
         }
         QPropertyAnimation* anim = new QPropertyAnimation(effect, "opacity", w);
-        anim->setDuration(m_animSpeedMs * 8 / 10);
+        anim->setDuration(durationMs);
         anim->setStartValue(0.0);
         anim->setEndValue(1.0);
-        anim->setEasingCurve(QEasingCurve::OutQuad);
+        anim->setEasingCurve(QEasingCurve::OutCubic);
+        QObject::connect(anim, &QPropertyAnimation::finished, w, [w]() {
+            w->setGraphicsEffect(nullptr);
+        });
         anim->start(QAbstractAnimation::DeleteWhenStopped);
+    };
+
+    connect(m_bottomStack, &QStackedWidget::currentChanged, this, [this, fadeInPage](int index) {
+        fadeInPage(m_bottomStack->widget(index), m_animSpeedMs * 8 / 10);
     });
 
-    connect(m_workStack, &QStackedWidget::currentChanged, this, [this](int index) {
-        QWidget* w = m_workStack->widget(index);
-        if (!w) return;
-        if (!m_animTabsEnabled) {
-            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(w->graphicsEffect());
-            if (effect) effect->setOpacity(1.0);
-            return;
-        }
-        QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(w->graphicsEffect());
-        if (!effect) {
-            effect = new QGraphicsOpacityEffect(w);
-            w->setGraphicsEffect(effect);
-        }
-        QPropertyAnimation* anim = new QPropertyAnimation(effect, "opacity", w);
-        anim->setDuration(m_animSpeedMs);
-        anim->setStartValue(0.0);
-        anim->setEndValue(1.0);
-        anim->setEasingCurve(QEasingCurve::OutQuad);
-        anim->start(QAbstractAnimation::DeleteWhenStopped);
+    connect(m_workStack, &QStackedWidget::currentChanged, this, [this, fadeInPage](int index) {
+        fadeInPage(m_workStack->widget(index), m_animSpeedMs);
     });
 
     m_mainSplit->addWidget(m_workStack);
@@ -1874,7 +1892,7 @@ QWidget* MainWindow::buildSnapshotTab()
     m_snapshotRecent->setFixedHeight(120);
     m_snapshotRecent->setTextElideMode(Qt::ElideMiddle);
     m_snapshotRecent->setStyleSheet(QString(
-        "QListWidget { background: %1; border: 1px solid %2; border-radius: 0px; }"
+        "QListWidget { background: %1; border: 1px solid %2; border-radius: 6px; }"
         "QListWidget::item { padding: 4px; border-bottom: none; }"
         "QListWidget::item:selected { background: %3; border-left: 2px solid %4; padding-left: 2px; }"
         "QListWidget::item:hover { background: %3; }")
@@ -2152,16 +2170,15 @@ QWidget* MainWindow::buildSideNav()
                            QString::fromLatin1(spec.tip)));
         b->setStyleSheet(QString(
             "QPushButton { background: transparent; color: %1; border: none;"
-            " border-left: 2px solid transparent;"
+            " border-left: 2px solid transparent; border-radius: 6px;"
             " text-align: left; padding: 0 10px; font-size: 12px; font-weight: 500;"
             " min-height: 28px; }"
             "QPushButton:hover { background: %2; color: %3; }"
-            "QPushButton:checked { background: %4; color: %3;"
-            " border-left: 2px solid %5; font-weight: 600; }")
+            "QPushButton:checked { background: rgba(212, 86, 74, 0.14); color: %3;"
+            " border-left: 2px solid %4; font-weight: 600; }")
             .arg(T::textDim)
             .arg(T::bg2)
             .arg(T::text)
-            .arg(T::bg2)
             .arg(T::accent));
         return b;
     };
@@ -2233,26 +2250,11 @@ void MainWindow::setNavExpanded(bool expanded)
     int startW = sizes[0];
     int endW = expanded ? 200 : 56;
 
-    if (!m_animSidebarEnabled) {
-        m_mainSplit->setSizes({ endW, std::max(300, total - endW) });
-        applyNavLabels();
-        return;
-    }
-
-    QVariantAnimation* anim = new QVariantAnimation(this);
-    anim->setDuration(m_animSpeedMs);
-    anim->setStartValue(startW);
-    anim->setEndValue(endW);
-    anim->setEasingCurve(QEasingCurve::OutQuad);
-    connect(anim, &QVariantAnimation::valueChanged, this, [this, total](const QVariant& value) {
-        int w = value.toInt();
-        m_mainSplit->setSizes({ w, std::max(300, total - w) });
-    });
-    connect(anim, &QVariantAnimation::finished, this, &MainWindow::applyNavLabels);
-    if (expanded) {
-        applyNavLabels();
-    }
-    anim->start(QAbstractAnimation::DeleteWhenStopped);
+    /* Instant: per-frame splitter animation resizes the GL views every frame
+       (framebuffer recreation = stutter, not motion). */
+    Q_UNUSED(startW);
+    m_mainSplit->setSizes({ endW, std::max(300, total - endW) });
+    applyNavLabels();
 }
 
 void MainWindow::setNavItem(NavItem item)
@@ -2286,39 +2288,13 @@ void MainWindow::setNavItem(NavItem item)
             return;
         }
 
-        if (show) {
-            if (!m_bottomStack->isVisible()) {
-                m_bottomStack->setMinimumHeight(0);
-                m_bottomStack->setVisible(true);
-                QVariantAnimation* anim = new QVariantAnimation(this);
-                anim->setDuration(m_animSpeedMs);
-                anim->setStartValue(0);
-                anim->setEndValue(targetH);
-                anim->setEasingCurve(QEasingCurve::OutQuad);
-                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalH](const QVariant& val) {
-                    int h = val.toInt();
-                    m_workSplit->setSizes({ totalH - h, h });
-                });
-                anim->start(QAbstractAnimation::DeleteWhenStopped);
-            }
-        } else {
-            if (m_bottomStack->isVisible()) {
-                m_bottomStack->setMinimumHeight(0);
-                QVariantAnimation* anim = new QVariantAnimation(this);
-                anim->setDuration(m_animSpeedMs);
-                anim->setStartValue(startH);
-                anim->setEndValue(0);
-                anim->setEasingCurve(QEasingCurve::OutQuad);
-                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalH](const QVariant& val) {
-                    int h = val.toInt();
-                    m_workSplit->setSizes({ totalH - h, h });
-                });
-                connect(anim, &QVariantAnimation::finished, this, [this]() {
-                    m_bottomStack->setVisible(false);
-                });
-                anim->start(QAbstractAnimation::DeleteWhenStopped);
-            }
-        }
+        /* Instant: animating splitter sizes resizes the GL views every frame
+           (framebuffer recreation = stutter). The page fade in m_bottomStack
+           still gives a motion cue. */
+        Q_UNUSED(startH);
+        m_bottomStack->setVisible(show);
+        m_workSplit->setSizes(show ? QList<int>{ totalH - targetH, targetH }
+                                   : QList<int>{ totalH, 0 });
     };
 
     if (item == NavItem::Gallery) {
@@ -2393,122 +2369,44 @@ void MainWindow::togglePreviewMode()
         return;
     }
 
+    /* No per-frame splitter animation here: every setSizes() step forces the
+       QOpenGLWidget views to recreate their framebuffers, which reads as a
+       stutter, not as motion. The toggle is instant; the floating buttons'
+       slide provides the motion cue. */
     if (m_previewMode) {
-        if (m_mainSplit && m_sideNav && m_sideNav->isVisible()) {
-            m_sideNav->setMinimumWidth(0);
-            QList<int> sizes = m_mainSplit->sizes();
-            if (sizes.size() >= 2) {
-                int startW = sizes[0];
-                int totalW = sizes[0] + sizes[1];
-                QVariantAnimation* anim = new QVariantAnimation(this);
-                anim->setDuration(m_animSpeedMs);
-                anim->setStartValue(startW);
-                anim->setEndValue(0);
-                anim->setEasingCurve(QEasingCurve::OutQuad);
-                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalW](const QVariant& val) {
-                    int w = val.toInt();
-                    m_mainSplit->setSizes({ w, totalW - w });
-                });
-                connect(anim, &QVariantAnimation::finished, this, [this]() {
-                    m_sideNav->hide();
-                });
-                anim->start(QAbstractAnimation::DeleteWhenStopped);
-            }
-        }
-
-        if (m_workSplit && m_bottomStack && m_bottomStack->isVisible()) {
-            m_bottomStack->setMinimumHeight(0);
-            QList<int> sizes = m_workSplit->sizes();
-            if (sizes.size() >= 2) {
-                int startH = sizes[1];
-                int totalH = sizes[0] + sizes[1];
-                QVariantAnimation* anim = new QVariantAnimation(this);
-                anim->setDuration(m_animSpeedMs);
-                anim->setStartValue(startH);
-                anim->setEndValue(0);
-                anim->setEasingCurve(QEasingCurve::OutQuad);
-                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalH](const QVariant& val) {
-                    int h = val.toInt();
-                    m_workSplit->setSizes({ totalH - h, h });
-                });
-                connect(anim, &QVariantAnimation::finished, this, [this]() {
-                    m_bottomStack->hide();
-                });
-                anim->start(QAbstractAnimation::DeleteWhenStopped);
-            }
-        }
-
-        if (m_statusBar && m_statusBar->isVisible()) {
-            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(m_statusBar->graphicsEffect());
-            if (!effect) {
-                effect = new QGraphicsOpacityEffect(m_statusBar);
-                m_statusBar->setGraphicsEffect(effect);
-            }
-            QPropertyAnimation* fade = new QPropertyAnimation(effect, "opacity", m_statusBar);
-            fade->setDuration(m_animSpeedMs);
-            fade->setStartValue(1.0);
-            fade->setEndValue(0.0);
-            connect(fade, &QPropertyAnimation::finished, this, [this]() {
-                m_statusBar->hide();
-            });
-            fade->start(QAbstractAnimation::DeleteWhenStopped);
+        if (m_sideNav) m_sideNav->hide();
+        if (m_bottomStack) m_bottomStack->hide();
+        if (m_statusBar) {
+            if (m_statusBar->graphicsEffect()) m_statusBar->setGraphicsEffect(nullptr);
+            m_statusBar->hide();
         }
     } else {
-        if (m_mainSplit && m_sideNav) {
-            m_sideNav->setMinimumWidth(0);
+        if (m_sideNav) {
+            m_sideNav->setMinimumWidth(56);
             m_sideNav->show();
-            QList<int> sizes = m_mainSplit->sizes();
-            if (sizes.size() >= 2) {
-                int totalW = sizes[0] + sizes[1];
-                int targetW = m_navExpanded ? 200 : 56;
-                QVariantAnimation* anim = new QVariantAnimation(this);
-                anim->setDuration(m_animSpeedMs);
-                anim->setStartValue(0);
-                anim->setEndValue(targetW);
-                anim->setEasingCurve(QEasingCurve::OutQuad);
-                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalW](const QVariant& val) {
-                    int w = val.toInt();
-                    m_mainSplit->setSizes({ w, totalW - w });
-                });
-                connect(anim, &QVariantAnimation::finished, this, [this]() {
-                    m_sideNav->setMinimumWidth(56);
-                });
-                anim->start(QAbstractAnimation::DeleteWhenStopped);
+            if (m_mainSplit) {
+                QList<int> sizes = m_mainSplit->sizes();
+                if (sizes.size() >= 2) {
+                    const int totalW = sizes[0] + sizes[1];
+                    const int targetW = m_navExpanded ? 200 : 56;
+                    m_mainSplit->setSizes({ targetW, totalW - targetW });
+                }
             }
         }
-
-        if (m_workSplit && m_bottomStack && m_currentNav != NavItem::None) {
-            m_bottomStack->setMinimumHeight(0);
+        if (m_bottomStack && m_currentNav != NavItem::None) {
             m_bottomStack->show();
-            QList<int> sizes = m_workSplit->sizes();
-            if (sizes.size() >= 2) {
-                int totalH = sizes[0] + sizes[1];
-                int targetH = 260;
-                QVariantAnimation* anim = new QVariantAnimation(this);
-                anim->setDuration(m_animSpeedMs);
-                anim->setStartValue(0);
-                anim->setEndValue(targetH);
-                anim->setEasingCurve(QEasingCurve::OutQuad);
-                connect(anim, &QVariantAnimation::valueChanged, this, [this, totalH](const QVariant& val) {
-                    int h = val.toInt();
-                    m_workSplit->setSizes({ totalH - h, h });
-                });
-                anim->start(QAbstractAnimation::DeleteWhenStopped);
+            if (m_workSplit) {
+                QList<int> sizes = m_workSplit->sizes();
+                if (sizes.size() >= 2) {
+                    const int totalH = sizes[0] + sizes[1];
+                    const int targetH = qMin(260, totalH / 2);
+                    m_workSplit->setSizes({ totalH - targetH, targetH });
+                }
             }
         }
-
         if (m_statusBar) {
+            if (m_statusBar->graphicsEffect()) m_statusBar->setGraphicsEffect(nullptr);
             m_statusBar->show();
-            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(m_statusBar->graphicsEffect());
-            if (!effect) {
-                effect = new QGraphicsOpacityEffect(m_statusBar);
-                m_statusBar->setGraphicsEffect(effect);
-            }
-            QPropertyAnimation* fade = new QPropertyAnimation(effect, "opacity", m_statusBar);
-            fade->setDuration(m_animSpeedMs);
-            fade->setStartValue(0.0);
-            fade->setEndValue(1.0);
-            fade->start(QAbstractAnimation::DeleteWhenStopped);
         }
     }
 
@@ -3050,9 +2948,12 @@ void MainWindow::animateDialogEntry(QDialog* dlg, QWidget* triggerWidget, int du
     QWidget* parent = dlg->parentWidget();
     if (!parent) parent = QApplication::activeWindow();
 
-    QSize targetSize = dlg->sizeHint();
+    /* Respect an explicit resize() (WA_Resized): sizeHint() of chart/3D
+       dialogs is near-minimal and was shrinking them to a tiny square. */
+    QSize targetSize = dlg->testAttribute(Qt::WA_Resized) ? dlg->size()
+                                                          : dlg->sizeHint();
     if (targetSize.width() < 100 || targetSize.height() < 100) {
-        targetSize = dlg->size();
+        targetSize = targetSize.expandedTo(dlg->sizeHint());
     }
     QRect targetGeo(QPoint(0, 0), targetSize);
     if (parent) {
@@ -3070,59 +2971,38 @@ void MainWindow::animateDialogEntry(QDialog* dlg, QWidget* triggerWidget, int du
         startPos = QCursor::pos();
     }
 
-    QRect startGeo(startPos, QSize(10, 10));
+    /* Fixed final size + windowOpacity fade + short slide toward the cursor.
+       Animating geometry growth forces a native resize/relayout every frame
+       (the old "micro-lag"); windowOpacity is composited by DWM for free. */
+    QPoint dir = startPos - targetGeo.center();
+    const int len = qMax(1, int(std::sqrt(double(dir.x() * dir.x() + dir.y() * dir.y()))));
+    QPoint offset(dir.x() * 18 / len, dir.y() * 18 / len);
 
-    const QObjectList children = dlg->children();
-    QList<QWidget*> childWidgets;
-    for (QObject* child : children) {
-        QWidget* cw = qobject_cast<QWidget*>(child);
-        if (cw && cw->parentWidget() == dlg && !cw->isHidden()) {
-            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(cw->graphicsEffect());
-            if (!effect) {
-                effect = new QGraphicsOpacityEffect(cw);
-                cw->setGraphicsEffect(effect);
-            }
-            effect->setOpacity(0.0);
-            cw->setProperty("isFaded", false);
-            childWidgets.append(cw);
-        }
-    }
-
-    dlg->setGeometry(startGeo);
+    dlg->setGeometry(targetGeo.translated(offset));
+    dlg->setWindowOpacity(0.0);
     dlg->show();
     dlg->raise();
     dlg->activateWindow();
 
-    QPropertyAnimation* geomAnim = new QPropertyAnimation(dlg, "geometry", dlg);
-    geomAnim->setDuration(durationMs);
-    geomAnim->setStartValue(startGeo);
-    geomAnim->setEndValue(targetGeo);
-    geomAnim->setEasingCurve(QEasingCurve::OutQuad);
+    QPropertyAnimation* posAnim = new QPropertyAnimation(dlg, "pos", dlg);
+    posAnim->setDuration(durationMs);
+    posAnim->setStartValue(targetGeo.topLeft() + offset);
+    posAnim->setEndValue(targetGeo.topLeft());
+    posAnim->setEasingCurve(QEasingCurve::OutCubic);
 
-    QObject::connect(geomAnim, &QPropertyAnimation::valueChanged, dlg, [childWidgets, targetGeo](const QVariant& value) {
-        QRect current = value.toRect();
-        double progress = double(current.width()) / targetGeo.width();
-        if (progress >= 0.33) {
-            for (QWidget* cw : childWidgets) {
-                if (cw && !cw->property("isFaded").toBool()) {
-                    cw->setProperty("isFaded", true);
-                    QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(cw->graphicsEffect());
-                    if (effect) {
-                        QPropertyAnimation* fade = new QPropertyAnimation(effect, "opacity", cw);
-                        fade->setDuration(150);
-                        fade->setStartValue(0.0);
-                        fade->setEndValue(1.0);
-                        connect(fade, &QPropertyAnimation::finished, cw, [cw]() {
-                            cw->setGraphicsEffect(nullptr);
-                        });
-                        fade->start(QAbstractAnimation::DeleteWhenStopped);
-                    }
-                }
-            }
-        }
+    QPropertyAnimation* fadeAnim = new QPropertyAnimation(dlg, "windowOpacity", dlg);
+    fadeAnim->setDuration(durationMs);
+    fadeAnim->setStartValue(0.0);
+    fadeAnim->setEndValue(1.0);
+    fadeAnim->setEasingCurve(QEasingCurve::OutCubic);
+
+    QParallelAnimationGroup* group = new QParallelAnimationGroup(dlg);
+    group->addAnimation(posAnim);
+    group->addAnimation(fadeAnim);
+    QObject::connect(group, &QParallelAnimationGroup::finished, dlg, [dlg]() {
+        dlg->setWindowOpacity(1.0);
     });
-
-    geomAnim->start(QAbstractAnimation::DeleteWhenStopped);
+    group->start(QAbstractAnimation::DeleteWhenStopped);
 }
 
 void MainWindow::buildAlignDialog()
@@ -3215,7 +3095,7 @@ void MainWindow::buildAlignDialog()
     root->addStretch();
 }
 
-void MainWindow::positionFloatingButtons()
+void MainWindow::positionFloatingButtons(bool animate)
 {
     if (!m_videoArea) return;
     const int w = m_videoArea->width();
@@ -3223,16 +3103,25 @@ void MainWindow::positionFloatingButtons()
     const int pad = 10;
     const bool camerasHidden = (m_currentNav == NavItem::Gallery);
 
-    auto animateButton = [this](QWidget* btn, bool show, const QPoint& targetPos) {
+    /* NOTE: no QGraphicsOpacityEffect here. Opacity effects on widgets that
+       overlap QOpenGLWidget siblings rasterize through the backing store and
+       produce black rectangles + CPU jank. FABs animate with position only. */
+    auto animateButton = [this, animate](QWidget* btn, bool show, const QPoint& targetPos) {
         if (!btn) return;
 
-        bool currentlyVisible = btn->isVisible() && (btn->graphicsEffect() ? qobject_cast<QGraphicsOpacityEffect*>(btn->graphicsEffect())->opacity() > 0.1 : true);
+        if (btn->graphicsEffect()) btn->setGraphicsEffect(nullptr);
 
-        if (!m_animFABsEnabled) {
+        /* A running slide keeps writing stale coordinates and would override
+           any repositioning that happens during it (e.g. startup layout). */
+        const auto running = btn->findChildren<QPropertyAnimation*>();
+        for (QPropertyAnimation* a : running) a->stop();
+
+        const bool currentlyVisible = btn->isVisible();
+
+        if (!m_animFABsEnabled || !animate) {
             btn->move(targetPos);
             btn->setVisible(show);
-            QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(btn->graphicsEffect());
-            if (effect) effect->setOpacity(1.0);
+            if (show) btn->raise();
             return;
         }
 
@@ -3243,69 +3132,32 @@ void MainWindow::positionFloatingButtons()
                     posAnim->setDuration(m_animSpeedMs);
                     posAnim->setStartValue(btn->pos());
                     posAnim->setEndValue(targetPos);
-                    posAnim->setEasingCurve(QEasingCurve::OutQuad);
+                    posAnim->setEasingCurve(QEasingCurve::OutCubic);
                     posAnim->start(QAbstractAnimation::DeleteWhenStopped);
                 }
-                QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(btn->graphicsEffect());
-                if (effect) effect->setOpacity(1.0);
             } else {
+                btn->move(targetPos + QPoint(0, 25));
                 btn->show();
                 btn->raise();
 
-                QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(btn->graphicsEffect());
-                if (!effect) {
-                    effect = new QGraphicsOpacityEffect(btn);
-                    btn->setGraphicsEffect(effect);
-                }
-                effect->setOpacity(0.0);
-
-                QPropertyAnimation* opacityAnim = new QPropertyAnimation(effect, "opacity", btn);
-                opacityAnim->setDuration(m_animSpeedMs);
-                opacityAnim->setStartValue(0.0);
-                opacityAnim->setEndValue(1.0);
-                opacityAnim->setEasingCurve(QEasingCurve::OutQuad);
-
                 QPropertyAnimation* posAnim = new QPropertyAnimation(btn, "pos", btn);
                 posAnim->setDuration(m_animSpeedMs);
-                QPoint startPos = targetPos + QPoint(0, 25);
-                posAnim->setStartValue(startPos);
+                posAnim->setStartValue(btn->pos());
                 posAnim->setEndValue(targetPos);
-                posAnim->setEasingCurve(QEasingCurve::OutQuad);
-
-                QParallelAnimationGroup* group = new QParallelAnimationGroup(btn);
-                group->addAnimation(opacityAnim);
-                group->addAnimation(posAnim);
-                group->start(QAbstractAnimation::DeleteWhenStopped);
+                posAnim->setEasingCurve(QEasingCurve::OutCubic);
+                posAnim->start(QAbstractAnimation::DeleteWhenStopped);
             }
         } else {
             if (currentlyVisible) {
-                QGraphicsOpacityEffect* effect = qobject_cast<QGraphicsOpacityEffect*>(btn->graphicsEffect());
-                if (!effect) {
-                    effect = new QGraphicsOpacityEffect(btn);
-                    btn->setGraphicsEffect(effect);
-                }
-
-                QPropertyAnimation* opacityAnim = new QPropertyAnimation(effect, "opacity", btn);
-                opacityAnim->setDuration(m_animSpeedMs);
-                opacityAnim->setStartValue(effect->opacity());
-                opacityAnim->setEndValue(0.0);
-                opacityAnim->setEasingCurve(QEasingCurve::OutQuad);
-
                 QPropertyAnimation* posAnim = new QPropertyAnimation(btn, "pos", btn);
                 posAnim->setDuration(m_animSpeedMs);
-                QPoint endPos = btn->pos() + QPoint(0, 25);
                 posAnim->setStartValue(btn->pos());
-                posAnim->setEndValue(endPos);
-                posAnim->setEasingCurve(QEasingCurve::OutQuad);
-
-                QParallelAnimationGroup* group = new QParallelAnimationGroup(btn);
-                group->addAnimation(opacityAnim);
-                group->addAnimation(posAnim);
-
-                QObject::connect(group, &QParallelAnimationGroup::finished, btn, [btn]() {
+                posAnim->setEndValue(btn->pos() + QPoint(0, 25));
+                posAnim->setEasingCurve(QEasingCurve::InCubic);
+                QObject::connect(posAnim, &QPropertyAnimation::finished, btn, [btn]() {
                     btn->hide();
                 });
-                group->start(QAbstractAnimation::DeleteWhenStopped);
+                posAnim->start(QAbstractAnimation::DeleteWhenStopped);
             } else {
                 btn->hide();
             }
@@ -3325,8 +3177,8 @@ void MainWindow::positionFloatingButtons()
         animateButton(m_btnFabSnapshot, !camerasHidden, target);
     }
     if (m_btnFloatingPreviewToggle) {
-        QPoint target(pad, pad);
-        animateButton(m_btnFloatingPreviewToggle, m_previewMode, target);
+        /* Top-left corner — where the hidden sidebar "used to be". */
+        animateButton(m_btnFloatingPreviewToggle, m_previewMode, QPoint(pad, pad));
     }
 }
 
@@ -3600,15 +3452,15 @@ void MainWindow::openCameras()
 
     m_btnFabStream->setToolTip("Stop streaming");
     m_btnFabStream->setStyleSheet(QString(
-        "QPushButton { background: %1; border: 1px solid %1; border-radius: 0px; }"
-        "QPushButton:hover { background: %2; border-color: %2; }")
-        .arg(T::accent).arg(T::accentDim));
+        "QPushButton { background: %1; border: 1px solid %1; border-radius: 20px; }"
+        "QPushButton:hover { background: #e0695d; border-color: #e0695d; }")
+        .arg(T::accent));
     if (m_fabStreamIcon) {
         m_fabStreamIcon->setText(QString::fromUtf8("\u25A0"));
         m_fabStreamIcon->setStyleSheet(QString(
             "QLabel { background: transparent; color: %1; border: none;"
             " font-family: 'Segoe UI Symbol','Segoe UI Emoji','Arial Unicode MS';"
-            " font-size: 14px; font-weight: 800; }").arg(T::text));
+            " font-size: 14px; font-weight: 800; }").arg(T::onAccent));
     }
 
     updateEccPill();
@@ -3642,9 +3494,9 @@ void MainWindow::closeCameras()
 
         m_btnFabStream->setToolTip("Start streaming");
         m_btnFabStream->setStyleSheet(QString(
-            "QPushButton { background: rgba(20,20,20,230); border: 1px solid %1; border-radius: 0px; }"
-            "QPushButton:hover { background: rgba(40,12,12,230); border: 1px solid %2; }")
-            .arg(T::border).arg(T::accent));
+            "QPushButton { background: #161616; border: 1px solid %1; border-radius: 20px; }"
+            "QPushButton:hover { background: #2e0e0b; border: 1px solid %2; }")
+            .arg(T::borderStrong).arg(T::accent));
         if (m_fabStreamIcon) {
             m_fabStreamIcon->setText(QString::fromUtf8("\u25B6"));
             m_fabStreamIcon->setStyleSheet(QString(
@@ -3722,8 +3574,11 @@ cv::Mat MainWindow::applyDiffView(const cv::Mat& d1, const cv::Mat& d2)
 
 bool MainWindow::eventFilter(QObject* obj, QEvent* event)
 {
-    if (obj == m_videoArea && event->type() == QEvent::Resize) {
-        positionFloatingButtons();
+    if (obj == m_videoArea
+        && (event->type() == QEvent::Resize || event->type() == QEvent::Show)) {
+        /* Instant repositioning: during a live window resize the buttons must
+           track the edges every frame, not chase them with an animation. */
+        positionFloatingButtons(false);
     }
     return QMainWindow::eventFilter(obj, event);
 }
@@ -4384,11 +4239,11 @@ void MainWindow::showExposureDialog()
     btnCam2->setCursor(Qt::PointingHandCursor);
 
     QString camBtnSty = QString(
-        "QPushButton { background: %1; color: %2; border: 1px solid %3; border-radius: 0px;"
+        "QPushButton { background: %1; color: %2; border: 1px solid %3; border-radius: 6px;"
         " padding: 4px 14px; font-weight: 600; font-size: 11px;"
         " font-family: 'Space Mono','JetBrains Mono',monospace; letter-spacing: 0.06em; }"
-        "QPushButton:checked { background: %4; color: %2; border-color: %4; }")
-        .arg(T::bg2).arg(T::text).arg(T::border).arg(T::accent);
+        "QPushButton:checked { background: %4; color: %5; border-color: %4; }")
+        .arg(T::bg2).arg(T::text).arg(T::border).arg(T::accent).arg(T::onAccent);
     btnCam1->setStyleSheet(camBtnSty);
     btnCam2->setStyleSheet(camBtnSty);
     btnCam1->setChecked(true);
@@ -4761,6 +4616,15 @@ void MainWindow::saveSettings()
     s.setValue("diffMode", m_isDiffMode);
     s.setValue("sheetOpen", m_currentNav != NavItem::None);
 
+    if (m_comboCamSet) {
+        QVariantList v = m_comboCamSet->currentData().toList();
+        if (v.size() == 3 && v[0].toInt() > 0) {
+            s.setValue("camW", v[0].toInt());
+            s.setValue("camH", v[1].toInt());
+            s.setValue("camFps", v[2].toInt());
+        }
+    }
+
     auto writeAdj = [&s](const QString& prefix, const ManualAdjust& a) {
         s.setValue(prefix + "tx", a.tx);
         s.setValue(prefix + "ty", a.ty);
@@ -4863,6 +4727,31 @@ void MainWindow::loadSettings()
         m_comboAdjCam->setCurrentIndex(m_activeAdjCam - 1);
     }
     applyAdjustToWidgets();
+
+    if (m_comboCamSet) {
+        const int cw = s.value("camW", 0).toInt();
+        const int ch = s.value("camH", 0).toInt();
+        const int cf = s.value("camFps", 0).toInt();
+        if (cw > 0 && ch > 0 && cf > 0) {
+            int found = -1;
+            for (int i = 0; i < m_comboCamSet->count(); ++i) {
+                QVariantList v = m_comboCamSet->itemData(i).toList();
+                if (v.size() == 3 && v[0].toInt() == cw
+                    && v[1].toInt() == ch && v[2].toInt() == cf) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found < 0 && m_comboCamSet->count() > 0) {
+                const int customIdx = m_comboCamSet->count() - 1;
+                m_comboCamSet->setItemText(customIdx,
+                    QString("%1x%2 @ %3 FPS ★").arg(cw).arg(ch).arg(cf));
+                m_comboCamSet->setItemData(customIdx, QVariantList{cw, ch, cf});
+                found = customIdx;
+            }
+            if (found >= 0) m_comboCamSet->setCurrentIndex(found);
+        }
+    }
 
     updateEccPill();
     updateFpsPill();
@@ -5063,7 +4952,7 @@ void MainWindow::initCommands()
         QDialog* dlg = new QDialog(this, Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         dlg->setStyleSheet(styleSheetText() + QString(
-            "QDialog { background: %1; border: 1px solid %2; border-radius: 0px; }")
+            "QDialog { background: %1; border: 1px solid %2; border-radius: 8px; }")
             .arg(T::bg1).arg(T::accent));
 
         QVBoxLayout* lay = new QVBoxLayout(dlg);
@@ -5154,7 +5043,10 @@ void MainWindow::initCommands()
         {"cmd_load_preset", "Load Selected Preset", "Presets", CmdType::Action, [this](){ if (m_btnLoadPreset) m_btnLoadPreset->click(); }, {}},
         {"cmd_delete_preset", "Delete Selected Preset", "Presets", CmdType::Action, [this](){ if (m_btnDeletePreset) m_btnDeletePreset->click(); }, {}},
 
-        {"cmd_history", "Chart History Limit", "Options", CmdType::Parameter, {}, [this, createPopup](QWidget*){ createPopup("Chart History Limit", m_historySlider); }}
+        {"cmd_history", "Chart History Limit", "Options", CmdType::Parameter, {}, [this, createPopup](QWidget*){ createPopup("Chart History Limit", m_historySlider); }},
+
+        {"cmd_tour", "Show Quick Tour", "Help", CmdType::Action, [this](){ showQuickTour(); }, {}},
+        {"cmd_help", "Open Help & Tips", "Help", CmdType::Action, [this](){ showHelpDialog(); }, {}}
     };
 
     QSettings s(settingsPath(), QSettings::IniFormat);
@@ -5215,8 +5107,16 @@ public:
         setSeq(seq);
         setCheckable(true);
 
-        setStyleSheet(
-            "QPushButton:checked { background: #500b0b; color: #e5e2e1; border: 1px solid #500b0b; }");
+        setStyleSheet(QString(
+            "QPushButton { color: %1; }"
+            "QPushButton:checked { background: %2; color: %3; border: 1px solid %2; font-weight: 600; }")
+            .arg(T::text).arg(T::accent).arg(T::onAccent));
+
+        connect(this, &QPushButton::toggled, this, [this](bool on) {
+            if (on) setText("Press a key...");
+            else setText(m_seq.isEmpty() ? "None"
+                                         : m_seq.toString(QKeySequence::NativeText));
+        });
     }
 
     void setSeq(const QKeySequence& seq) {
@@ -5278,6 +5178,370 @@ protected:
 private:
     QKeySequence m_seq;
 };
+
+/* First-run interactive tour: dims the window, highlights one UI region per
+   step and explains it. Esc / Skip closes, click or Next advances. */
+class TourOverlay : public QWidget {
+public:
+    struct Step { QWidget* target; QString title; QString text; };
+
+    TourOverlay(QWidget* host, QVector<Step> steps, std::function<void()> onDone)
+        : QWidget(host), m_steps(std::move(steps)), m_onDone(std::move(onDone))
+    {
+        setAttribute(Qt::WA_DeleteOnClose);
+        setFocusPolicy(Qt::StrongFocus);
+
+        m_card = new QFrame(this);
+        m_card->setStyleSheet(QString(
+            "QFrame { background: %1; border: 1px solid %2; border-radius: 10px; }"
+            "QLabel { border: none; background: transparent; }")
+            .arg(T::bg2).arg(T::borderStrong));
+        QVBoxLayout* cl = new QVBoxLayout(m_card);
+        cl->setContentsMargins(16, 14, 16, 12);
+        cl->setSpacing(6);
+
+        m_stepLbl = new QLabel(m_card);
+        m_stepLbl->setStyleSheet(QString(
+            "color:%1; font-size:10px; font-weight:700; letter-spacing:0.10em;"
+            " font-family:'Space Mono',monospace;").arg(T::accent));
+        m_title = new QLabel(m_card);
+        m_title->setStyleSheet(QString("color:%1; font-size:14px; font-weight:600;").arg(T::text));
+        m_text = new QLabel(m_card);
+        m_text->setWordWrap(true);
+        m_text->setStyleSheet(QString("color:%1; font-size:12px;").arg(T::textDim));
+        cl->addWidget(m_stepLbl);
+        cl->addWidget(m_title);
+        cl->addWidget(m_text);
+
+        QHBoxLayout* row = new QHBoxLayout();
+        row->setSpacing(8);
+        m_btnSkip = new QPushButton("Skip tour", m_card);
+        m_btnSkip->setStyleSheet(QString(
+            "QPushButton { background: transparent; border: none; color: %1; padding: 4px 2px; }"
+            "QPushButton:hover { color: %2; }").arg(T::textFaint).arg(T::text));
+        m_btnBack = new QPushButton("Back", m_card);
+        m_btnBack->setStyleSheet(QString(
+            "QPushButton { background: %1; color: %2; border: 1px solid %3;"
+            " border-radius: 6px; padding: 5px 14px; }")
+            .arg(T::bg3).arg(T::text).arg(T::borderStrong));
+        m_btnNext = new QPushButton("Next", m_card);
+        m_btnNext->setStyleSheet(QString(
+            "QPushButton { background: %1; color: %2; border: 1px solid %1;"
+            " border-radius: 6px; padding: 5px 16px; font-weight: 600; }"
+            "QPushButton:hover { background: #e0695d; border-color: #e0695d; }")
+            .arg(T::accent).arg(T::onAccent));
+        row->addWidget(m_btnSkip);
+        row->addStretch();
+        row->addWidget(m_btnBack);
+        row->addWidget(m_btnNext);
+        cl->addLayout(row);
+
+        connect(m_btnSkip, &QPushButton::clicked, this, [this]() { finish(); });
+        connect(m_btnBack, &QPushButton::clicked, this, [this]() { setStep(m_idx - 1); });
+        connect(m_btnNext, &QPushButton::clicked, this, [this]() { advance(); });
+
+        if (host) {
+            host->installEventFilter(this);
+            setGeometry(host->rect());
+        }
+        setStep(0);
+        show();
+        raise();
+        setFocus();
+    }
+
+protected:
+    bool eventFilter(QObject* o, QEvent* e) override {
+        if (o == parentWidget()
+            && (e->type() == QEvent::Resize || e->type() == QEvent::LayoutRequest)) {
+            setGeometry(parentWidget()->rect());
+            layoutCard();
+            update();
+        }
+        return QWidget::eventFilter(o, e);
+    }
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        QPainterPath dim;
+        dim.setFillRule(Qt::OddEvenFill);
+        dim.addRect(rect());
+        const QRect hole = targetRect();
+        if (!hole.isNull()) dim.addRoundedRect(hole, 10, 10);
+        p.fillPath(dim, QColor(5, 5, 5, 178));
+        if (!hole.isNull()) {
+            QPen pen{ QColor(T::accent) };
+            pen.setWidth(2);
+            p.setPen(pen);
+            p.setBrush(Qt::NoBrush);
+            p.drawRoundedRect(hole, 10, 10);
+        }
+    }
+    void mousePressEvent(QMouseEvent*) override { advance(); }
+    void keyPressEvent(QKeyEvent* e) override {
+        switch (e->key()) {
+        case Qt::Key_Escape: finish(); break;
+        case Qt::Key_Left:   setStep(m_idx - 1); break;
+        case Qt::Key_Right:
+        case Qt::Key_Space:
+        case Qt::Key_Return:
+        case Qt::Key_Enter:  advance(); break;
+        default: QWidget::keyPressEvent(e);
+        }
+    }
+
+private:
+    QRect targetRect() const {
+        if (m_idx < 0 || m_idx >= m_steps.size()) return QRect();
+        QWidget* t = m_steps[m_idx].target;
+        if (!t || !t->isVisible() || !parentWidget()) return QRect();
+        return QRect(t->mapTo(parentWidget(), QPoint(0, 0)), t->size())
+               .adjusted(-4, -4, 4, 4);
+    }
+    void advance() {
+        if (m_idx + 1 >= m_steps.size()) finish();
+        else setStep(m_idx + 1);
+    }
+    void setStep(int i) {
+        m_idx = qBound(0, i, int(m_steps.size()) - 1);
+        const Step& s = m_steps[m_idx];
+        m_stepLbl->setText(QString("STEP %1 / %2").arg(m_idx + 1).arg(m_steps.size()));
+        m_title->setText(s.title);
+        m_text->setText(s.text);
+        m_btnBack->setVisible(m_idx > 0);
+        m_btnNext->setText(m_idx + 1 >= m_steps.size() ? "Done" : "Next");
+        layoutCard();
+        update();
+    }
+    void layoutCard() {
+        if (!m_card) return;
+        m_card->setFixedWidth(qMin(380, width() - 32));
+        m_card->adjustSize();
+        const QRect hole = targetRect();
+        QPoint pos;
+        if (hole.isNull()) {
+            pos = QPoint((width() - m_card->width()) / 2,
+                         (height() - m_card->height()) / 2);
+        } else {
+            int x = qBound(16, hole.center().x() - m_card->width() / 2,
+                           qMax(16, width() - m_card->width() - 16));
+            int y = hole.bottom() + 14;
+            if (y + m_card->height() > height() - 16)
+                y = hole.top() - m_card->height() - 14;
+            y = qMax(16, y);
+            pos = QPoint(x, y);
+        }
+        m_card->move(pos);
+    }
+    void finish() {
+        if (m_onDone) m_onDone();
+        close();
+    }
+
+    QVector<Step> m_steps;
+    std::function<void()> m_onDone;
+    QFrame* m_card = nullptr;
+    QLabel* m_stepLbl = nullptr;
+    QLabel* m_title = nullptr;
+    QLabel* m_text = nullptr;
+    QPushButton* m_btnSkip = nullptr;
+    QPushButton* m_btnBack = nullptr;
+    QPushButton* m_btnNext = nullptr;
+    int m_idx = 0;
+};
+
+struct HelpTopic { QString title; QString text; };
+
+static QVector<HelpTopic> helpTopics()
+{
+    return {
+        { "Workspaces & navigation",
+          "The left rail switches workspaces: Capture, Pipeline, Diff, Focus, "
+          "Snapshot and Settings. Each workspace opens its own control panel at "
+          "the bottom; clicking the active item again hides the panel. \"G\" "
+          "opens the snapshot gallery, \"<<\" collapses the rail to icons, "
+          "\"[]\" hides all panels for a cameras-only view (a small button in "
+          "the top-left corner brings everything back)." },
+        { "Streaming & preview",
+          "▶ starts and stops both camera streams; the resolution / FPS preset "
+          "is chosen in the top-left combo box (including custom modes). The "
+          "previews show CAM 1 and CAM 2 side by side — drag the divider "
+          "between them to resize. DUAL / DIFF switches between side-by-side "
+          "view and the difference image." },
+        { "Exposure",
+          "AUTO / MAN toggles automatic and manual exposure. In manual mode the "
+          "current gain × shutter is shown next to the toggle, and "
+          "\"Detail...\" opens per-camera gain and shutter controls with "
+          "sliders and exact values." },
+        { "Capture workspace",
+          "Color mode (grayscale / color), flipping of CAM 2 (horizontal / "
+          "vertical), bilateral noise filter with strength slider, and adaptive "
+          "view options." },
+        { "Pipeline & Diff",
+          "Pipeline contains the processing chain: noise floor, frame buffer "
+          "size, fusion and intensity stretch. Diff highlights differences "
+          "between cameras, with a motion threshold and a motion indicator; "
+          "peak intensities can be tracked on the chart." },
+        { "Focus view",
+          "Focus shows a live sharpness metric for both cameras as a chart plus "
+          "large per-camera focus values — useful for fine lens adjustment. "
+          "The history length is configurable." },
+        { "Alignment",
+          "The NO ALIGN pill in the top bar shows the alignment state. "
+          "Automatic ECC alignment can be enabled in the controls; manual "
+          "6-DOF alignment (shift, scale, rotation) is available in its own "
+          "dialog and is saved between sessions." },
+        { "Snapshots & gallery",
+          "SNAP saves a snapshot from both cameras. The filename is built from "
+          "a template with parameters (exposure, filters, etc.) — configure "
+          "them in the Snapshot workspace. The gallery (\"G\") lists recent "
+          "snapshots; \"Snapshots\" in the top bar opens the folder in the OS." },
+        { "Analysis viewers",
+          "From a snapshot you can open analysis views: an intensity profile "
+          "along a line (2D chart) and a 3D surface of a region's intensity "
+          "with rotation, zoom, point picking and CSV export." },
+        { "Presets & settings",
+          "Presets save the whole processing configuration and can be loaded "
+          "or deleted in one click. Settings contains animation speed and "
+          "toggles. Camera mode, exposure and all options persist between "
+          "sessions automatically." },
+        { "Hotkeys",
+          "Every action is listed in the HK's menu — run it directly with "
+          "\"Exec\" or click the key box to bind a keyboard shortcut. "
+          "Conflicts are detected automatically." },
+    };
+}
+
+void MainWindow::showHelpDialog()
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle("Help & Tips");
+    dlg.resize(560, 660);
+
+    QVBoxLayout* root = new QVBoxLayout(&dlg);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    QLabel* title = new QLabel("Help & Tips", &dlg);
+    title->setProperty("role", "title");
+    title->setStyleSheet("padding: 16px 16px 4px 16px;");
+    root->addWidget(title);
+
+    QLabel* tip = new QLabel(
+        "Overview of every part of DualCam. For a guided walkthrough of the "
+        "interface, start the interactive tour.", &dlg);
+    tip->setProperty("role", "faint");
+    tip->setWordWrap(true);
+    tip->setStyleSheet("padding: 0px 16px 12px 16px;");
+    root->addWidget(tip);
+
+    QScrollArea* scroll = new QScrollArea(&dlg);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setStyleSheet("QScrollArea { background: transparent; }"
+                          "QWidget#helpScrollContent { background: transparent; }");
+
+    QWidget* content = new QWidget();
+    content->setObjectName("helpScrollContent");
+    QVBoxLayout* list = new QVBoxLayout(content);
+    list->setContentsMargins(16, 0, 16, 16);
+    list->setSpacing(8);
+
+    for (const HelpTopic& t : helpTopics()) {
+        QFrame* card = new QFrame();
+        card->setProperty("role", "panel");
+        QVBoxLayout* cl = new QVBoxLayout(card);
+        cl->setContentsMargins(14, 10, 14, 12);
+        cl->setSpacing(4);
+        QLabel* h = new QLabel(t.title, card);
+        h->setStyleSheet(QString(
+            "color:%1; font-size:12px; font-weight:600; border:none; background:transparent;")
+            .arg(T::accent));
+        QLabel* b = new QLabel(t.text, card);
+        b->setWordWrap(true);
+        b->setStyleSheet(QString(
+            "color:%1; font-size:12px; border:none; background:transparent;")
+            .arg(T::textDim));
+        cl->addWidget(h);
+        cl->addWidget(b);
+        list->addWidget(card);
+    }
+    list->addStretch();
+
+    scroll->setWidget(content);
+    root->addWidget(scroll, 1);
+
+    QFrame* bottomBar = new QFrame(&dlg);
+    bottomBar->setObjectName("helpBottomBar");
+    bottomBar->setStyleSheet(QString(
+        "QFrame#helpBottomBar { background: %1; border-top: 1px solid %2; }")
+        .arg(T::bg2).arg(T::border));
+    QHBoxLayout* btnLay = new QHBoxLayout(bottomBar);
+    btnLay->setContentsMargins(16, 10, 16, 10);
+
+    QPushButton* tourBtn = new QPushButton("Start interactive tour", bottomBar);
+    tourBtn->setProperty("kind", "ghost");
+    tourBtn->setCursor(Qt::PointingHandCursor);
+    connect(tourBtn, &QPushButton::clicked, &dlg, [this, &dlg]() {
+        dlg.accept();
+        QTimer::singleShot(0, this, [this]() { showQuickTour(); });
+    });
+    btnLay->addWidget(tourBtn);
+    btnLay->addStretch();
+
+    QPushButton* closeBtn = new QPushButton("Close", bottomBar);
+    closeBtn->setProperty("kind", "primary");
+    closeBtn->setCursor(Qt::PointingHandCursor);
+    connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    btnLay->addWidget(closeBtn);
+
+    root->addWidget(bottomBar);
+
+    if (m_animDialogsEnabled) {
+        animateDialogEntry(&dlg, m_btnHelpDocs, m_animSpeedMs);
+    }
+    dlg.exec();
+}
+
+void MainWindow::showQuickTour()
+{
+    QWidget* host = centralWidget();
+    if (!host) return;
+
+    QVector<TourOverlay::Step> steps;
+    auto add = [&steps](QWidget* t, const QString& title, const QString& text) {
+        if (t && t->isVisible()) steps.append({ t, title, text });
+    };
+
+    QWidget* topStrip = m_fpsPill ? m_fpsPill->parentWidget() : nullptr;
+    add(m_sideNav, "Workspaces",
+        "Capture, Pipeline, Diff, Focus, Snapshot and Settings — each opens its "
+        "own control panel at the bottom. \"G\" is the snapshot gallery. "
+        "\"<<\" collapses this rail, \"[]\" hides all panels (cameras-only view).");
+    add(topStrip, "Camera & status strip",
+        "Left side: resolution / FPS, AUTO-MAN exposure toggle and detailed "
+        "exposure settings. Right side: streaming status, alignment state and "
+        "recent snapshots.");
+    add(m_videoArea, "Live preview",
+        "Both cameras side by side. ▶ starts and stops the streams, "
+        "DUAL / DIFF switches to the difference view, SNAP saves a snapshot "
+        "from both cameras.");
+    add(m_bottomStack, "Control panel",
+        "Settings for the selected workspace: color pipeline, filters, motion "
+        "detection, focus metrics and more.");
+    add(m_btnHelp, "HK's — Actions & Hotkeys",
+        "Every action in the app is listed here — run it directly or assign a "
+        "keyboard shortcut of your choice.");
+    add(m_btnHelpDocs, "Help & Tips",
+        "Detailed notes on every part of the app, and a way to restart this "
+        "tour at any time.");
+
+    if (steps.isEmpty()) return;
+    new TourOverlay(host, steps, []() {
+        QSettings s(settingsPath(), QSettings::IniFormat);
+        s.setValue("tourShown", true);
+    });
+}
 
 void MainWindow::showActionsMenu()
 {
@@ -5404,8 +5668,13 @@ void MainWindow::showActionsMenu()
     root->addWidget(scroll, 1);
 
     QFrame* bottomBar = new QFrame(&dlg);
-    bottomBar->setStyleSheet(QString("background: %1; border-top: 1px solid %2;")
-                             .arg(T::bg2).arg(T::border));
+    bottomBar->setObjectName("hotkeysBottomBar");
+    /* Scoped selector: an unscoped "background:" in a widget stylesheet is
+       inherited by every child — the Reset button was picking up the bar's
+       dark background under its own dark-on-accent text. */
+    bottomBar->setStyleSheet(QString(
+        "QFrame#hotkeysBottomBar { background: %1; border-top: 1px solid %2; }")
+        .arg(T::bg2).arg(T::border));
     QHBoxLayout* btnLay = new QHBoxLayout(bottomBar);
     btnLay->setContentsMargins(16, 10, 16, 10);
 
