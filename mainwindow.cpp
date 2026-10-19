@@ -1735,9 +1735,11 @@ QWidget* MainWindow::buildPipelineTab()
     QWidget* fuseBox = new QWidget(this);
     QHBoxLayout* fuseLay = new QHBoxLayout(fuseBox);
     fuseLay->setContentsMargins(0, 0, 0, 0);
-    m_chkFusion = new QCheckBox("Blend CAM1+CAM2", this);
-    m_chkFusion->setToolTip("DUAL view: shows CAM1 blended 50/50 with the aligned CAM2 (needs a solved\n"
-                            "alignment). The DIFF view always uses the camera frames themselves.");
+    m_chkFusion = new QCheckBox("Sum (CAM1 + k·CAM2)/2", this);
+    m_chkFusion->setToolTip("DUAL view: shows Σ/2 = (CAM1 + k·CAM2)/2 with the aligned CAM2 (needs a solved\n"
+                            "alignment): the image of the total flux S0 with the polarization removed, in CAM1\n"
+                            "units — for an unpolarized scene it equals CAM1. Uses the same k as the difference.\n"
+                            "The DIFF view always uses the camera frames themselves.");
     m_motionIndicator = new QLabel(QString::fromUtf8("\u25CF Idle"), this);
     m_motionIndicator->setStyleSheet(QString("color:%1; font-weight:600;").arg(T::textDim));
     fuseLay->addWidget(m_chkFusion);
@@ -3959,7 +3961,7 @@ void MainWindow::closeCameras()
 cv::Mat MainWindow::fuseCameras(const cv::Mat& a, const cv::Mat& b)
 {
     cv::Mat out;
-    cv::addWeighted(a, 0.5, b, 0.5, 0.0, out);
+    cv::addWeighted(a, 0.5, b, 0.5 * m_channelK, 0.0, out);
     return out;
 }
 
@@ -4564,7 +4566,9 @@ void MainWindow::updateView()
         }
 
         m_view1->setOverlayColor(QColor(0x4e, 0xc9, 0xb0));
-        m_view1->setOverlayText(QString("CAM1  Focus %1").arg(static_cast<int>(m_lastFocus1)), false);
+        m_view1->setOverlayText(wantFusion
+                                    ? QString("Σ/2 = (CAM1 + %1·CAM2)/2").arg(m_channelK, 0, 'f', 4)
+                                    : QString("CAM1  Focus %1").arg(static_cast<int>(m_lastFocus1)), false);
         m_view2->setOverlayColor(QColor(0xce, 0x91, 0x78));
         m_view2->setOverlayText(QString("CAM2  Focus %1").arg(static_cast<int>(m_lastFocus2)), true);
 
@@ -5775,6 +5779,8 @@ ExifParams MainWindow::buildExifParams(const QString& mode) const
     obj["timeBuffer"]      = m_bufferSlider ? m_bufferSlider->value() : 0;
     obj["motionThreshold"] = m_motionThresholdSlider ? m_motionThresholdSlider->value() : 0;
     obj["fusion"]          = m_chkFusion && m_chkFusion->isChecked();
+    if (m_chkFusion && m_chkFusion->isChecked())
+        obj["fusionFormula"] = QString("(CAM1 + k*CAM2)/2, k = %1").arg(m_channelK, 0, 'f', 4);
     obj["bilateralFilter"] = m_chkBilateral && m_chkBilateral->isChecked();
     obj["bilateralStrength"] = m_bilateralSlider ? m_bilateralSlider->value() : m_bilateralStrength;
     obj["noiseFloor"]      = m_noiseFloorSlider ? m_noiseFloorSlider->value() : m_noiseFloor;
@@ -6711,7 +6717,7 @@ static QVector<HelpTopic> helpTopics()
         { "Pipeline & Diff",
           "Pipeline contains the processing chain: the T-buffer (temporal "
           "averaging over N frames), the motion threshold with its indicator "
-          "(motion restarts the averaging), CAM1 + CAM2 fusion and the "
+          "(motion restarts the averaging), the sum (CAM1 + k·CAM2)/2 and the "
           "alignment controls. Diff shows D = CAM1 − k·CAM2 as a colour "
           "map with a scale in DN. k balances the two channels: Calibrate k on "
           "an unpolarized, evenly lit scene with the laser off and the exposure "
