@@ -308,5 +308,3 @@ The bulk of the application lives in `mainwindow.cpp` — it owns the window, th
 Developed for the scientific and research work of the **Institute of Physics, National Academy of Sciences of Ukraine (IF NASU)**.
 
 Built on the shoulders of the [Qt](https://www.qt.io/) and [OpenCV](https://opencv.org/) projects.
-
-> Add a `LICENSE` file (e.g. MIT, or your institution's preferred terms) and reference it here once chosen.
