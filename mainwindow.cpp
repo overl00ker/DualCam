@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "resource_monitor.h"
 #ifndef DUALCAM_SEPARATE_VIEWER
 #include "viewer_dialogs.h"
 #endif
@@ -77,8 +78,15 @@
 #include <opencv2/calib3d.hpp>
 
 #include <iostream>
+#ifdef Q_OS_LINUX
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 #include <vector>
+#include <limits>
 #include <cmath>
+#include <algorithm>
+#include <array>
 
 #include <QPainter>
 #include <QPaintEvent>
@@ -96,48 +104,72 @@
 #include <QLinearGradient>
 #include <QtCharts/QChartView>
 #include <QtCharts/QLineSeries>
+#include <QImageReader>
 
-GpuImageView::GpuImageView(QWidget* parent)
-    : QOpenGLWidget(parent)
+ImageView::ImageView(QWidget* parent)
+    : QWidget(parent)
 {
     setAttribute(Qt::WA_OpaquePaintEvent);
+    setAttribute(Qt::WA_NoSystemBackground);
     setAutoFillBackground(false);
     setMinimumSize(160, 120);
 }
 
-void GpuImageView::initializeGL()
-{
-    initializeOpenGLFunctions();
-}
-
-void GpuImageView::resizeGL(int , int ) {}
-
-void GpuImageView::setImage(const QImage& img)
+void ImageView::setImage(const QImage& img)
 {
     m_image = img;
     update();
 }
 
-void GpuImageView::setPlaceholder(const QString& text)
+void ImageView::setPlaceholder(const QString& text)
 {
     m_placeholder = text;
     m_image = QImage();
     update();
 }
 
-void GpuImageView::setOverlayText(const QString& text, bool rightAlign)
+void ImageView::setOverlayText(const QString& text, bool rightAlign)
 {
+    if (m_overlayText == text && m_overlayRight == rightAlign) return;
     m_overlayText = text;
     m_overlayRight = rightAlign;
     update();
 }
 
-void GpuImageView::paintGL()
+void ImageView::setOverlayColor(const QColor& c)
+{
+    if (m_overlayColor == c) return;
+    m_overlayColor = c;
+    update();
+}
+
+void ImageView::setColorScale(const QImage& ramp, double maxValue, const QString& title)
+{
+    if (m_scaleRamp.cacheKey() == ramp.cacheKey() && m_scaleMax == maxValue && m_scaleTitle == title)
+        return;
+    m_scaleRamp = ramp;
+    m_scaleMax = maxValue;
+    m_scaleTitle = title;
+    update();
+}
+
+QSize ImageView::targetSize(const QSize& imageSize) const
+{
+    if (imageSize.isEmpty()) return QSize();
+    const double dpr = devicePixelRatioF();
+    const double kx = width()  * dpr / imageSize.width();
+    const double ky = height() * dpr / imageSize.height();
+    const double k  = m_stretch ? std::max(kx, ky) : std::min(kx, ky);
+    return QSize(std::max(1, int(imageSize.width() * k)),
+                 std::max(1, int(imageSize.height() * k)));
+}
+
+void ImageView::paintEvent(QPaintEvent*)
 {
     QPainter p(this);
-    p.fillRect(rect(), QColor("#000000"));
 
     if (m_image.isNull()) {
+        p.fillRect(rect(), QColor("#000000"));
         if (!m_placeholder.isEmpty()) {
 
             p.setRenderHint(QPainter::Antialiasing, true);
@@ -176,17 +208,25 @@ void GpuImageView::paintGL()
     }
 
     {
+        const double dpr = devicePixelRatioF();
         const QSize is = m_image.size();
-        const QSize ws = size();
-        const double kx = static_cast<double>(ws.width())  / is.width();
-        const double ky = static_cast<double>(ws.height()) / is.height();
-        const double k  = m_stretch ? std::max(kx, ky) : std::min(kx, ky);
-        const int dw = static_cast<int>(is.width()  * k);
-        const int dh = static_cast<int>(is.height() * k);
-        const int dx = (ws.width()  - dw) / 2;
-        const int dy = (ws.height() - dh) / 2;
+        QSize ds = targetSize(is);
+        const bool oneToOne = std::abs(ds.width() - is.width()) <= 1
+                           && std::abs(ds.height() - is.height()) <= 1;
+        if (oneToOne) ds = is;
+        const QSizeF logical(ds.width() / dpr, ds.height() / dpr);
+        const QRectF target(QPointF(std::floor((width() - logical.width()) / 2.0),
+                                    std::floor((height() - logical.height()) / 2.0)), logical);
+
+        const QRegion bars = QRegion(rect()).subtracted(QRegion(target.toAlignedRect()));
+        for (const QRect& r : bars) p.fillRect(r, Qt::black);
+
         p.setRenderHint(QPainter::SmoothPixmapTransform, false);
-        p.drawImage(QRect(dx, dy, dw, dh), m_image);
+        if (oneToOne) {
+            p.drawImage(target.topLeft(), m_image);
+        } else {
+            p.drawImage(target, m_image);
+        }
     }
 
     if (!m_overlayText.isEmpty()) {
@@ -207,6 +247,79 @@ void GpuImageView::paintGL()
         p.setPen(m_overlayColor);
         p.drawText(bg, Qt::AlignCenter, m_overlayText);
     }
+
+    if (!m_scaleRamp.isNull() && m_scaleMax > 0.0) {
+        p.setRenderHint(QPainter::Antialiasing, true);
+        QFont f = p.font();
+        f.setFamily("Space Mono");
+        f.setPointSize(8);
+        f.setBold(false);
+        f.setLetterSpacing(QFont::AbsoluteSpacing, 0.0);
+        QFont fBold = f;
+        fBold.setBold(true);
+        const QFontMetrics fm(f), fmBold(fBold);
+        const int pad = 10, barW = 8, tickW = 4, gap = 6;
+        const int lineH = fm.height();
+        const int barH = std::clamp(height() * 40 / 100, 80, 200);
+
+        const QString title = m_scaleTitle.section(", ", 0, 0);
+        const QString unit = m_scaleTitle.section(", ", 1);
+
+        const int prec = m_scaleMax < 10.0 ? 1 : 0;
+        auto label = [prec](double v) { return QString::number(v, 'f', prec); };
+        double step = m_scaleMax / 4.0;
+        const double mag = std::pow(10.0, std::floor(std::log10(step)));
+        const double norm = step / mag;
+        step = (norm < 1.5 ? 1.0 : norm < 3.0 ? 2.0 : norm < 7.0 ? 5.0 : 10.0) * mag;
+        while (step / m_scaleMax * barH < lineH + 2) step *= 2.0;
+        QVector<double> ticks;
+        for (double v = 0.0; v < m_scaleMax - 0.4 * step; v += step) ticks << v;
+
+        int labelW = fmBold.horizontalAdvance(label(m_scaleMax));
+        for (double v : ticks) labelW = std::max(labelW, fm.horizontalAdvance(label(v)));
+        int contentW = std::max(barW + tickW + gap + labelW,
+                                fmBold.horizontalAdvance(title) + gap + fm.horizontalAdvance(unit));
+        const int boxW = contentW + 2 * pad;
+        const int boxH = pad + lineH + 10 + barH + lineH / 2 + pad;
+        const QRectF box(width() - 12 - boxW, std::max(8, (height() - boxH) / 2), boxW, boxH);
+        p.setPen(QPen(QColor(255, 255, 255, 22), 1.0));
+        p.setBrush(QColor(12, 12, 12, 215));
+        p.drawRoundedRect(box.adjusted(0.5, 0.5, -0.5, -0.5), 8, 8);
+
+        const QColor textCol(0xe5, 0xe2, 0xe1), dimCol(0x9a, 0x97, 0x94);
+        const int left = int(box.left()) + pad;
+        int y = int(box.top()) + pad;
+        p.setFont(fBold);
+        p.setPen(textCol);
+        p.drawText(QRect(left, y, contentW, lineH), Qt::AlignLeft | Qt::AlignVCenter, title);
+        p.setFont(f);
+        p.setPen(dimCol);
+        p.drawText(QRect(left + fmBold.horizontalAdvance(title) + gap, y, contentW, lineH),
+                   Qt::AlignLeft | Qt::AlignVCenter, unit);
+        y += lineH + 10;
+
+        const QRect bar(left, y, barW, barH);
+        QPainterPath barPath;
+        barPath.addRoundedRect(QRectF(bar), 3, 3);
+        p.save();
+        p.setClipPath(barPath);
+        p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        p.drawImage(bar, m_scaleRamp);
+        p.restore();
+
+        const int tickX = bar.right() + 2;
+        const int lx = tickX + tickW + gap;
+        auto drawTick = [&](double v, bool top) {
+            const int ty = bar.bottom() - int(std::round(v / m_scaleMax * (barH - 1)));
+            p.setPen(QPen(top ? textCol : QColor(255, 255, 255, 110), 1.0));
+            p.drawLine(QPointF(tickX, ty + 0.5), QPointF(tickX + tickW, ty + 0.5));
+            p.setFont(top ? fBold : f);
+            p.setPen(top ? textCol : dimCol);
+            p.drawText(QRect(lx, ty - lineH / 2, labelW, lineH), Qt::AlignLeft | Qt::AlignVCenter, label(v));
+        };
+        for (double v : ticks) drawTick(v, false);
+        drawTick(m_scaleMax, true);
+    }
 }
 
 CameraWorker::CameraWorker(QObject* parent) : QThread(parent) {
@@ -215,17 +328,24 @@ CameraWorker::CameraWorker(QObject* parent) : QThread(parent) {
 CameraWorker::~CameraWorker() {
     stopCameras();
 }
-void CameraWorker::startCameras(const std::string& pipe1, const std::string& pipe2, int w, int h, int fps) {
+bool CameraWorker::startCameras(const std::string& pipe1, const std::string& pipe2, int w, int h, int fps) {
+    Q_UNUSED(w); Q_UNUSED(h); Q_UNUSED(fps);
+    stopCameras();
     m_cap1.open(pipe1, cv::CAP_GSTREAMER);
     m_cap2.open(pipe2, cv::CAP_GSTREAMER);
     if (!m_cap1.isOpened() || !m_cap2.isOpened()) {
         emit cameraError("Failed to open GStreamer pipelines");
-        return;
+        m_cap1.release();
+        m_cap2.release();
+        return false;
     }
+    m_frameCount = 0;
     m_running = true;
     start();
+    return true;
 }
-void CameraWorker::startCamerasV4L2(int id1, int id2, int w, int h, int fps) {
+bool CameraWorker::startCamerasV4L2(int id1, int id2, int w, int h, int fps) {
+    stopCameras();
 #ifdef Q_OS_LINUX
     m_cap1.open(id1, cv::CAP_V4L2);
     m_cap2.open(id2, cv::CAP_V4L2);
@@ -237,7 +357,7 @@ void CameraWorker::startCamerasV4L2(int id1, int id2, int w, int h, int fps) {
         emit cameraError("Failed to open one or both cameras (V4L2/DSHOW fallback)");
         if (m_cap1.isOpened()) m_cap1.release();
         if (m_cap2.isOpened()) m_cap2.release();
-        return;
+        return false;
     }
     m_cap1.set(cv::CAP_PROP_FRAME_WIDTH, w);
     m_cap1.set(cv::CAP_PROP_FRAME_HEIGHT, h);
@@ -245,20 +365,24 @@ void CameraWorker::startCamerasV4L2(int id1, int id2, int w, int h, int fps) {
     m_cap2.set(cv::CAP_PROP_FRAME_WIDTH, w);
     m_cap2.set(cv::CAP_PROP_FRAME_HEIGHT, h);
     m_cap2.set(cv::CAP_PROP_FPS, fps);
+    m_frameCount = 0;
     m_running = true;
     start();
+    return true;
 }
 void CameraWorker::stopCameras() {
     m_running = false;
-    if (m_cap1.isOpened()) m_cap1.release();
-    if (m_cap2.isOpened()) m_cap2.release();
-    if (!wait(2000)) {
-        requestInterruption();
+
+    if (isRunning() && !wait(2000)) {
+        m_cap1.release();
+        m_cap2.release();
         if (!wait(1000)) {
             terminate();
             wait();
         }
     }
+    if (m_cap1.isOpened()) m_cap1.release();
+    if (m_cap2.isOpened()) m_cap2.release();
 }
 void CameraWorker::setParams(const WorkerParams& p) {
     m_paramMutex.lock();
@@ -267,23 +391,29 @@ void CameraWorker::setParams(const WorkerParams& p) {
 }
 cv::Mat CameraWorker::toWorkingFormat(const cv::Mat& frame, ColorMode mode) {
     if (frame.empty()) return frame;
-    cv::Mat res;
-    if (mode == ColorMode::GRAY_CV) {
+    cv::Mat res = frame;
+    if (mode == ColorMode::GRAY_CV || mode == ColorMode::GRAY_NATIVE) {
         if (frame.channels() == 3) cv::cvtColor(frame, res, cv::COLOR_BGR2GRAY);
-        else res = frame.clone();
-    } else {
-        if (frame.channels() == 1 && mode == ColorMode::COLOR) cv::cvtColor(frame, res, cv::COLOR_GRAY2BGR);
-        else res = frame.clone();
+    } else if (frame.channels() == 1 && mode == ColorMode::COLOR) {
+        cv::cvtColor(frame, res, cv::COLOR_GRAY2BGR);
     }
     return res;
 }
-double CameraWorker::detectMotion(const cv::Mat& frame, double /*thr*/) {
+double CameraWorker::detectMotion(const cv::Mat& frame) {
 
     if (frame.empty()) return 0.0;
+
+    constexpr int kProxySide = 320;
+    cv::Mat src = frame;
+    const int side = std::max(frame.cols, frame.rows);
+    if (side > kProxySide) {
+        const double k = double(kProxySide) / side;
+        cv::resize(frame, src, cv::Size(), k, k, cv::INTER_AREA);
+    }
     cv::Mat fgMask;
-    m_bgSubtractor->apply(frame, fgMask, 0.01);
+    m_bgSubtractor->apply(src, fgMask, 0.01);
     double nonZero = cv::countNonZero(fgMask);
-    return nonZero / (frame.cols * frame.rows);
+    return nonZero / (src.cols * src.rows);
 }
 cv::Mat CameraWorker::applyTemporalDenoise(cv::Mat& frame, cv::Mat& ema, int bufferSize) {
     if (bufferSize <= 1 || frame.empty()) return frame;
@@ -292,9 +422,7 @@ cv::Mat CameraWorker::applyTemporalDenoise(cv::Mat& frame, cv::Mat& ema, int buf
     if (ema.empty() || ema.size() != frame.size() || ema.type() != cvType) {
         frame.convertTo(ema, cvType);
     } else {
-        cv::Mat tmp;
-        frame.convertTo(tmp, cvType);
-        cv::accumulateWeighted(tmp, ema, alpha);
+        cv::accumulateWeighted(frame, ema, alpha);
     }
     cv::Mat res;
     ema.convertTo(res, frame.type());
@@ -306,15 +434,26 @@ double CameraWorker::calculateFocus(const cv::Mat& frame) {
     if (frame.channels() == 3) cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
     else gray = frame;
     cv::Mat laplacian;
-    cv::Laplacian(gray, laplacian, CV_64F);
+    cv::Laplacian(gray, laplacian, gray.depth() == CV_8U ? CV_16S : CV_64F);
     cv::Scalar mean, stddev;
     cv::meanStdDev(laplacian, mean, stddev);
     return stddev.val[0] * stddev.val[0];
 }
 void CameraWorker::run() {
-    cv::Mat f1, f2;
+#ifdef Q_OS_LINUX
+    m_threadId = static_cast<int>(::syscall(SYS_gettid));
+#elif defined(Q_OS_WIN)
+    m_threadId = static_cast<int>(reinterpret_cast<quintptr>(QThread::currentThreadId()));
+#endif
+    int failedGrabs = 0;
     while (m_running) {
-        if (!m_cap1.grab() || !m_cap2.grab()) continue;
+        cv::Mat f1, f2;
+        if (!m_cap1.grab() || !m_cap2.grab()) {
+            if (++failedGrabs == 200) emit cameraError("Camera stream stalled: no frames are arriving");
+            QThread::msleep(10);
+            continue;
+        }
+        failedGrabs = 0;
         m_cap1.retrieve(f1);
         m_cap2.retrieve(f2);
 
@@ -331,7 +470,7 @@ void CameraWorker::run() {
         f1 = toWorkingFormat(f1, p.colorMode);
         f2 = toWorkingFormat(f2, p.colorMode);
 
-        double motion = detectMotion(f2, p.motionThr);
+        double motion = detectMotion(f2);
         bool motionDetected = (motion > p.motionThr);
 
         if (motionDetected) {
@@ -359,14 +498,16 @@ void CameraWorker::run() {
         double focus2 = calculateFocus(f2);
 
         m_frameCount++;
+        m_statProcessed.fetch_add(1);
 
-        if (m_pendingFrames.load() >= 2) {
-
+        if (m_pendingFrames.load() >= 1) {
+            m_statDropped.fetch_add(1);
             continue;
         }
         m_pendingFrames.fetch_add(1);
-        emit framesProcessed(f1.clone(), f2.clone(), focus1, focus2, motionDetected, m_frameCount);
+        emit framesProcessed(f1, f2, focus1, focus2, motionDetected, m_frameCount);
     }
+    m_threadId = 0;
 }
 
 namespace {
@@ -627,7 +768,6 @@ static cv::Mat qImageToBGR(const QImage& src) {
     return bgr;
 }
 
-
 namespace T {
     static const char* bg0 = "#050505";
     static const char* bg1 = "#0e0e0e";
@@ -639,9 +779,9 @@ namespace T {
     static const char* text = "#f2efee";
     static const char* textDim = "#b8b5b3";
     static const char* textFaint = "#8a8784";
-    static const char* accent = "#d4564a";      /* bright coral-red: highlights, borders, checked */
-    static const char* accentDim = "#7e2c24";   /* dark red: fills, pressed */
-    static const char* onAccent = "#1f0a08";    /* dark text on bright accent fill */
+    static const char* accent = "#d4564a";
+    static const char* accentDim = "#7e2c24";
+    static const char* onAccent = "#1f0a08";
     static const char* ok = "#7ed492";
     static const char* warn = "#f0b860";
     static const char* err = "#f07d72";
@@ -652,13 +792,21 @@ namespace T {
 static void setPillState(QLabel* lbl, const char* state, const QString& text = QString())
 {
     if (!lbl) return;
+    if (!text.isNull()) lbl->setText(text);
+
+    if (lbl->property("role").toString() == QLatin1String("pill")
+        && lbl->property("pillState").toString() == QLatin1String(state))
+        return;
     lbl->setProperty("role", "pill");
     lbl->setProperty("pillState", state);
-    if (!text.isNull()) lbl->setText(text);
     lbl->style()->unpolish(lbl);
     lbl->style()->polish(lbl);
     lbl->update();
 }
+
+static constexpr int kKCalFrames = 20;
+static constexpr int kKCalMinLevel = 24;
+static constexpr int kKCalMinPixels = 1000;
 
 static QString settingsPath()
 {
@@ -685,6 +833,7 @@ static const FilenameParamSpec kFilenameParamSpecs[] = {
     {"CM",  "Color Mode (RGB/GRY)"},
     {"FH",  "Flip Horizontal (FH)"},
     {"FV",  "Flip Vertical (FV)"},
+    {"K",   "Channel balance (K#)"},
 };
 
 MainWindow::MainWindow(QWidget* parent)
@@ -705,10 +854,25 @@ MainWindow::MainWindow(QWidget* parent)
         m_paramInName[QString::fromLatin1(spec.key)] = true;
     }
 
+    probeCameras();
     initUI();
     initCommands();
     loadSettings();
     refreshPresetList();
+    updateDiffReadout(true);
+
+    m_resMonitor = new ResourceMonitor([this]() {
+        ResourceMonitor::FrameCounters c;
+        if (m_worker) {
+            c.processed = m_worker->processedFrames();
+            c.dropped = m_worker->droppedFrames();
+            c.workerThreadId = m_worker->threadId();
+        }
+        c.displayed = m_displayedFrames;
+        return c;
+    }, this);
+    connect(m_resMonitor, &ResourceMonitor::updated, this, &MainWindow::updateResourceDisplay);
+    m_resMonitor->start(1000);
 
     {
         QSettings s(settingsPath(), QSettings::IniFormat);
@@ -729,7 +893,7 @@ QString MainWindow::styleSheetText() const
 {
 
     return QString(R"(
-        /* Foundation */
+
         QMainWindow, QWidget#root { background: %1; color: %3; }
         QDialog { background: %2; color: %3; }
         QDialog QLabel { color: %3; background: transparent; }
@@ -758,7 +922,6 @@ QString MainWindow::styleSheetText() const
         QMenu::indicator:non-exclusive:checked   { background: %5; border: 1px solid %5; }
         QMenu::indicator:non-exclusive:unchecked { background: transparent; border: 1px solid %9; }
 
-        /* Typography roles */
         QLabel { color: %3; }
         QLabel[role="dim"]     { color: %4;  font-size: 11px; }
         QLabel[role="faint"]   { color: %10; font-size: 11px; }
@@ -767,8 +930,6 @@ QString MainWindow::styleSheetText() const
         QLabel[role="hero"]    { color: %3;  font-family: 'Space Mono','JetBrains Mono',monospace; font-size: 22px; font-weight: 700; }
         QLabel[role="mono"]    { color: %3;  font-family: 'Space Mono','JetBrains Mono',monospace; font-size: 11px; }
 
-        /* Pill (status indicator) -- sourced from Mario Guzman segmented bottom bar idiom,
-           recolored for light-on-dark Adrenalin */
         QLabel[role="pill"] {
             background: %6; color: %4; border: 1px solid %7;
             border-radius: 9px; padding: 2px 10px;
@@ -781,13 +942,10 @@ QString MainWindow::styleSheetText() const
         QLabel[role="pill"][pillState="info"] { color: %3;      background: %6;      border-color: %5; }
         QLabel[role="pill"][pillState="idle"] { color: %4;      background: %6;      border-color: %7; }
 
-        /* Frames */
         QFrame[role="card"]  { background: %6; border: 1px solid %7; border-radius: 8px; }
         QFrame[role="panel"] { background: %2; border: 1px solid %7; border-radius: 8px; }
         QFrame[role="hud"]   { background: rgba(10,10,10,215); border: 1px solid %9; border-radius: 8px; }
 
-        /* Tabs -- top-tab navigation idiom from AMD Adrenalin (calibration.md Source 8),
-           hugging-left per skill anti-pattern fix (no setExpanding) */
         QTabWidget::pane { border: none; background: %2; }
         QTabBar { background: %2; qproperty-drawBase: 0; }
         QTabBar::tab {
@@ -801,8 +959,6 @@ QString MainWindow::styleSheetText() const
         QTabBar::tab:selected         { color: %3; border-bottom: 2px solid %5; }
         QTabBar::tab:hover:!selected  { color: %3; }
 
-        /* Buttons -- Apple HIG "Regular" approximation (tokens.md controlH 28),
-           but tightened to 22 min-height for Compact tier */
         QPushButton {
             background: %6; color: %3; border: 1px solid %7; border-radius: 6px;
             padding: 5px 12px; min-height: 22px;
@@ -844,7 +1000,6 @@ QString MainWindow::styleSheetText() const
         }
         QPushButton[kind="quiet"]:hover { color: %3; }
 
-        /* Sheet handle -- at Mario Guzman's small bottom-bar spec (22pt) */
         QPushButton#sheetHandle {
             background: %2; border: none;
             border-top: 1px solid %7; border-bottom: 1px solid %7;
@@ -852,7 +1007,6 @@ QString MainWindow::styleSheetText() const
         }
         QPushButton#sheetHandle:hover { background: %6; color: %3; }
 
-        /* Inputs -- monospace, Adrenalin "telemetry" treatment */
         QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
             background: %8; color: %3; border: 1px solid %7; border-radius: 6px;
             padding: 4px 8px; min-height: 22px;
@@ -867,7 +1021,20 @@ QString MainWindow::styleSheetText() const
             font-family: 'Space Mono','JetBrains Mono',monospace; font-size: 11px;
         }
 
-        /* Checkboxes -- small for Compact tier */
+        QAbstractItemView, QTreeView, QListView, QTableView, QColumnView {
+            background: %2; color: %3; border: 1px solid %7;
+            selection-background-color: %11; selection-color: %3;
+            alternate-background-color: %6; outline: 0;
+        }
+        QAbstractItemView::item:hover    { background: %6; color: %3; }
+        QAbstractItemView::item:selected { background: %11; color: %3; }
+        QHeaderView { background: %2; }
+        QHeaderView::section {
+            background: %6; color: %4; border: none;
+            border-right: 1px solid %7; border-bottom: 1px solid %7;
+            padding: 4px 8px;
+        }
+
         QCheckBox { color: %3; spacing: 6px; font-size: 12px; }
         QCheckBox::indicator {
             width: 15px; height: 15px; border-radius: 4px;
@@ -877,9 +1044,6 @@ QString MainWindow::styleSheetText() const
         QCheckBox::indicator:checked  { background: %5; border-color: %5; }
         QCheckBox::indicator:disabled { background: %2; border-color: %7; }
 
-        /* Sliders -- rectangle handle sized to align with button baseline (22-28px),
-           accent-fill sub-page. Handle height matches QPushButton min-height so
-           sliders read as peers of the 2D/3D toggle rather than as decoration. */
         QSlider::horizontal { min-height: 22px; }
         QSlider::groove:horizontal { background: %8; height: 4px; border: none; border-radius: 2px; }
         QSlider::sub-page:horizontal { background: %5; border-radius: 2px; }
@@ -902,7 +1066,6 @@ QString MainWindow::styleSheetText() const
         }
         QSlider::handle:vertical:hover { background: %5; border-color: %3; }
 
-        /* Lists */
         QListWidget {
             background: %2; color: %3; border: 1px solid %7; border-radius: 6px;
             outline: 0; font-size: 12px;
@@ -913,7 +1076,6 @@ QString MainWindow::styleSheetText() const
         QListWidget::item:selected { background: %6; color: %3; border-left: 2px solid %5; padding-left: 8px; }
         QListWidget::item:hover    { background: %6; }
 
-        /* Status bar — Mario small bottom-bar 22pt, Space Mono telemetry */
         QStatusBar {
             background: %2; color: %4;
             border-top: 1px solid %7;
@@ -922,13 +1084,11 @@ QString MainWindow::styleSheetText() const
         }
         QStatusBar::item { border: none; }
 
-        /* Splitter — 2px gap, DESIGN.md "pitch black background as natural border" */
         QSplitter::handle           { background: %1; }
         QSplitter::handle:horizontal { width: 2px; }
         QSplitter::handle:vertical   { height: 2px; }
         QSplitter::handle:hover      { background: %5; }
 
-        /* Scrollbars — slim, hover-revealed accent */
         QScrollBar:vertical   { background: %2; width: 8px; }
         QScrollBar:horizontal { background: %2; height: 8px; }
         QScrollBar::handle:vertical   { background: %9; min-height: 24px; border-radius: 4px; }
@@ -937,7 +1097,6 @@ QString MainWindow::styleSheetText() const
         QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
         QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 
-        /* Group box (rare) */
         QGroupBox { border: 1px solid %7; border-radius: 8px; margin-top: 14px; padding: 10px; font-size: 11px; }
         QGroupBox::title { subcontrol-origin: margin; left: 10px; color: %4; }
     )")
@@ -959,9 +1118,7 @@ void MainWindow::initUI()
 {
     setWindowTitle("DualCam Analysis Tool");
     setMinimumSize(560, 420);
-    /* Application-wide stylesheet: tooltips, QMessageBox and other top-level
-       popups don't inherit a window-level stylesheet, which left them with
-       the native palette (dark-on-dark text on Windows dark theme). */
+
     qApp->setStyleSheet(styleSheetText());
 
     m_centralWidget = new QWidget(this);
@@ -993,9 +1150,13 @@ void MainWindow::initUI()
             dlg.setWindowTitle("Custom Resolution");
             dlg.setStyleSheet(styleSheetText());
             QVBoxLayout* lay = new QVBoxLayout(&dlg);
-            QSpinBox* spinW = new QSpinBox(&dlg); spinW->setRange(320, 3840); spinW->setValue(1920);
-            QSpinBox* spinH = new QSpinBox(&dlg); spinH->setRange(240, 2160); spinH->setValue(1080);
-            QSpinBox* spinF = new QSpinBox(&dlg); spinF->setRange(1, 240); spinF->setValue(30);
+            const QSize native = sensorNativeSize();
+            const int maxW = native.isValid() ? native.width()  : 3840;
+            const int maxH = native.isValid() ? native.height() : 2160;
+            const int maxF = native.isValid() ? std::max(1, int(sensorMaxFps(1, 1))) : 240;
+            QSpinBox* spinW = new QSpinBox(&dlg); spinW->setRange(std::min(320, maxW), maxW); spinW->setValue(std::min(1920, maxW));
+            QSpinBox* spinH = new QSpinBox(&dlg); spinH->setRange(std::min(240, maxH), maxH); spinH->setValue(std::min(1080, maxH));
+            QSpinBox* spinF = new QSpinBox(&dlg); spinF->setRange(1, maxF); spinF->setValue(std::min(30, maxF));
             QFormLayout* form = new QFormLayout();
             form->addRow("Width:", spinW);
             form->addRow("Height:", spinH);
@@ -1006,13 +1167,12 @@ void MainWindow::initUI()
             connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
             lay->addWidget(box);
 
-            if (m_animDialogsEnabled) {
-                animateDialogEntry(&dlg, m_comboCamSet, m_animSpeedMs);
-            }
-            if (dlg.exec() == QDialog::Accepted) {
-                QString label = QString("%1x%2 @ %3 FPS \u2605").arg(spinW->value()).arg(spinH->value()).arg(spinF->value());
+            if (execDialog(&dlg, m_comboCamSet) == QDialog::Accepted) {
+                int w = spinW->value(), h = spinH->value(), f = spinF->value();
+                fitToSensor(w, h, f);
+                QString label = QString("%1x%2 @ %3 FPS \u2605").arg(w).arg(h).arg(f);
                 m_comboCamSet->setItemText(index, label);
-                m_comboCamSet->setItemData(index, QVariantList{spinW->value(), spinH->value(), spinF->value()});
+                m_comboCamSet->setItemData(index, QVariantList{w, h, f});
             }
         }
     });
@@ -1023,6 +1183,13 @@ void MainWindow::initUI()
     m_eccPill = new QLabel("NO ALIGN", this);
     m_eccPill->setProperty("role", "pill");
     m_eccPill->setProperty("pillState", "err");
+
+    m_resPill = new QLabel("CPU  --", this);
+    m_resPill->setProperty("role", "pill");
+    m_resPill->setProperty("pillState", "idle");
+    m_resPill->setCursor(Qt::PointingHandCursor);
+    m_resPill->setToolTip("System resources \u2014 click for details");
+    m_resPill->installEventFilter(this);
 
     m_btnGallery = new QPushButton("Snapshots", this);
     m_btnGallery->setCursor(Qt::PointingHandCursor);
@@ -1043,6 +1210,7 @@ void MainWindow::initUI()
     m_btnHelpDocs = new QPushButton("?", this);
     m_btnHelpDocs->setProperty("kind", "ghost");
     m_btnHelpDocs->setFixedWidth(28);
+    m_btnHelpDocs->setStyleSheet("QPushButton { padding-left: 0; padding-right: 0; }");
     m_btnHelpDocs->setCursor(Qt::PointingHandCursor);
     m_btnHelpDocs->setToolTip("Help & Tips — overview of the app and the interactive tour");
     connect(m_btnHelpDocs, &QPushButton::clicked, this, &MainWindow::showHelpDialog);
@@ -1215,6 +1383,7 @@ void MainWindow::initUI()
     topLay->addWidget(m_btnExpChange);
 
     topLay->addStretch();
+    topLay->addWidget(m_resPill);
     topLay->addWidget(m_fpsPill);
     topLay->addWidget(m_eccPill);
     topLay->addSpacing(4);
@@ -1235,7 +1404,7 @@ void MainWindow::initUI()
     m_splitter->setHandleWidth(2);
 
     auto makeView = [this](const QString& placeholder) {
-        GpuImageView* v = new GpuImageView(this);
+        ImageView* v = new ImageView(this);
         v->setMinimumSize(160, 120);
         v->setPlaceholder(placeholder);
         return v;
@@ -1289,12 +1458,14 @@ void MainWindow::initUI()
         " font-family: 'Segoe UI Symbol','Segoe UI Emoji','Arial Unicode MS';"
         " font-size: 14px; font-weight: 700; }").arg(T::text));
     connect(m_btnFabStream, &QPushButton::clicked, this, [this]() {
-        if (m_camerasOpen) closeCameras();
-        else openCameras();
+        cameraTransition([this]() {
+            if (m_camerasOpen) closeCameras();
+            else openCameras();
+        });
     });
     m_btnToggleCameras = m_btnFabStream;
 
-    m_btnModeToggle = new QPushButton("DUAL", m_videoArea);
+    m_btnModeToggle = new QPushButton("Dual", m_videoArea);
     m_btnModeToggle->setFixedHeight(26);
     m_btnModeToggle->setCursor(Qt::PointingHandCursor);
     m_btnModeToggle->setStyleSheet(QString(
@@ -1330,6 +1501,17 @@ void MainWindow::initUI()
     m_btnModeToggle->hide();
     m_btnFabSnapshot->hide();
 
+    m_resHud = new QFrame(m_videoArea);
+    m_resHud->setProperty("role", "hud");
+    m_resHud->setAttribute(Qt::WA_TransparentForMouseEvents);
+    QVBoxLayout* hudLay = new QVBoxLayout(m_resHud);
+    hudLay->setContentsMargins(10, 8, 10, 8);
+    m_resHudText = new QLabel("Collecting\u2026", m_resHud);
+    m_resHudText->setProperty("role", "mono");
+    m_resHudText->setTextFormat(Qt::PlainText);
+    hudLay->addWidget(m_resHudText);
+    m_resHud->hide();
+
     m_videoArea->installEventFilter(this);
 
     m_mainSplit = new QSplitter(Qt::Horizontal, this);
@@ -1341,9 +1523,6 @@ void MainWindow::initUI()
 
     m_workStack = new QStackedWidget(this);
 
-    /* The "show sidebar" floating toggle lives on the work stack (not the
-       video area) so it stays reachable from the Gallery page too — without
-       it, leaving preview mode from Gallery required a hotkey. */
     if (m_btnFloatingPreviewToggle) m_btnFloatingPreviewToggle->setParent(m_workStack);
 
     m_workSplit = new QSplitter(Qt::Vertical, m_workStack);
@@ -1370,14 +1549,9 @@ void MainWindow::initUI()
     m_galleryView = buildGalleryView();
     m_workStack->addWidget(m_galleryView);
 
-    /* Page fade on tab switch. Pages containing QOpenGLWidget views are
-       NEVER animated through QGraphicsOpacityEffect: the effect rasterizes
-       the whole subtree on the CPU every frame (jank) and composites GL
-       content as black. The effect is also detached once the fade ends so
-       it doesn't tax every later repaint. */
     auto fadeInPage = [this](QWidget* w, int durationMs) {
         if (!w) return;
-        if (!m_animTabsEnabled || w->findChild<QOpenGLWidget*>()) {
+        if (!m_animTabsEnabled || w->findChild<ImageView*>()) {
             if (w->graphicsEffect()) w->setGraphicsEffect(nullptr);
             return;
         }
@@ -1562,6 +1736,8 @@ QWidget* MainWindow::buildPipelineTab()
     QHBoxLayout* fuseLay = new QHBoxLayout(fuseBox);
     fuseLay->setContentsMargins(0, 0, 0, 0);
     m_chkFusion = new QCheckBox("Blend CAM1+CAM2", this);
+    m_chkFusion->setToolTip("DUAL view: shows CAM1 blended 50/50 with the aligned CAM2 (needs a solved\n"
+                            "alignment). The DIFF view always uses the camera frames themselves.");
     m_motionIndicator = new QLabel(QString::fromUtf8("\u25CF Idle"), this);
     m_motionIndicator->setStyleSheet(QString("color:%1; font-weight:600;").arg(T::textDim));
     fuseLay->addWidget(m_chkFusion);
@@ -1619,8 +1795,42 @@ QWidget* MainWindow::buildPipelineTab()
     eccButtons->addWidget(m_btnOpenManualAlign, 1);
     eccLay->addLayout(eccButtons);
 
+    QHBoxLayout* eccOpts = new QHBoxLayout();
+    eccOpts->setSpacing(6);
+    m_chkEccPolish = new QCheckBox("ECC polish", this);
+    m_chkEccPolish->setChecked(true);
+    m_chkEccPolish->setToolTip(
+        "After the feature stage, refine the matrix with pyramidal ECC on gradient maps.\n"
+        "Gives sub-pixel accuracy. Turn off if the two channels differ so strongly\n"
+        "that the polish degrades the result — compare the diff view both ways.");
+    m_chkPersistAlign = new QCheckBox("Remember", this);
+    m_chkPersistAlign->setChecked(true);
+    m_chkPersistAlign->setToolTip(
+        "Save the solved warp matrix and restore it on the next launch.\n"
+        "Automatically discarded if the frame size changes.");
+    connect(m_chkPersistAlign, &QCheckBox::toggled, this, [this](bool on) {
+        if (on) saveAlignmentMatrix();
+        else {
+            QSettings s(settingsPath(), QSettings::IniFormat);
+            s.beginGroup("Alignment");
+            s.remove("");
+            s.endGroup();
+            s.sync();
+        }
+    });
+    eccOpts->addWidget(m_chkEccPolish, 1);
+    eccOpts->addWidget(m_chkPersistAlign, 1);
+    eccOpts->addStretch(1);
+    eccLay->addLayout(eccOpts);
+
+    m_alignDetail = new QLabel("No solution yet.", this);
+    m_alignDetail->setWordWrap(true);
+    m_alignDetail->setProperty("role", "faint");
+    eccLay->addWidget(m_alignDetail);
+
     QLabel* eccHint = new QLabel(
-        "Calibrate solves the warp matrix once (SIFT + FLANN + RANSAC). "
+        "Calibrate solves the warp matrix once: features (SIFT / ORB / AKAZE + RANSAC) "
+        "find it globally, then sub-pixel correlation and ECC refine it on gradient maps. "
         "Apply reuses that matrix on every frame.",
         this);
     eccHint->setWordWrap(true);
@@ -1652,10 +1862,12 @@ QWidget* MainWindow::buildDiffTab()
     m_noiseFloorLabel = new QLabel(QString::number(m_noiseFloor), this);
     m_noiseFloorLabel->setFixedWidth(28);
     m_noiseFloorLabel->setAlignment(Qt::AlignCenter);
+    m_noiseFloorSlider->setToolTip("|D| at or below this level (DN) is shown as 0");
     connect(m_noiseFloorSlider, &QSlider::valueChanged, this, [this](int v) {
         m_noiseFloor = v;
         m_noiseFloorLabel->setText(QString::number(v));
         pushWorkerParams();
+        updateDiffReadout(true);
     });
     nfLay->addWidget(m_noiseFloorSlider, 1);
     nfLay->addWidget(m_noiseFloorLabel);
@@ -1663,6 +1875,12 @@ QWidget* MainWindow::buildDiffTab()
 
     grid->addWidget(sectionLabel("STRETCH"), 0, 1);
     m_chkStretch = new QCheckBox("Stretch intensity range", this);
+    m_chkStretch->setToolTip("Multiply |D| so that its largest value reaches the top of the colour scale.\n"
+                             "The factor and the resulting scale are shown below and on the image.");
+    connect(m_chkStretch, &QCheckBox::toggled, this, [this]() {
+        updateView();
+        updateDiffReadout(true);
+    });
     grid->addWidget(m_chkStretch, 1, 1);
 
     grid->addWidget(sectionLabel("PEAKS"), 0, 2);
@@ -1674,14 +1892,82 @@ QWidget* MainWindow::buildDiffTab()
     });
     grid->addWidget(m_btnPeakIntensities, 1, 2);
 
+    grid->addWidget(sectionLabel("CHANNEL BALANCE k"), 2, 0);
+    QWidget* kBox = new QWidget(this);
+    QVBoxLayout* kCol = new QVBoxLayout(kBox);
+    kCol->setContentsMargins(0, 0, 0, 0);
+    kCol->setSpacing(4);
+    QHBoxLayout* kLay = new QHBoxLayout();
+    kLay->setContentsMargins(0, 0, 0, 0);
+    kLay->setSpacing(6);
+    m_spnChannelK = new QDoubleSpinBox(this);
+    m_spnChannelK->setRange(0.1, 10.0);
+    m_spnChannelK->setDecimals(4);
+    m_spnChannelK->setSingleStep(0.001);
+    m_spnChannelK->setValue(m_channelK);
+    m_spnChannelK->setKeyboardTracking(false);
+    m_spnChannelK->setFocusPolicy(Qt::StrongFocus);
+    m_spnChannelK->installEventFilter(this);
+    m_spnChannelK->setToolTip("Weight of CAM2 in the difference D = CAM1 − k·CAM2: the radiometric balance of\n"
+                              "the two channels. A calibration constant — set it once with Calibrate k,\n"
+                              "with exposure on MAN, and keep it while the rig and exposure stay the same.\n"
+                              "It is saved at once and restored on the next start; presets do not change it.");
+    connect(m_spnChannelK, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        m_channelK = v;
+        if (!m_kProgrammatic) {
+            KCalibration manual;
+            manual.source = "manual";
+            manual.when = QDateTime::currentDateTime();
+            m_kCal = manual;
+            saveKCalibration();
+            updateKInfo();
+        }
+        updateView();
+        updateDiffReadout(true);
+    });
+    m_btnCalibrateK = new QPushButton("Calibrate k", this);
+    m_btnCalibrateK->setToolTip(QString("Measures k over %1 frames so that CAM1 − k·CAM2 = 0 (median of CAM1 / CAM2)\n"
+                                        "and saves it. Point the rig at an unpolarized, evenly lit scene with the\n"
+                                        "laser off and exposure set as for the measurement. Click again to cancel.")
+                                    .arg(kKCalFrames));
+    connect(m_btnCalibrateK, &QPushButton::clicked, this, &MainWindow::calibrateChannelBalance);
+    kLay->addWidget(m_spnChannelK, 1);
+    kLay->addWidget(m_btnCalibrateK);
+    kCol->addLayout(kLay);
+    m_lblKInfo = new QLabel(this);
+    m_lblKInfo->setWordWrap(true);
+    m_lblKInfo->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    kCol->addWidget(m_lblKInfo);
+    grid->addWidget(kBox, 3, 0);
+
+    grid->addWidget(sectionLabel("CLIP LEVEL"), 2, 1);
+    m_spnClipLevel = new QSpinBox(this);
+    m_spnClipLevel->setRange(128, 255);
+    m_spnClipLevel->setSuffix(" DN");
+    m_spnClipLevel->setValue(m_clipLevel);
+    m_spnClipLevel->setToolTip("Pixels at or above this level count as clipped. Clipped in both\n"
+                               "cameras they are equal by definition, so D = 0 there whatever k is.");
+    connect(m_spnClipLevel, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        m_clipLevel = v;
+        updateView();
+        updateDiffReadout(true);
+    });
+    grid->addWidget(m_spnClipLevel, 3, 1, Qt::AlignTop);
+
     m_lblPeakInfo = new QLabel("", this);
     m_lblPeakInfo->setStyleSheet(QString("color:%1; font-family:'Space Mono',monospace;").arg(T::warn));
-    grid->addWidget(m_lblPeakInfo, 2, 0, 1, 3);
+    grid->addWidget(m_lblPeakInfo, 4, 0, 1, 3);
+
+    m_lblDiffInfo = new QLabel(this);
+    m_lblDiffInfo->setProperty("role", "mono");
+    m_lblDiffInfo->setWordWrap(true);
+    m_lblDiffInfo->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    grid->addWidget(m_lblDiffInfo, 5, 0, 1, 3);
 
     grid->setColumnStretch(0, 1);
     grid->setColumnStretch(1, 1);
     grid->setColumnStretch(2, 1);
-    grid->setRowStretch(3, 1);
+    grid->setRowStretch(6, 1);
     return page;
 }
 
@@ -1847,6 +2133,11 @@ QWidget* MainWindow::buildSnapshotTab()
     m_chkAppendParams->setToolTip("Add active filter values to filename (e.g. _BF5_NF15)");
     saveLay->addWidget(m_chkAppendParams);
 
+    m_chkSeparateFiles = new QCheckBox("Separate files", this);
+    m_chkSeparateFiles->setToolTip("Dual mode: save CAM1 and CAM2 as two files (_cam1 / _cam2)\n"
+                                   "instead of one side-by-side image");
+    saveLay->addWidget(m_chkSeparateFiles);
+
     m_btnConfigParams = new QPushButton("Configure...", this);
     m_btnConfigParams->setProperty("kind", "ghost");
     m_btnConfigParams->setToolTip("Choose which parameters are written into the filename");
@@ -1908,33 +2199,7 @@ QWidget* MainWindow::buildSnapshotTab()
 
     m_snapshotRecent->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_snapshotRecent, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
-        QListWidgetItem* item = m_snapshotRecent->itemAt(pos);
-        if (!item) return;
-        QMenu menu(this);
-        menu.setStyleSheet(styleSheetText());
-        QAction* openAct = menu.addAction("Preview");
-        QAction* renameAct = menu.addAction("Rename");
-        QAction* dltAct = menu.addAction("Delete");
-        QAction* res = menu.exec(m_snapshotRecent->mapToGlobal(pos));
-        if (!res) return;
-        QString dir = QCoreApplication::applicationDirPath() + "/metrics/";
-        QString oldPath = dir + item->text();
-        if (res == openAct) {
-            emit m_snapshotRecent->itemDoubleClicked(item);
-        } else if (res == renameAct) {
-            bool ok;
-            QString newName = QInputDialog::getText(this, "Rename", "New name:", QLineEdit::Normal, item->text(), &ok);
-            if (ok && !newName.isEmpty()) {
-                QString newPath = dir + newName;
-                QFile::rename(oldPath, newPath);
-                refreshSnapshotPreview();
-            }
-        } else if (res == dltAct) {
-            if (QMessageBox::question(this, "Delete", "Delete " + item->text() + "?") == QMessageBox::Yes) {
-                QFile::remove(oldPath);
-                refreshSnapshotPreview();
-            }
-        }
+        showSnapshotMenu(m_snapshotRecent, pos);
     });
 
     root->addStretch(1);
@@ -1949,7 +2214,6 @@ QWidget* MainWindow::buildSettingsTab()
     root->setContentsMargins(14, 14, 14, 14);
     root->setSpacing(10);
 
-    // Left card for Presets save
     QFrame* saveCard = new QFrame(this);
     saveCard->setProperty("role", "card");
     QHBoxLayout* saveLay = new QHBoxLayout(saveCard);
@@ -1962,6 +2226,7 @@ QWidget* MainWindow::buildSettingsTab()
     m_btnSavePreset->setProperty("kind", "primary");
     auto saveNow = [this]() {
         QString name = m_presetNameEdit->text().trimmed();
+        name.replace('/', '-').replace('\\', '-');
         if (name.isEmpty()) name = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
         savePreset(name);
         m_presetNameEdit->clear();
@@ -2002,7 +2267,6 @@ QWidget* MainWindow::buildSettingsTab()
     listBtnCol->addStretch();
     listRow->addLayout(listBtnCol);
 
-    // Right card for Animations
     QFrame* animCard = new QFrame(this);
     animCard->setProperty("role", "card");
     QVBoxLayout* animLay = new QVBoxLayout(animCard);
@@ -2020,12 +2284,12 @@ QWidget* MainWindow::buildSettingsTab()
     speedSlider->setValue(m_animSpeedMs);
     QLabel* speedValLbl = new QLabel(QString("%1 ms").arg(m_animSpeedMs), animCard);
     speedValLbl->setFixedWidth(60);
-    
+
     connect(speedSlider, &QSlider::valueChanged, this, [this, speedValLbl](int val) {
         m_animSpeedMs = val;
         speedValLbl->setText(QString("%1 ms").arg(val));
     });
-    
+
     speedRow->addWidget(speedLbl);
     speedRow->addWidget(speedSlider, 1);
     speedRow->addWidget(speedValLbl);
@@ -2058,7 +2322,6 @@ QWidget* MainWindow::buildSettingsTab()
 
     animLay->addStretch();
 
-    // Side-by-side layout
     QHBoxLayout* mainRow = new QHBoxLayout();
     mainRow->setSpacing(14);
 
@@ -2250,8 +2513,6 @@ void MainWindow::setNavExpanded(bool expanded)
     int startW = sizes[0];
     int endW = expanded ? 200 : 56;
 
-    /* Instant: per-frame splitter animation resizes the GL views every frame
-       (framebuffer recreation = stutter, not motion). */
     Q_UNUSED(startW);
     m_mainSplit->setSizes({ endW, std::max(300, total - endW) });
     applyNavLabels();
@@ -2267,7 +2528,7 @@ void MainWindow::setNavItem(NavItem item)
 
     auto animateBottomStack = [this](bool show) {
         if (!m_bottomStack || !m_workSplit) return;
-        
+
         QList<int> sizes = m_workSplit->sizes();
         if (sizes.size() < 2) {
             m_bottomStack->setVisible(show);
@@ -2288,9 +2549,6 @@ void MainWindow::setNavItem(NavItem item)
             return;
         }
 
-        /* Instant: animating splitter sizes resizes the GL views every frame
-           (framebuffer recreation = stutter). The page fade in m_bottomStack
-           still gives a motion cue. */
         Q_UNUSED(startH);
         m_bottomStack->setVisible(show);
         m_workSplit->setSizes(show ? QList<int>{ totalH - targetH, targetH }
@@ -2369,10 +2627,6 @@ void MainWindow::togglePreviewMode()
         return;
     }
 
-    /* No per-frame splitter animation here: every setSizes() step forces the
-       QOpenGLWidget views to recreate their framebuffers, which reads as a
-       stutter, not as motion. The toggle is instant; the floating buttons'
-       slide provides the motion cue. */
     if (m_previewMode) {
         if (m_sideNav) m_sideNav->hide();
         if (m_bottomStack) m_bottomStack->hide();
@@ -2451,33 +2705,7 @@ QWidget* MainWindow::buildGalleryView()
 
     m_snapshotPreview->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_snapshotPreview, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
-        QListWidgetItem* item = m_snapshotPreview->itemAt(pos);
-        if (!item) return;
-        QMenu menu(this);
-        menu.setStyleSheet(styleSheetText());
-        QAction* openAct = menu.addAction("Preview");
-        QAction* renameAct = menu.addAction("Rename");
-        QAction* dltAct = menu.addAction("Delete");
-        QAction* res = menu.exec(m_snapshotPreview->mapToGlobal(pos));
-        if (!res) return;
-        QString dir = QCoreApplication::applicationDirPath() + "/metrics/";
-        QString oldPath = dir + item->text();
-        if (res == openAct) {
-            emit m_snapshotPreview->itemDoubleClicked(item);
-        } else if (res == renameAct) {
-            bool ok;
-            QString newName = QInputDialog::getText(this, "Rename", "New name:", QLineEdit::Normal, item->text(), &ok);
-            if (ok && !newName.isEmpty()) {
-                QString newPath = dir + newName;
-                QFile::rename(oldPath, newPath);
-                refreshSnapshotPreview();
-            }
-        } else if (res == dltAct) {
-            if (QMessageBox::question(this, "Delete", "Delete " + item->text() + "?") == QMessageBox::Yes) {
-                QFile::remove(oldPath);
-                refreshSnapshotPreview();
-            }
-        }
+        showSnapshotMenu(m_snapshotPreview, pos);
     });
 
     connect(m_snapshotPreview, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
@@ -2490,59 +2718,38 @@ QWidget* MainWindow::buildGalleryView()
     return page;
 }
 
-void MainWindow::recreateGpuViews()
+void MainWindow::showSnapshotMenu(QListWidget* list, const QPoint& pos)
 {
-    if (!m_splitter || !m_videoArea) return;
+    QListWidgetItem* item = list->itemAt(pos);
+    if (!item) return;
+    QMenu menu(this);
+    menu.setStyleSheet(styleSheetText());
+    QAction* openAct = menu.addAction("Preview");
+    QAction* renameAct = menu.addAction("Rename");
+    QAction* dltAct = menu.addAction("Delete");
+    QAction* res = menu.exec(list->mapToGlobal(pos));
+    if (!res) return;
 
-    QList<int> sizes = m_splitter->sizes();
-    int resultIdx = -1;
-    if (QLayout* lay = m_videoArea->layout()) {
-        for (int i = 0; i < lay->count(); ++i) {
-            if (lay->itemAt(i)->widget() == m_resultView) { resultIdx = i; break; }
+    const QString dir = QCoreApplication::applicationDirPath() + "/metrics/";
+    const QFileInfo oldInfo(dir + item->text());
+    if (res == openAct) {
+        emit list->itemDoubleClicked(item);
+    } else if (res == renameAct) {
+        bool ok;
+        QString newName = QInputDialog::getText(this, "Rename", "New name:", QLineEdit::Normal, item->text(), &ok).trimmed();
+        if (!ok || newName.isEmpty() || newName == item->text()) return;
+        if (QFileInfo(newName).suffix().compare(oldInfo.suffix(), Qt::CaseInsensitive) != 0)
+            newName += "." + oldInfo.suffix();
+        if (QFile::exists(dir + newName) || !QFile::rename(oldInfo.filePath(), dir + newName)) {
+            m_statusBar->showMessage("Rename failed: " + newName + " already exists or is not a valid name.", 4000);
+            return;
         }
-    }
-
-    bool resultVisible = m_resultView && m_resultView->isVisible();
-
-    auto* oldView1 = m_view1;
-    auto* oldView2 = m_view2;
-    auto* oldResult = m_resultView;
-
-    auto makeFresh = [this](const QString& placeholder) {
-        GpuImageView* v = new GpuImageView(this);
-        v->setMinimumSize(160, 120);
-        v->setPlaceholder(placeholder);
-        return v;
-    };
-    m_view1     = makeFresh("CAM 1");
-    m_view2     = makeFresh("CAM 2");
-    m_resultView = makeFresh("RESULT");
-
-    m_splitter->insertWidget(0, m_view1);
-    m_splitter->insertWidget(1, m_view2);
-    if (sizes.size() >= 2) m_splitter->setSizes(sizes);
-
-    if (resultIdx >= 0 && m_videoArea->layout()) {
-        QBoxLayout* bl = qobject_cast<QBoxLayout*>(m_videoArea->layout());
-        if (bl) bl->insertWidget(resultIdx, m_resultView, 1);
-    }
-    m_resultView->setVisible(resultVisible);
-
-    if (oldView1)  oldView1->deleteLater();
-    if (oldView2)  oldView2->deleteLater();
-    if (oldResult) oldResult->deleteLater();
-
-    if (m_isDiffMode && !m_lastDiffResult.empty()) {
-        m_resultView->setOverlayColor(QColor(0xff, 0xff, 0xff));
-        m_resultView->setOverlayText("DIFF", false);
-        displayMat(m_resultView, m_lastDiffResult);
-    } else if (!m_frame1.empty() && !m_frame2.empty()) {
-        m_view1->setOverlayColor(QColor(0x4e, 0xc9, 0xb0));
-        m_view1->setOverlayText(QString("CAM1  Focus %1").arg(static_cast<int>(m_lastFocus1)), false);
-        m_view2->setOverlayColor(QColor(0xce, 0x91, 0x78));
-        m_view2->setOverlayText(QString("CAM2  Focus %1").arg(static_cast<int>(m_lastFocus2)), true);
-        displayMat(m_view1, m_frame1);
-        displayMat(m_view2, m_frame2);
+        refreshSnapshotPreview();
+    } else if (res == dltAct) {
+        if (QMessageBox::question(this, "Delete", "Delete " + item->text() + "?") == QMessageBox::Yes) {
+            QFile::remove(oldInfo.filePath());
+            refreshSnapshotPreview();
+        }
     }
 }
 
@@ -2715,33 +2922,6 @@ void MainWindow::launchSurfaceViewer(const cv::Mat& img, QRect roi,
 #endif
 }
 
-void MainWindow::restoreMainViewAfterChildClose()
-{
-    QTimer::singleShot(0, this, [this]() {
-        auto kick = [](QOpenGLWidget* v) {
-            if (!v) return;
-            v->hide();
-            v->show();
-            v->update();
-        };
-        kick(m_view1);
-        kick(m_view2);
-        kick(m_resultView);
-        this->update();
-        this->activateWindow();
-        this->raise();
-
-        QTimer::singleShot(50, this, [this]() {
-            if (m_isDiffMode && !m_lastDiffResult.empty()) {
-                displayMat(m_resultView, m_lastDiffResult);
-            } else if (!m_frame1.empty() && !m_frame2.empty()) {
-                displayMat(m_view1, m_frame1);
-                displayMat(m_view2, m_frame2);
-            }
-        });
-    });
-}
-
 void MainWindow::openPreviewWindow(const QString& imagePath, const QString& fileBase)
 {
     QDialog* dlg = new QDialog(nullptr, Qt::Window);
@@ -2749,10 +2929,6 @@ void MainWindow::openPreviewWindow(const QString& imagePath, const QString& file
     dlg->setWindowTitle("Preview: " + fileBase);
     dlg->setStyleSheet(styleSheetText());
     dlg->resize(this->width() * 2 / 3, this->height() * 2 / 3);
-
-    connect(dlg, &QObject::destroyed, this, [this]() {
-        restoreMainViewAfterChildClose();
-    });
 
     QVBoxLayout* root = new QVBoxLayout(dlg);
     root->setContentsMargins(8, 8, 8, 8);
@@ -2815,7 +2991,14 @@ void MainWindow::openPreviewWindow(const QString& imagePath, const QString& file
     body->setSpacing(8);
     root->addLayout(body, 1);
 
-    cv::Mat raw = cv::imread(imagePath.toStdString(), cv::IMREAD_UNCHANGED);
+    std::vector<uint8_t> jpegBytes;
+    QFile jf(imagePath);
+    if (jf.open(QIODevice::ReadOnly)) {
+        QByteArray ba = jf.readAll();
+        jpegBytes.assign(reinterpret_cast<const uint8_t*>(ba.constData()),
+                         reinterpret_cast<const uint8_t*>(ba.constData()) + ba.size());
+    }
+    cv::Mat raw = jpegBytes.empty() ? cv::Mat() : cv::imdecode(jpegBytes, cv::IMREAD_UNCHANGED);
     if (raw.empty()) {
         body->addWidget(new QLabel("Failed to load image."));
     }
@@ -2880,13 +3063,6 @@ void MainWindow::openPreviewWindow(const QString& imagePath, const QString& file
     metaList->setTextElideMode(Qt::ElideRight);
     metaLay->addWidget(metaList, 1);
 
-    std::vector<uint8_t> jpegBytes;
-    QFile jf(imagePath);
-    if (jf.open(QIODevice::ReadOnly)) {
-        QByteArray ba = jf.readAll();
-        jpegBytes.assign(reinterpret_cast<const uint8_t*>(ba.constData()),
-                         reinterpret_cast<const uint8_t*>(ba.constData()) + ba.size());
-    }
     std::string desc = readExifDescription(jpegBytes);
     QJsonDocument jdoc = desc.empty()
         ? QJsonDocument()
@@ -2899,7 +3075,16 @@ void MainWindow::openPreviewWindow(const QString& imagePath, const QString& file
                     const QString full = prefix.isEmpty() ? key : (prefix + "." + key);
                     QString line;
                     if (v.isObject()) { emitObj(v.toObject(), full); continue; }
-                    else if (v.isArray())  line = full + ": [array]";
+                    else if (v.isArray()) {
+                        const QJsonArray arr = v.toArray();
+                        bool numeric = arr.size() <= 64;
+                        QStringList parts;
+                        for (const QJsonValue& e : arr) {
+                            if (!e.isDouble()) { numeric = false; break; }
+                            parts << QString::number(e.toDouble(), 'g', 6);
+                        }
+                        line = full + ": " + (numeric ? "[" + parts.join(", ") + "]" : QString("[array]"));
+                    }
                     else if (v.isString()) line = full + ": " + v.toString();
                     else if (v.isBool())   line = full + ": " + (v.toBool() ? "true" : "false");
                     else if (v.isDouble()) {
@@ -2948,8 +3133,6 @@ void MainWindow::animateDialogEntry(QDialog* dlg, QWidget* triggerWidget, int du
     QWidget* parent = dlg->parentWidget();
     if (!parent) parent = QApplication::activeWindow();
 
-    /* Respect an explicit resize() (WA_Resized): sizeHint() of chart/3D
-       dialogs is near-minimal and was shrinking them to a tiny square. */
     QSize targetSize = dlg->testAttribute(Qt::WA_Resized) ? dlg->size()
                                                           : dlg->sizeHint();
     if (targetSize.width() < 100 || targetSize.height() < 100) {
@@ -2971,9 +3154,6 @@ void MainWindow::animateDialogEntry(QDialog* dlg, QWidget* triggerWidget, int du
         startPos = QCursor::pos();
     }
 
-    /* Fixed final size + windowOpacity fade + short slide toward the cursor.
-       Animating geometry growth forces a native resize/relayout every frame
-       (the old "micro-lag"); windowOpacity is composited by DWM for free. */
     QPoint dir = startPos - targetGeo.center();
     const int len = qMax(1, int(std::sqrt(double(dir.x() * dir.x() + dir.y() * dir.y()))));
     QPoint offset(dir.x() * 18 / len, dir.y() * 18 / len);
@@ -3005,13 +3185,20 @@ void MainWindow::animateDialogEntry(QDialog* dlg, QWidget* triggerWidget, int du
     group->start(QAbstractAnimation::DeleteWhenStopped);
 }
 
+int MainWindow::execDialog(QDialog* dlg, QWidget* triggerWidget)
+{
+
+    dlg->setWindowModality(Qt::ApplicationModal);
+    if (m_animDialogsEnabled) animateDialogEntry(dlg, triggerWidget, m_animSpeedMs);
+    return dlg->exec();
+}
+
 void MainWindow::buildAlignDialog()
 {
     m_alignDialog = new QDialog(this);
     m_alignDialog->setWindowTitle("Manual Align (6 DOF)");
     m_alignDialog->setModal(false);
     m_alignDialog->resize(620, 460);
-
 
     m_alignDialog->setStyleSheet(styleSheetText() + QString(R"(
         QDialog QLabel { font-size: 12px; font-weight: 600; }
@@ -3103,16 +3290,11 @@ void MainWindow::positionFloatingButtons(bool animate)
     const int pad = 10;
     const bool camerasHidden = (m_currentNav == NavItem::Gallery);
 
-    /* NOTE: no QGraphicsOpacityEffect here. Opacity effects on widgets that
-       overlap QOpenGLWidget siblings rasterize through the backing store and
-       produce black rectangles + CPU jank. FABs animate with position only. */
     auto animateButton = [this, animate](QWidget* btn, bool show, const QPoint& targetPos) {
         if (!btn) return;
 
         if (btn->graphicsEffect()) btn->setGraphicsEffect(nullptr);
 
-        /* A running slide keeps writing stale coordinates and would override
-           any repositioning that happens during it (e.g. startup layout). */
         const auto running = btn->findChildren<QPropertyAnimation*>();
         for (QPropertyAnimation* a : running) a->stop();
 
@@ -3177,8 +3359,18 @@ void MainWindow::positionFloatingButtons(bool animate)
         animateButton(m_btnFabSnapshot, !camerasHidden, target);
     }
     if (m_btnFloatingPreviewToggle) {
-        /* Top-left corner — where the hidden sidebar "used to be". */
+
         animateButton(m_btnFloatingPreviewToggle, m_previewMode, QPoint(pad, pad));
+    }
+    if (m_resHud) {
+
+        const bool show = m_resHudVisible && !camerasHidden;
+        if (show) {
+            m_resHud->adjustSize();
+            m_resHud->move(w - pad - m_resHud->width(), 40);
+            m_resHud->raise();
+        }
+        m_resHud->setVisible(show);
     }
 }
 
@@ -3201,11 +3393,16 @@ void MainWindow::setDiffMode(bool on)
     }
     if (!on && m_lblPeakInfo) m_lblPeakInfo->clear();
     updateView();
+    updateDiffReadout(true);
 }
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
     saveSettings();
+
+    for (QWidget* w : QApplication::topLevelWidgets()) {
+        if (w != this && w->isVisible()) w->close();
+    }
     QMainWindow::closeEvent(event);
 }
 
@@ -3237,6 +3434,7 @@ void MainWindow::resizeEvent(QResizeEvent* event)
     const bool compact = w < 720;
     const bool ultraCompact = w < 560;
 
+    if (m_resPill) m_resPill->setVisible(!ultraCompact);
     if (m_fpsPill) m_fpsPill->setVisible(!ultraCompact);
     if (m_eccPill) m_eccPill->setVisible(!ultraCompact);
 
@@ -3261,26 +3459,40 @@ void MainWindow::refreshSnapshotPreview()
     if (!metricsDir.exists()) {
         if (m_snapshotPreview) m_snapshotPreview->clear();
         if (m_snapshotRecent)  m_snapshotRecent->clear();
+        m_thumbnails.clear();
         return;
     }
 
     QStringList filters = {"*.png", "*.jpg", "*.jpeg", "*.bmp"};
     QFileInfoList files = metricsDir.entryInfoList(filters, QDir::Files, QDir::Time);
 
-    auto fillList = [](QListWidget* lw, const QFileInfoList& src, int maxItems,
-                       const QSize& thumbSize) {
+    const QSize thumbMax(180, 130);
+    QHash<QString, Thumbnail> current;
+    auto thumbnailFor = [this, &current, thumbMax](const QFileInfo& fi) -> QPixmap {
+        const QString path = fi.absoluteFilePath();
+        const auto seen = current.constFind(path);
+        if (seen != current.constEnd()) return seen->pixmap;
+        Thumbnail t = m_thumbnails.value(path);
+        if (t.pixmap.isNull() || t.modified != fi.lastModified() || t.size != fi.size()) {
+            QImageReader reader(path);
+            const QSize full = reader.size();
+            if (full.isValid()) reader.setScaledSize(full.scaled(thumbMax, Qt::KeepAspectRatio));
+            const QImage img = reader.read();
+            t = Thumbnail{ fi.lastModified(), fi.size(), img.isNull() ? QPixmap() : QPixmap::fromImage(img) };
+        }
+        current.insert(path, t);
+        return t.pixmap;
+    };
+
+    auto fillList = [&thumbnailFor](QListWidget* lw, const QFileInfoList& src, int maxItems,
+                                    const QSize& thumbSize) {
         if (!lw) return;
         lw->clear();
         const QSize grid = lw->gridSize();
         int n = 0;
         for (const QFileInfo& fi : src) {
             if (maxItems > 0 && n >= maxItems) break;
-            cv::Mat raw = cv::imread(fi.absoluteFilePath().toStdString(), cv::IMREAD_COLOR);
-            if (raw.empty()) continue;
-            cv::Mat rgb;
-            cv::cvtColor(raw, rgb, cv::COLOR_BGR2RGB);
-            QImage qimg(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
-            QPixmap pix = QPixmap::fromImage(qimg.copy());
+            const QPixmap pix = thumbnailFor(fi);
             if (pix.isNull()) continue;
             QListWidgetItem* item = new QListWidgetItem(
                 QIcon(pix.scaled(thumbSize, Qt::KeepAspectRatio, Qt::SmoothTransformation)),
@@ -3295,6 +3507,7 @@ void MainWindow::refreshSnapshotPreview()
 
     fillList(m_snapshotPreview, files, 0,  QSize(180, 130));
     fillList(m_snapshotRecent,  files, 5,  QSize(110, 80));
+    m_thumbnails.swap(current);
 }
 
 void MainWindow::updateEccPill()
@@ -3320,47 +3533,221 @@ void MainWindow::updateFpsPill()
         setPillState(m_fpsPill, "ok", "STREAMING");
     } else {
         setPillState(m_fpsPill, "idle", "IDLE");
+        m_fpsPill->setToolTip(QString());
+    }
+}
+
+void MainWindow::toggleResourceHud()
+{
+    m_resHudVisible = !m_resHudVisible;
+    if (m_resHudVisible && m_resMonitor) updateResourceDisplay(m_resMonitor->last());
+    positionFloatingButtons(false);
+}
+
+QString MainWindow::formatResourceStats(const ResourceStats& st) const
+{
+    auto pct = [](double v) { return QString("%1%").arg(qRound(v), 3); };
+    QStringList lines;
+    if (st.cpuTotal >= 0) {
+        QString l = "CPU    " + pct(st.cpuTotal);
+        if (!st.cpuCores.isEmpty()) {
+            QStringList cores;
+            for (double c : st.cpuCores) cores << QString("%1").arg(qRound(c), 3);
+            l += "   cores" + cores.join(QString());
+        }
+        lines << l;
+    }
+    if (st.appCpu >= 0) {
+        QString l = "APP    " + pct(st.appCpu);
+        if (st.guiThreadCpu >= 0)    l += QString("   GUI %1%").arg(qRound(st.guiThreadCpu));
+        if (st.workerThreadCpu >= 0) l += QString("  CAM %1%").arg(qRound(st.workerThreadCpu));
+        lines << l;
+    }
+    if (st.tempC >= 0 || st.armMHz > 0) {
+        QString l = "TEMP  ";
+        l += st.tempC >= 0 ? QString("%1\u00B0C").arg(st.tempC, 5, 'f', 1) : QString("  n/a");
+        if (st.armMHz > 0) {
+            l += QString("   ARM %1").arg(st.armMHz);
+            if (st.armMaxMHz > 0) l += QString("/%1").arg(st.armMaxMHz);
+            l += " MHz";
+        }
+        if (st.fanRpm >= 0) l += QString("   FAN %1 rpm").arg(st.fanRpm);
+        lines << l;
+    }
+    if (st.throttleFlags >= 0) {
+        lines << "THROT  now: " + ResourceMonitor::throttleText(st.throttleFlags, false)
+                 + "   since boot: " + ResourceMonitor::throttleText(st.throttleFlags, true);
+    }
+    if (st.memTotalMB > 0) {
+        QString l = QString("RAM   %1/%2 GB").arg(st.memUsedMB / 1024.0, 0, 'f', 1)
+                                          .arg(st.memTotalMB / 1024.0, 0, 'f', 1);
+        if (st.appRssMB >= 0) l += QString("   APP %1 MB").arg(st.appRssMB);
+        lines << l;
+    }
+    if (st.processedFps >= 0) {
+        lines << QString("FPS   camera %1   shown %2   dropped %3")
+                     .arg(st.processedFps, 0, 'f', 1)
+                     .arg(st.displayedFps, 0, 'f', 1)
+                     .arg(st.droppedFps, 0, 'f', 1);
+    } else {
+        lines << "FPS   cameras stopped";
+    }
+    return lines.join('\n');
+}
+
+void MainWindow::updateResourceDisplay(const ResourceStats& st)
+{
+    if (m_resPill) {
+        const unsigned now = st.throttleFlags >= 0
+            ? unsigned(st.throttleFlags) & PiThrottle::NowMask : 0u;
+        const char* state = "ok";
+        if ((now & (PiThrottle::ThrottledNow | PiThrottle::UnderVoltageNow)) || st.tempC >= 80.0)
+            state = "err";
+        else if (now || st.tempC >= 70.0 || st.cpuTotal >= 90.0)
+            state = "warn";
+
+        QString text = st.cpuTotal >= 0 ? QString("CPU %1%").arg(qRound(st.cpuTotal), 3)
+                                        : QString("CPU  --");
+        if (st.tempC >= 0) text += QString(" \u00B7 %1\u00B0C").arg(qRound(st.tempC));
+        if (now & (PiThrottle::ThrottledNow | PiThrottle::FreqCappedNow)) text += " \u00B7 THR";
+        else if (now & PiThrottle::UnderVoltageNow) text += " \u00B7 LOW V";
+        setPillState(m_resPill, state, text);
+        m_resPill->setToolTip(formatResourceStats(st)
+                              + "\n\nAPP/GUI/CAM are % of one core (4 cores = 400%)."
+                                "\nClick to toggle the overlay.");
+    }
+
+    if (m_fpsPill && m_camerasOpen && st.processedFps >= 0) {
+        const bool behind = m_requestedFps > 0 && st.processedFps < 0.9 * m_requestedFps;
+        setPillState(m_fpsPill, behind ? "warn" : "ok",
+                     QString("STREAMING %1 FPS").arg(qRound(st.processedFps), 2));
+        m_fpsPill->setToolTip(QString("Camera %1 fps (requested %2), shown %3 fps, dropped %4 fps")
+                                  .arg(st.processedFps, 0, 'f', 1).arg(m_requestedFps)
+                                  .arg(st.displayedFps, 0, 'f', 1).arg(st.droppedFps, 0, 'f', 1));
+    }
+
+    if (m_resHud && m_resHudVisible && m_resHudText) {
+        const QString text = formatResourceStats(st);
+        if (m_resHudText->text() != text) {
+            m_resHudText->setText(text);
+            positionFloatingButtons(false);
+        }
     }
 }
 
 void MainWindow::refreshCameraModes()
 {
     m_comboCamSet->clear();
-    m_comboCamSet->addItem("640x480 @ 30 FPS", QVariantList{640, 480, 30});
-    m_comboCamSet->addItem("640x480 @ 60 FPS", QVariantList{640, 480, 60});
-    m_comboCamSet->addItem("1280x720 @ 30 FPS", QVariantList{1280, 720, 30});
-    m_comboCamSet->addItem("1280x720 @ 60 FPS", QVariantList{1280, 720, 60});
-    m_comboCamSet->addItem("1920x1080 @ 30 FPS", QVariantList{1920, 1080, 30});
-    m_comboCamSet->addItem("1920x1080 @ 60 FPS", QVariantList{1920, 1080, 60});
+
+    struct Preset { int w, h, fps; };
+    static const Preset kPresets[] = {
+        {640, 480, 30}, {640, 480, 60}, {1280, 720, 30}, {1280, 720, 60},
+        {1920, 1080, 30}, {1920, 1080, 60},
+    };
+    const QSize native = sensorNativeSize();
+    for (const Preset& p : kPresets) {
+        if (native.isValid() && (p.w > native.width() || p.h > native.height()
+                                 || p.fps > sensorMaxFps(p.w, p.h)))
+            continue;
+        m_comboCamSet->addItem(QString("%1x%2 @ %3 FPS").arg(p.w).arg(p.h).arg(p.fps),
+                               QVariantList{p.w, p.h, p.fps});
+    }
+    if (native.isValid()) {
+        const int maxFps = static_cast<int>(sensorMaxFps(native.width(), native.height()));
+        QList<int> rates;
+        if (maxFps > 30) rates << 30;
+        if (maxFps > 0) rates << maxFps;
+        for (int fps : rates) {
+            m_comboCamSet->addItem(QString("%1x%2 @ %3 FPS (native)")
+                                       .arg(native.width()).arg(native.height()).arg(fps),
+                                   QVariantList{native.width(), native.height(), fps});
+        }
+    }
     m_comboCamSet->addItem("Custom...", QVariantList{0, 0, 0});
+}
+
+void MainWindow::probeCameras()
+{
+    m_libCameraIds.clear();
+    m_sensorModes.clear();
+
+    QProcess process;
+    process.start("rpicam-hello", QStringList() << "--list-cameras");
+    if (!process.waitForFinished(5000) || process.exitCode() != 0) {
+        process.start("libcamera-hello", QStringList() << "--list-cameras");
+        process.waitForFinished(5000);
+    }
+    const QString output = QString::fromLocal8Bit(process.readAllStandardOutput());
+
+    static const QRegularExpression headerRe(R"(^\s*\d+\s*:.*\((/base/[^)]+)\))");
+    static const QRegularExpression modeRe(R"((\d+)x(\d+)\s*\[([\d.]+)\s*fps)");
+    for (const QString& line : output.split('\n')) {
+        const QRegularExpressionMatch h = headerRe.match(line);
+        if (h.hasMatch()) {
+            m_libCameraIds << h.captured(1);
+            m_sensorModes.emplace_back();
+            continue;
+        }
+        if (m_sensorModes.empty()) continue;
+        QRegularExpressionMatchIterator it = modeRe.globalMatch(line);
+        while (it.hasNext()) {
+            const QRegularExpressionMatch m = it.next();
+            m_sensorModes.back().push_back({m.captured(1).toInt(), m.captured(2).toInt(),
+                                            m.captured(3).toDouble()});
+        }
+    }
 }
 
 QStringList MainWindow::getLibCameraIds()
 {
-    QStringList cameraPaths;
-    QProcess process;
+    if (m_libCameraIds.size() < 2) probeCameras();
+    return m_libCameraIds;
+}
 
-    QString program = "rpicam-hello";
-    process.start(program, QStringList() << "--list-cameras");
-    if (!process.waitForFinished() || process.exitCode() != 0) {
-        program = "libcamera-hello";
-        process.start(program, QStringList() << "--list-cameras");
-        process.waitForFinished();
+QSize MainWindow::sensorNativeSize() const
+{
+    QSize common;
+    const size_t n = std::min<size_t>(2, m_sensorModes.size());
+    for (size_t c = 0; c < n; ++c) {
+        QSize best;
+        for (const SensorMode& m : m_sensorModes[c])
+            if (m.width * m.height > best.width() * best.height()) best = QSize(m.width, m.height);
+        if (!best.isValid()) return QSize();
+        common = common.isValid() ? common.boundedTo(best) : best;
     }
+    return common;
+}
 
-    QString output = process.readAllStandardOutput();
-
-    QRegularExpression re("\\((/base/[^)]+)\\)");
-    QRegularExpressionMatchIterator i = re.globalMatch(output);
-
-    while (i.hasNext()) {
-        QRegularExpressionMatch match = i.next();
-        if (match.hasMatch()) {
-            cameraPaths << match.captured(1);
-        }
+double MainWindow::sensorMaxFps(int width, int height) const
+{
+    double overall = -1.0;
+    const size_t n = std::min<size_t>(2, m_sensorModes.size());
+    for (size_t c = 0; c < n; ++c) {
+        double best = 0.0;
+        for (const SensorMode& m : m_sensorModes[c])
+            if (m.width >= width && m.height >= height) best = std::max(best, m.fps);
+        overall = overall < 0 ? best : std::min(overall, best);
     }
+    return std::max(0.0, overall);
+}
 
-    return cameraPaths;
+bool MainWindow::fitToSensor(int& width, int& height, int& fps) const
+{
+    const QSize native = sensorNativeSize();
+    if (!native.isValid() || width <= 0 || height <= 0) return false;
+    bool changed = false;
+    if (width > native.width() || height > native.height()) {
+        const double k = std::min(double(native.width()) / width, double(native.height()) / height);
+        width  = std::max(2, int(width * k) & ~1);
+        height = std::max(2, int(height * k) & ~1);
+        changed = true;
+    }
+    const int maxFps = static_cast<int>(sensorMaxFps(width, height));
+    if (maxFps > 0 && fps > maxFps) {
+        fps = maxFps;
+        changed = true;
+    }
+    return changed;
 }
 
 std::string MainWindow::makeGStreamerPipeline(const QString& cameraId, int width, int height, int fps, int camIndex)
@@ -3379,10 +3766,8 @@ std::string MainWindow::makeGStreamerPipeline(const QString& cameraId, int width
     }
 
     return QString("libcamerasrc camera-name=%1%5 ! "
-        "video/x-raw, width=%2, height=%3, framerate=%4/1, format=NV12 ! "
-        "videoconvert ! "
-        "video/x-raw, format=(string)BGR ! "
-        "appsink drop=1 sync=false")
+        "video/x-raw, width=%2, height=%3, framerate=%4/1, format=BGR ! "
+        "appsink drop=1 max-buffers=1 sync=false")
         .arg(cameraId)
         .arg(width)
         .arg(height)
@@ -3394,11 +3779,42 @@ std::string MainWindow::makeGStreamerPipeline(const QString& cameraId, int width
 void MainWindow::applyExposureControls()
 {
 
-    if (m_camerasOpen) {
-        m_statusBar->showMessage("Restarting cameras to apply exposure...", 2000);
-        closeCameras();
-        openCameras();
+    if (!m_camerasOpen) return;
+    if (!m_libcameraSession) {
+        m_statusBar->showMessage("Manual gain / shutter apply to libcamera (CSI) cameras only; "
+                                 "these cameras keep their own exposure.", 5000);
+        return;
     }
+    if (!m_exposureRestartTimer) {
+        m_exposureRestartTimer = new QTimer(this);
+        m_exposureRestartTimer->setSingleShot(true);
+        m_exposureRestartTimer->setInterval(400);
+        connect(m_exposureRestartTimer, &QTimer::timeout, this, [this]() {
+            if (!m_camerasOpen) return;
+            if (m_cameraTransition) {
+                m_exposureRestartTimer->start();
+                return;
+            }
+            m_statusBar->showMessage("Restarting cameras to apply exposure...", 2000);
+            cameraTransition([this]() {
+                closeCameras();
+                openCameras();
+            });
+        });
+    }
+    m_exposureRestartTimer->start();
+}
+
+void MainWindow::cameraTransition(const std::function<void()>& fn)
+{
+
+    if (m_cameraTransition) return;
+    m_cameraTransition = true;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    fn();
+    QApplication::restoreOverrideCursor();
+    QApplication::processEvents();
+    m_cameraTransition = false;
 }
 
 void MainWindow::openCameras()
@@ -3416,8 +3832,18 @@ void MainWindow::openCameras()
         }
     }
 
+    {
+        const int askW = reqW, askH = reqH, askFps = reqFps;
+        if (fitToSensor(reqW, reqH, reqFps)) {
+            m_statusBar->showMessage(QString("%1x%2 @ %3 exceeds the sensor; using %4x%5 @ %6.")
+                .arg(askW).arg(askH).arg(askFps).arg(reqW).arg(reqH).arg(reqFps), 5000);
+        }
+    }
+
+    bool started = false;
     QStringList camPaths = getLibCameraIds();
-    if (camPaths.size() < 2) {
+    const bool libcamera = camPaths.size() >= 2;
+    if (!libcamera) {
         m_statusBar->showMessage("Warning: < 2 libcameras found. Attempting fallback.", 3000);
         int c1 = -1, c2 = -1;
         for (int i = 0; i < 10; ++i) {
@@ -3433,7 +3859,7 @@ void MainWindow::openCameras()
             }
         }
         if (c1 != -1 && c2 != -1) {
-            m_worker->startCamerasV4L2(c1, c2, reqW, reqH, reqFps);
+            started = m_worker->startCamerasV4L2(c1, c2, reqW, reqH, reqFps);
         } else {
             m_statusBar->showMessage("Error: Could not find two fallback cameras.", 3000);
             return;
@@ -3441,12 +3867,16 @@ void MainWindow::openCameras()
     } else {
         std::string p1 = makeGStreamerPipeline(camPaths[0], reqW, reqH, reqFps, 0);
         std::string p2 = makeGStreamerPipeline(camPaths[1], reqW, reqH, reqFps, 1);
-        m_worker->startCameras(p1, p2, reqW, reqH, reqFps);
+        started = m_worker->startCameras(p1, p2, reqW, reqH, reqFps);
+        if (!started) m_libCameraIds.clear();
+    }
+    if (!started) {
+        return;
     }
 
     m_camerasOpen = true;
-    m_isAligned = false;
-    m_eccWarpMatrix.release();
+    m_requestedFps = reqFps;
+    m_libcameraSession = libcamera;
 
     if (m_comboCamSet) m_comboCamSet->setEnabled(false);
 
@@ -3479,6 +3909,7 @@ void MainWindow::openCameras()
     m_btnFabStream->setObjectName("fabStreamStop");
     m_btnFabStream->style()->unpolish(m_btnFabStream);
     m_btnFabStream->style()->polish(m_btnFabStream);
+    updateDiffReadout(true);
 
     m_statusBar->showMessage("Cameras OK. Noise suppression active.", 4000);
 }
@@ -3487,6 +3918,7 @@ void MainWindow::closeCameras()
 {
     m_worker->stopCameras();
     m_camerasOpen = false;
+    if (m_kCalTarget > 0) stopKCalibration("Calibrate k: stopped, cameras closed. k unchanged.");
 
     if (m_comboCamSet) m_comboCamSet->setEnabled(true);
 
@@ -3519,6 +3951,7 @@ void MainWindow::closeCameras()
     }
     updateEccPill();
     updateFpsPill();
+    updateDiffReadout(true);
 
     m_statusBar->showMessage("Cameras closed.", 2000);
 }
@@ -3530,12 +3963,39 @@ cv::Mat MainWindow::fuseCameras(const cv::Mat& a, const cv::Mat& b)
     return out;
 }
 
-cv::Mat MainWindow::applyDiffView(const cv::Mat& d1, const cv::Mat& d2)
+static const std::array<cv::Vec3b, 256>& jetLut()
 {
-    cv::Mat diff;
+    static const std::array<cv::Vec3b, 256> lut = [] {
+        cv::Mat index(1, 256, CV_8U);
+        for (int i = 0; i < 256; ++i) index.at<uchar>(0, i) = static_cast<uchar>(i);
+        cv::Mat bgr;
+        cv::applyColorMap(index, bgr, cv::COLORMAP_JET);
+        std::array<cv::Vec3b, 256> table;
+        for (int i = 0; i < 256; ++i) table[i] = bgr.at<cv::Vec3b>(0, i);
+        return table;
+    }();
+    return lut;
+}
 
-    cv::Mat a = d1, b = d2;
-    if (b.size() != a.size()) cv::resize(b, b, a.size());
+static QImage diffScaleRamp()
+{
+    const auto& lut = jetLut();
+    QImage ramp(1, 256, QImage::Format_RGB32);
+    for (int i = 0; i < 256; ++i) {
+        const cv::Vec3b c = lut[255 - i];
+        ramp.setPixel(0, i, qRgb(c[2], c[1], c[0]));
+    }
+    return ramp;
+}
+
+cv::Mat MainWindow::applyDiffView(const cv::Mat& d1, const cv::Mat& d2,
+                                  const cv::Mat& valid1, const cv::Mat& valid2)
+{
+    cv::Mat a = d1, b = d2, vb = valid2;
+    if (b.size() != a.size()) {
+        cv::resize(b, b, a.size());
+        if (!vb.empty()) cv::resize(vb, vb, a.size(), 0, 0, cv::INTER_NEAREST);
+    }
 
     cv::Mat ga, gb;
     if (a.channels() == 3) cv::cvtColor(a, ga, cv::COLOR_BGR2GRAY);
@@ -3543,9 +4003,16 @@ cv::Mat MainWindow::applyDiffView(const cv::Mat& d1, const cv::Mat& d2)
     if (b.channels() == 3) cv::cvtColor(b, gb, cv::COLOR_BGR2GRAY);
     else gb = b;
 
+    DiffStats st;
+    st.valid = true;
+    st.k = m_channelK;
+    st.noiseFloor = m_noiseFloor;
+    st.clipLevel = m_clipLevel;
+
     const double f1 = m_lastFocus1;
-    const double f2 = m_lastFocus2;
+    const double f2 = m_lastFocus2 * m_channelK * m_channelK;
     if (f1 > 1.0 && f2 > 1.0) {
+        st.sharpRatio = f1 / f2;
         const double ratio = (f1 > f2) ? (f1 / f2) : (f2 / f1);
         if (ratio > 1.15) {
             const double sigma = std::min(6.0, 0.6 * std::sqrt(ratio - 1.0));
@@ -3554,30 +4021,354 @@ cv::Mat MainWindow::applyDiffView(const cv::Mat& d1, const cv::Mat& d2)
             if (k > 31) k = 31;
             if (f1 > f2) cv::GaussianBlur(ga, ga, cv::Size(k, k), sigma);
             else         cv::GaussianBlur(gb, gb, cv::Size(k, k), sigma);
+            st.psfChannel = (f1 > f2) ? 1 : 2;
+            st.psfSigma = sigma;
         }
     }
 
-    cv::absdiff(ga, gb, diff);
+    cv::Mat valid;
+    if (!valid1.empty() && !vb.empty()) cv::bitwise_and(valid1, vb, valid);
+    else if (!valid1.empty()) valid = valid1;
+    else if (!vb.empty()) valid = vb;
 
-    if (m_noiseFloor > 0) {
-        cv::threshold(diff, diff, m_noiseFloor, 255, cv::THRESH_TOZERO);
+    const int rows = ga.rows, cols = ga.cols;
+    cv::Mat d(ga.size(), CV_16S);
+    std::vector<int> rowMax(rows, 0), rowBoth(rows, 0), rowOne(rows, 0), rowInside(rows, 0);
+    const float k = static_cast<float>(m_channelK);
+    const int noiseFloor = m_noiseFloor, clip = m_clipLevel;
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const uchar* pa = ga.ptr<uchar>(y);
+            const uchar* pb = gb.ptr<uchar>(y);
+            const uchar* pv = valid.empty() ? nullptr : valid.ptr<uchar>(y);
+            short* pd = d.ptr<short>(y);
+            int maxAbs = 0, both = 0, one = 0, inside = 0;
+            for (int x = 0; x < cols; ++x) {
+                if (pv && !pv[x]) { pd[x] = 0; continue; }
+                ++inside;
+                const bool c1 = pa[x] >= clip, c2 = pb[x] >= clip;
+                int v = cvRound(pa[x] - k * pb[x]);
+                if (std::abs(v) <= noiseFloor || (c1 && c2)) v = 0;
+                pd[x] = static_cast<short>(v);
+                if (c1 && c2) ++both;
+                else if (c1 || c2) ++one;
+                maxAbs = std::max(maxAbs, std::abs(v));
+            }
+            rowMax[y] = maxAbs;
+            rowBoth[y] = both;
+            rowOne[y] = one;
+            rowInside[y] = inside;
+        }
+    });
+    long long both = 0, one = 0, inside = 0;
+    for (int y = 0; y < rows; ++y) {
+        st.maxValue = std::max(st.maxValue, static_cast<double>(rowMax[y]));
+        both += rowBoth[y];
+        one += rowOne[y];
+        inside += rowInside[y];
+    }
+    const double total = static_cast<double>(rows) * cols;
+    st.noData = total > 0.0 ? 1.0 - inside / total : 0.0;
+    if (inside > 0) {
+        st.clippedBoth = static_cast<double>(both) / inside;
+        st.clippedOne = static_cast<double>(one) / inside;
     }
 
-    if (m_chkStretch && m_chkStretch->isChecked()) {
-        cv::normalize(diff, diff, 0, 255, cv::NORM_MINMAX);
+    const bool stretch = m_chkStretch && m_chkStretch->isChecked();
+    st.gain = (stretch && st.maxValue > 0.0) ? 255.0 / st.maxValue : 1.0;
+    st.fullScale = 255.0 / st.gain;
+    const auto& lut = jetLut();
+    const float gain = static_cast<float>(st.gain);
+    cv::Mat color(ga.size(), CV_8UC3);
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const short* pd = d.ptr<short>(y);
+            cv::Vec3b* pc = color.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < cols; ++x)
+                pc[x] = lut[std::min(255, cvRound(std::abs(pd[x]) * gain))];
+        }
+    });
+
+    m_diffStats = st;
+    m_lastDiffA = ga;
+    m_lastDiffB = gb;
+    m_lastDiffValid = valid;
+    return color;
+}
+
+struct ChannelRatio {
+    double k = 0.0;
+    double spread = 0.0;
+    int pixels = 0;
+};
+
+static ChannelRatio channelRatio(const cv::Mat& a, const cv::Mat& b, const cv::Mat& valid, int clip)
+{
+    std::vector<float> ratios;
+    ratios.reserve(a.total() / 4 + 1);
+    for (int y = 0; y < a.rows; y += 2) {
+        const uchar* pa = a.ptr<uchar>(y);
+        const uchar* pb = b.ptr<uchar>(y);
+        const uchar* pv = valid.empty() ? nullptr : valid.ptr<uchar>(y);
+        for (int x = 0; x < a.cols; x += 2) {
+            if (pv && !pv[x]) continue;
+            if (pa[x] < kKCalMinLevel || pb[x] < kKCalMinLevel) continue;
+            if (pa[x] >= clip || pb[x] >= clip) continue;
+            ratios.push_back(static_cast<float>(pa[x]) / static_cast<float>(pb[x]));
+        }
+    }
+    ChannelRatio r;
+    r.pixels = static_cast<int>(ratios.size());
+    if (r.pixels < kKCalMinPixels) return r;
+    auto quantile = [&ratios](double q) {
+        const size_t i = std::min(ratios.size() - 1, static_cast<size_t>(q * static_cast<double>(ratios.size())));
+        std::nth_element(ratios.begin(), ratios.begin() + static_cast<std::ptrdiff_t>(i), ratios.end());
+        return static_cast<double>(ratios[i]);
+    };
+    r.k = quantile(0.5);
+    const double q1 = quantile(0.25), q3 = quantile(0.75);
+    r.spread = (q3 - q1) / (2.0 * r.k);
+    return r;
+}
+
+template <typename V>
+static V medianOf(std::vector<V> v)
+{
+    const size_t i = v.size() / 2;
+    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(i), v.end());
+    return v[i];
+}
+
+void MainWindow::calibrateChannelBalance()
+{
+    if (m_kCalTarget > 0) {
+        stopKCalibration("Calibrate k: cancelled, k unchanged.");
+        return;
+    }
+    if (!m_camerasOpen || m_frame1.empty() || m_frame2.empty()) {
+        m_statusBar->showMessage("Calibrate k: open the cameras first.", 3000);
+        return;
+    }
+    if (!m_isDiffMode) setDiffMode(true);
+    m_kCalSamples.clear();
+    m_kCalPixels.clear();
+    m_kCalSpreads.clear();
+    m_kCalTarget = kKCalFrames;
+    m_btnCalibrateK->setText(QString("Cancel 0/%1").arg(kKCalFrames));
+    m_statusBar->showMessage("Calibrate k: measuring, keep the scene and the rig still.");
+}
+
+void MainWindow::collectKSample()
+{
+    if (m_kCalTarget <= 0) return;
+    if (!m_isDiffMode || m_lastDiffA.empty() || m_lastDiffB.empty()) {
+        stopKCalibration("Calibrate k: stopped, the Diff view was left. k unchanged.");
+        return;
+    }
+    const ChannelRatio r = channelRatio(m_lastDiffA, m_lastDiffB, m_lastDiffValid, m_clipLevel);
+    if (r.pixels < kKCalMinPixels) {
+        stopKCalibration(QString("Calibrate k: too few well-exposed pixels (%1, need %2 at %3..%4 DN in both "
+                                 "cameras). Light the scene evenly or adjust the exposure. k unchanged.")
+                             .arg(r.pixels).arg(kKCalMinPixels).arg(kKCalMinLevel).arg(m_clipLevel - 1));
+        return;
+    }
+    m_kCalSamples.push_back(r.k);
+    m_kCalPixels.push_back(r.pixels);
+    m_kCalSpreads.push_back(r.spread);
+    const int n = static_cast<int>(m_kCalSamples.size());
+    if (n < m_kCalTarget) {
+        m_btnCalibrateK->setText(QString("Cancel %1/%2").arg(n).arg(m_kCalTarget));
+        return;
     }
 
-    cv::applyColorMap(diff, diff, cv::COLORMAP_JET);
+    double mean = 0.0;
+    for (double v : m_kCalSamples) mean += v;
+    mean /= n;
+    double var = 0.0;
+    for (double v : m_kCalSamples) var += (v - mean) * (v - mean);
 
-    return diff;
+    KCalibration rec;
+    rec.source = "calibrated";
+    rec.when = QDateTime::currentDateTime();
+    rec.frames = n;
+    rec.pixels = medianOf(m_kCalPixels);
+    rec.sigma = n > 1 ? std::sqrt(var / (n - 1)) : 0.0;
+    rec.spread = medianOf(m_kCalSpreads);
+    rec.exposure = exposureSignature();
+    rec.frameSize = QSize(m_lastDiffA.cols, m_lastDiffA.rows);
+    rec.perFrame = m_kCalSamples;
+    const double k = std::clamp(medianOf(m_kCalSamples), m_spnChannelK->minimum(), m_spnChannelK->maximum());
+
+    m_kCalTarget = 0;
+    m_btnCalibrateK->setText("Calibrate k");
+    setChannelK(k, rec);
+    saveKCalibration();
+
+    QString msg = QString("k = %1 ± %2 (%3 frames, %4 px each), saved.")
+                      .arg(m_channelK, 0, 'f', 4).arg(rec.sigma, 0, 'f', 4).arg(n).arg(rec.pixels);
+    if (rec.spread > 0.05)
+        msg += QString(" CAM1/CAM2 varies by ±%1 % across the frame: the scene may be polarized or unevenly lit.")
+                   .arg(rec.spread * 100.0, 0, 'f', 1);
+    if (!(m_manualExposure && m_libcameraSession))
+        msg += " Exposure is not locked: each camera adapts on its own, so k will drift.";
+    m_statusBar->showMessage(msg, 15000);
+}
+
+void MainWindow::stopKCalibration(const QString& message)
+{
+    m_kCalTarget = 0;
+    m_kCalSamples.clear();
+    m_kCalPixels.clear();
+    m_kCalSpreads.clear();
+    if (m_btnCalibrateK) m_btnCalibrateK->setText("Calibrate k");
+    if (!message.isEmpty()) m_statusBar->showMessage(message, 8000);
+}
+
+void MainWindow::setChannelK(double k, const KCalibration& record)
+{
+    m_kCal = record;
+    m_kProgrammatic = true;
+    m_spnChannelK->setValue(k);
+    m_kProgrammatic = false;
+    m_channelK = m_spnChannelK->value();
+    updateKInfo();
+    updateDiffReadout(true);
+}
+
+void MainWindow::saveKCalibration()
+{
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    s.setValue("channelK", m_channelK);
+    s.beginGroup("ChannelBalance");
+    s.remove("");
+    s.setValue("k", m_channelK);
+    s.setValue("source", m_kCal.source);
+    if (m_kCal.when.isValid()) s.setValue("when", m_kCal.when.toString(Qt::ISODate));
+    if (m_kCal.source == "calibrated") {
+        s.setValue("frames", m_kCal.frames);
+        s.setValue("pixelsPerFrame", m_kCal.pixels);
+        s.setValue("sigma", m_kCal.sigma);
+        s.setValue("pixelSpread", m_kCal.spread);
+        s.setValue("exposure", m_kCal.exposure);
+        s.setValue("frameWidth", m_kCal.frameSize.width());
+        s.setValue("frameHeight", m_kCal.frameSize.height());
+        QStringList perFrame;
+        for (double v : m_kCal.perFrame) perFrame << QString::number(v, 'f', 6);
+        s.setValue("perFrame", perFrame);
+    }
+    s.endGroup();
+}
+
+void MainWindow::loadKCalibration(QSettings& s)
+{
+    double k = s.value("channelK", 1.0).toDouble();
+    KCalibration rec;
+    s.beginGroup("ChannelBalance");
+    if (s.contains("k")) k = s.value("k").toDouble();
+    rec.source = s.value("source").toString();
+    rec.when = QDateTime::fromString(s.value("when").toString(), Qt::ISODate);
+    rec.frames = s.value("frames", 0).toInt();
+    rec.pixels = s.value("pixelsPerFrame", 0).toInt();
+    rec.sigma = s.value("sigma", 0.0).toDouble();
+    rec.spread = s.value("pixelSpread", 0.0).toDouble();
+    rec.exposure = s.value("exposure").toString();
+    rec.frameSize = QSize(s.value("frameWidth", 0).toInt(), s.value("frameHeight", 0).toInt());
+    for (const QString& v : s.value("perFrame").toStringList()) rec.perFrame.push_back(v.toDouble());
+    s.endGroup();
+    setChannelK(k, rec);
+}
+
+QString MainWindow::exposureSignature() const
+{
+    if (!(m_manualExposure && m_libcameraSession)) return "auto";
+    if (m_perCameraExposure)
+        return QString("manual, CAM1 gain %1 shutter %2 us, CAM2 gain %3 shutter %4 us")
+            .arg(m_gainQ8 / 256.0, 0, 'f', 2).arg(m_shutterUs)
+            .arg(m_gain2Q8 / 256.0, 0, 'f', 2).arg(m_shutter2Us);
+    return QString("manual, gain %1 shutter %2 us").arg(m_gainQ8 / 256.0, 0, 'f', 2).arg(m_shutterUs);
+}
+
+void MainWindow::updateKInfo()
+{
+    if (!m_lblKInfo) return;
+    const KCalibration& c = m_kCal;
+    const QString when = c.when.isValid() ? c.when.toString("dd.MM.yyyy HH:mm") : QString("?");
+    QString text, warning;
+    if (c.source == "calibrated") {
+        text = QString("Calibrated %1  ·  %2 frames\nσ %3  ·  pixel spread ±%4 %")
+                   .arg(when).arg(c.frames).arg(c.sigma, 0, 'f', 4).arg(c.spread * 100.0, 0, 'f', 1);
+        if (!c.exposure.isEmpty() && c.exposure != exposureSignature())
+            warning = "Exposure changed since calibration: recalibrate k.";
+    } else if (c.source == "manual") {
+        text = QString("Entered by hand %1").arg(when);
+    } else {
+        text = std::abs(m_channelK - 1.0) < 1e-9 ? QString("Not calibrated (k = 1)") : QString("No calibration record");
+    }
+    QString html = QString("<span style='color:%1'>%2</span>")
+                       .arg(T::textFaint, text.toHtmlEscaped().replace('\n', "<br>"));
+    if (!warning.isEmpty())
+        html += QString("<br><span style='color:%1'>%2</span>").arg(T::warn, warning.toHtmlEscaped());
+    if (m_lblKInfo->text() != html) m_lblKInfo->setText(html);
+}
+
+void MainWindow::updateDiffReadout(bool force)
+{
+    if (!m_lblDiffInfo) return;
+    if (!force) {
+        if (!m_diffReadoutTimer) {
+            m_diffReadoutTimer = new QTimer(this);
+            m_diffReadoutTimer->setSingleShot(true);
+            m_diffReadoutTimer->setInterval(250);
+            connect(m_diffReadoutTimer, &QTimer::timeout, this, [this]() { updateDiffReadout(true); });
+        }
+        if (!m_diffReadoutTimer->isActive()) m_diffReadoutTimer->start();
+        return;
+    }
+    if (m_diffReadoutTimer) m_diffReadoutTimer->stop();
+    updateKInfo();
+
+    const DiffStats& st = m_diffStats;
+    const bool stretch = m_chkStretch && m_chkStretch->isChecked();
+    QStringList lines;
+    lines << QString("D = CAM1 − k·CAM2, k = %1  ·  |D| ≤ %2 DN shown as 0  ·  clipped ≥ %3 DN")
+                 .arg(m_channelK, 0, 'f', 4).arg(m_noiseFloor).arg(m_clipLevel);
+    if (m_isDiffMode && m_camerasOpen && st.valid) {
+        lines << QString("Colour = |D| × %1  (%2: top of scale = %3 DN)  ·  max |D| %4 DN")
+                     .arg(st.gain, 0, 'f', st.gain < 10.0 ? 2 : 1)
+                     .arg(stretch ? "stretch" : "no stretch")
+                     .arg(st.fullScale, 0, 'f', st.fullScale < 10.0 ? 1 : 0)
+                     .arg(st.maxValue, 0, 'f', 0);
+        QString l3 = QString("Clipped: both %1 %, one %2 %")
+                         .arg(st.clippedBoth * 100.0, 0, 'f', 1).arg(st.clippedOne * 100.0, 0, 'f', 1);
+        if (st.noData > 0.0005)
+            l3 += QString("  ·  no overlap %1 %").arg(st.noData * 100.0, 0, 'f', 1);
+        l3 += st.sharpRatio > 0.0
+            ? QString("  ·  sharpness F1/(k²F2) %1").arg(st.sharpRatio, 0, 'f', 2)
+            : QString("  ·  sharpness match");
+        l3 += st.psfChannel
+            ? QString(" → CAM%1 blurred, σ %2 px").arg(st.psfChannel).arg(st.psfSigma, 0, 'f', 2)
+            : QString(" → no blur");
+        lines << l3;
+    }
+    if (m_camerasOpen && !(m_manualExposure && m_libcameraSession))
+        lines << "Exposure is not locked (AUTO or camera-controlled): each camera adapts on its own, so k drifts.";
+    const QString text = lines.join('\n');
+    if (m_lblDiffInfo->text() != text) m_lblDiffInfo->setText(text);
 }
 
 bool MainWindow::eventFilter(QObject* obj, QEvent* event)
 {
+    if (obj == m_spnChannelK && event->type() == QEvent::Wheel && !m_spnChannelK->hasFocus()) {
+        event->ignore();
+        return true;
+    }
+    if (obj == m_resPill && event->type() == QEvent::MouseButtonRelease) {
+        toggleResourceHud();
+        return true;
+    }
     if (obj == m_videoArea
         && (event->type() == QEvent::Resize || event->type() == QEvent::Show)) {
-        /* Instant repositioning: during a live window resize the buttons must
-           track the edges every frame, not chase them with an animation. */
+
         positionFloatingButtons(false);
     }
     return QMainWindow::eventFilter(obj, event);
@@ -3588,6 +4379,7 @@ void MainWindow::onFramesProcessed(cv::Mat f1, cv::Mat f2, double focus1, double
     if (m_worker) m_worker->m_pendingFrames.fetch_sub(1);
 
     if (!m_camerasOpen) return;
+    ++m_displayedFrames;
 
     m_frame1 = f1;
     m_frame2 = f2;
@@ -3612,7 +4404,6 @@ void MainWindow::onFramesProcessed(cv::Mat f1, cv::Mat f2, double focus1, double
             if (!axes.isEmpty()) {
                 axes.first()->setRange(std::max(0LL, frameCount - m_maxHistory), frameCount);
             }
-
 
             auto seriesMax = [](QLineSeries* s) {
                 double m = 0.0;
@@ -3661,6 +4452,7 @@ void MainWindow::onFramesProcessed(cv::Mat f1, cv::Mat f2, double focus1, double
     }
 
     updateView();
+    if (m_kCalTarget > 0) collectKSample();
 }
 
 void MainWindow::updateView()
@@ -3672,17 +4464,34 @@ void MainWindow::updateView()
     cv::Mat f1 = m_frame1.clone();
     cv::Mat f2 = m_frame2.clone();
 
+    const bool diffMode = m_isDiffMode;
+    cv::Mat valid1, valid2;
+    auto warpValid = [](cv::Mat& valid, const cv::Size& srcSize, const cv::Mat& H, const cv::Size& dstSize) {
+        if (valid.empty()) valid = cv::Mat(srcSize, CV_8U, cv::Scalar(255));
+        cv::Mat warped;
+        cv::warpPerspective(valid, warped, H, dstSize, cv::INTER_LINEAR);
+        cv::compare(warped, 255.0, valid, cv::CMP_EQ);
+    };
+
     if (!m_manualAdj1.isIdentity()) {
         cv::Mat H = buildManualHomography(m_manualAdj1, f1.size());
         cv::Mat warped;
         cv::warpPerspective(f1, warped, H, f1.size(), cv::INTER_LINEAR);
+        if (diffMode) warpValid(valid1, f1.size(), H, f1.size());
         f1 = warped;
     }
     if (!m_manualAdj2.isIdentity()) {
         cv::Mat H = buildManualHomography(m_manualAdj2, f2.size());
         cv::Mat warped;
         cv::warpPerspective(f2, warped, H, f2.size(), cv::INTER_LINEAR);
+        if (diffMode) warpValid(valid2, f2.size(), H, f2.size());
         f2 = warped;
+    }
+
+    if (m_isAligned && m_alignCalibSize.width > 0 && m_alignCalibSize != f1.size()) {
+        invalidateAlignment(QString("frame size changed (%1x%2 -> %3x%4)")
+                                .arg(m_alignCalibSize.width).arg(m_alignCalibSize.height)
+                                .arg(f1.cols).arg(f1.rows));
     }
 
     const bool eccReady = m_isAligned && !m_eccWarpMatrix.empty();
@@ -3690,9 +4499,11 @@ void MainWindow::updateView()
     const bool wantFusion = m_chkFusion && m_chkFusion->isChecked() && eccReady;
 
     cv::Mat warpedF2 = f2;
+    bool warped = false;
     if (wantAlign || wantFusion) {
         try {
             cv::warpPerspective(f2, warpedF2, m_eccWarpMatrix, f1.size(), cv::INTER_LINEAR);
+            warped = true;
         }
         catch (const cv::Exception& e) {
             std::cerr << "Warp error: " << e.what() << std::endl;
@@ -3701,7 +4512,8 @@ void MainWindow::updateView()
     }
 
     cv::Mat alignedF2 = wantAlign ? warpedF2 : f2;
-    if (wantFusion) {
+    if (diffMode && wantAlign && warped) warpValid(valid2, f2.size(), m_eccWarpMatrix, f1.size());
+    if (wantFusion && !diffMode) {
         f1 = fuseCameras(f1, warpedF2);
     }
 
@@ -3764,19 +4576,251 @@ void MainWindow::updateView()
         m_splitter->hide();
         m_resultView->show();
 
-        cv::Mat diff = applyDiffView(f1, alignedF2);
+        cv::Mat diff = applyDiffView(f1, alignedF2, valid1, valid2);
 
         if (showPeaks) {
             drawTarget(diff, maxLoc1, cv::Scalar(0, 255, 255), "P1");
             drawTarget(diff, maxLoc2, cv::Scalar(255, 0, 255), "P2");
         }
 
+        const DiffStats& st = m_diffStats;
         m_resultView->setOverlayColor(QColor(0xff, 0xff, 0xff));
-        m_resultView->setOverlayText("DIFF", false);
+        m_resultView->setOverlayText(QString("DIFF  |CAM1 − %1·CAM2|  ×%2")
+                                         .arg(st.k, 0, 'f', 4)
+                                         .arg(st.gain, 0, 'f', st.gain < 10.0 ? 2 : 1), false);
+        if (m_diffScaleRamp.isNull()) m_diffScaleRamp = diffScaleRamp();
+        m_resultView->setColorScale(m_diffScaleRamp, st.fullScale, "|D|, DN");
 
         m_lastDiffResult = diff.clone();
         displayMat(m_resultView, diff);
+        updateDiffReadout();
     }
+}
+
+cv::Mat MainWindow::alignmentSignal(const cv::Mat& gray)
+{
+    cv::Mat g;
+    if (gray.channels() == 3) cv::cvtColor(gray, g, cv::COLOR_BGR2GRAY);
+    else g = gray;
+
+    cv::Mat eq;
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    clahe->apply(g, eq);
+
+    cv::Mat blurred;
+    cv::GaussianBlur(eq, blurred, cv::Size(0, 0), 1.0);
+
+    cv::Mat gx, gy, mag;
+    cv::Sobel(blurred, gx, CV_32F, 1, 0, 3);
+    cv::Sobel(blurred, gy, CV_32F, 0, 1, 3);
+    cv::magnitude(gx, gy, mag);
+
+    cv::normalize(mag, mag, 0.0, 1.0, cv::NORM_MINMAX);
+    return mag;
+}
+
+double MainWindow::warpDisagreement(const cv::Mat& A, const cv::Mat& B, const cv::Size& sz)
+{
+    if (A.empty() || B.empty()) return std::numeric_limits<double>::infinity();
+    cv::Mat Ad, Bd;
+    A.convertTo(Ad, CV_64F);
+    B.convertTo(Bd, CV_64F);
+
+    std::vector<cv::Point2f> corners = {
+        {0.f, 0.f},
+        {static_cast<float>(sz.width - 1), 0.f},
+        {static_cast<float>(sz.width - 1), static_cast<float>(sz.height - 1)},
+        {0.f, static_cast<float>(sz.height - 1)}
+    };
+    std::vector<cv::Point2f> wa, wb;
+    cv::perspectiveTransform(corners, wa, Ad);
+    cv::perspectiveTransform(corners, wb, Bd);
+
+    double worst = 0.0;
+    for (size_t i = 0; i < corners.size(); ++i) {
+        if (!std::isfinite(wa[i].x) || !std::isfinite(wa[i].y) ||
+            !std::isfinite(wb[i].x) || !std::isfinite(wb[i].y)) {
+            return std::numeric_limits<double>::infinity();
+        }
+        const double d = std::hypot(static_cast<double>(wa[i].x) - wb[i].x,
+                                    static_cast<double>(wa[i].y) - wb[i].y);
+        worst = std::max(worst, d);
+    }
+    return worst;
+}
+
+bool MainWindow::refineCorrespondences(const cv::Mat& sig1, const cv::Mat& sig2,
+                                       std::vector<cv::Point2f>& ptsSrc,
+                                       std::vector<cv::Point2f>& ptsDst,
+                                       const cv::Mat& H, int halfWin, int searchRad)
+{
+    if (ptsSrc.size() != ptsDst.size() || ptsSrc.empty() || H.empty()) return false;
+
+    std::vector<cv::Point2f> outSrc, outDst;
+    outSrc.reserve(ptsSrc.size());
+    outDst.reserve(ptsDst.size());
+
+    const int win = 2 * halfWin + 1;
+
+    for (size_t i = 0; i < ptsSrc.size(); ++i) {
+        const cv::Point2f& ps = ptsSrc[i];
+        const cv::Point2f& pd = ptsDst[i];
+
+        int sx = cvRound(ps.x) - halfWin;
+        int sy = cvRound(ps.y) - halfWin;
+        if (sx < 0 || sy < 0 || sx + win > sig2.cols || sy + win > sig2.rows) {
+            outSrc.push_back(ps); outDst.push_back(pd);
+            continue;
+        }
+        cv::Mat patch = sig2(cv::Rect(sx, sy, win, win));
+
+        int tx = cvRound(pd.x) - halfWin - searchRad;
+        int ty = cvRound(pd.y) - halfWin - searchRad;
+        int tw = win + 2 * searchRad;
+        if (tx < 0 || ty < 0 || tx + tw > sig1.cols || ty + tw > sig1.rows) {
+            outSrc.push_back(ps); outDst.push_back(pd);
+            continue;
+        }
+        cv::Mat region = sig1(cv::Rect(tx, ty, tw, tw));
+
+        cv::Scalar mu, sd;
+        cv::meanStdDev(patch, mu, sd);
+        if (sd[0] < 1e-3) {
+            outSrc.push_back(ps); outDst.push_back(pd);
+            continue;
+        }
+
+        cv::Mat resp;
+        try {
+            cv::matchTemplate(region, patch, resp, cv::TM_CCOEFF_NORMED);
+        } catch (const cv::Exception&) {
+            outSrc.push_back(ps); outDst.push_back(pd);
+            continue;
+        }
+
+        double maxVal = 0.0;
+        cv::Point maxLoc;
+        cv::minMaxLoc(resp, nullptr, &maxVal, nullptr, &maxLoc);
+        if (maxVal < 0.35) {
+            outSrc.push_back(ps); outDst.push_back(pd);
+            continue;
+        }
+
+        double dx = 0.0, dy = 0.0;
+        if (maxLoc.x > 0 && maxLoc.x < resp.cols - 1) {
+            double l = resp.at<float>(maxLoc.y, maxLoc.x - 1);
+            double c = resp.at<float>(maxLoc.y, maxLoc.x);
+            double r = resp.at<float>(maxLoc.y, maxLoc.x + 1);
+            double den = (l - 2.0 * c + r);
+            if (std::abs(den) > 1e-9) dx = 0.5 * (l - r) / den;
+        }
+        if (maxLoc.y > 0 && maxLoc.y < resp.rows - 1) {
+            double u = resp.at<float>(maxLoc.y - 1, maxLoc.x);
+            double c = resp.at<float>(maxLoc.y, maxLoc.x);
+            double d = resp.at<float>(maxLoc.y + 1, maxLoc.x);
+            double den = (u - 2.0 * c + d);
+            if (std::abs(den) > 1e-9) dy = 0.5 * (u - d) / den;
+        }
+        if (!std::isfinite(dx) || std::abs(dx) > 1.0) dx = 0.0;
+        if (!std::isfinite(dy) || std::abs(dy) > 1.0) dy = 0.0;
+
+        cv::Point2f refined(static_cast<float>(tx + maxLoc.x + halfWin + dx),
+                            static_cast<float>(ty + maxLoc.y + halfWin + dy));
+
+        outSrc.push_back(ps);
+        outDst.push_back(refined);
+    }
+
+    ptsSrc.swap(outSrc);
+    ptsDst.swap(outDst);
+    return true;
+}
+
+static cv::Mat invertWarp(const cv::Mat& m)
+{
+    cv::Mat d, inv;
+    m.convertTo(d, CV_64F);
+    if (d.rows == 2) {
+        cv::invertAffineTransform(d, inv);
+    } else {
+        if (std::abs(cv::determinant(d)) < 1e-12) return cv::Mat();
+        inv = d.inv();
+        const double h22 = inv.at<double>(2, 2);
+        if (std::abs(h22) < 1e-12) return cv::Mat();
+        inv /= h22;
+    }
+    cv::Mat out;
+    inv.convertTo(out, CV_32F);
+    return out;
+}
+
+bool MainWindow::eccPolish(const cv::Mat& sig1, const cv::Mat& sig2,
+                           cv::Mat& warp, int motionType, int levels,
+                           int iters, double eps, double& outRho)
+{
+    if (warp.empty() || sig1.empty() || sig2.empty()) return false;
+
+    std::vector<cv::Mat> pyr1, pyr2;
+    pyr1.push_back(sig1);
+    pyr2.push_back(sig2);
+    for (int i = 1; i < levels; ++i) {
+        cv::Mat d1, d2;
+        if (pyr1.back().cols < 64 || pyr1.back().rows < 64) break;
+        cv::pyrDown(pyr1.back(), d1);
+        cv::pyrDown(pyr2.back(), d2);
+        pyr1.push_back(d1);
+        pyr2.push_back(d2);
+    }
+    const int used = static_cast<int>(pyr1.size());
+
+    cv::Mat w = invertWarp(warp);
+    if (w.empty()) return false;
+
+    const double s0 = 1.0 / std::pow(2.0, used - 1);
+    auto scaleWarp = [motionType](cv::Mat& m, double s) {
+        if (motionType == cv::MOTION_HOMOGRAPHY) {
+            m.at<float>(0, 2) *= static_cast<float>(s);
+            m.at<float>(1, 2) *= static_cast<float>(s);
+            m.at<float>(2, 0) /= static_cast<float>(s);
+            m.at<float>(2, 1) /= static_cast<float>(s);
+        } else {
+            m.at<float>(0, 2) *= static_cast<float>(s);
+            m.at<float>(1, 2) *= static_cast<float>(s);
+        }
+    };
+    scaleWarp(w, s0);
+
+    bool any = false;
+    outRho = 0.0;
+
+    for (int lvl = used - 1; lvl >= 0; --lvl) {
+        cv::TermCriteria crit(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, iters, eps);
+        cv::Mat attempt = w.clone();
+        try {
+            double rho = cv::findTransformECC(pyr1[lvl], pyr2[lvl], attempt,
+                                              motionType, crit, cv::noArray(), 5);
+            if (std::isfinite(rho)) {
+                outRho = rho;
+                any = true;
+                w = attempt;
+            }
+        } catch (const cv::Exception&) {
+            if (!any) return false;
+            scaleWarp(w, std::pow(2.0, lvl));
+            break;
+        }
+        if (lvl > 0) scaleWarp(w, 2.0);
+    }
+
+    if (!any) return false;
+    for (int r = 0; r < w.rows; ++r)
+        for (int c = 0; c < w.cols; ++c)
+            if (!std::isfinite(w.at<float>(r, c))) return false;
+
+    const cv::Mat result = invertWarp(w);
+    if (result.empty()) return false;
+    warp = result;
+    return true;
 }
 
 void MainWindow::calibrateAlignment()
@@ -3827,11 +4871,14 @@ void MainWindow::calibrateAlignment()
     m_btnCalibrateAlign->setEnabled(false);
     setPillState(m_eccIndicator, "warn", "CALIBRATING\u2026");
     updateEccPill();
-    m_statusBar->showMessage("Calibrating (SIFT)... please wait.");
+    m_statusBar->showMessage("Calibrating (features + refinement)... please wait.");
+
+    const bool eccEnabled = !m_chkEccPolish || m_chkEccPolish->isChecked();
 
     if (m_calibThread.joinable()) m_calibThread.join();
 
-    m_calibThread = std::thread([this, gray1 = std::move(gray1), gray2 = std::move(gray2)]() {
+    m_calibThread = std::thread([this, eccEnabled,
+                                 gray1 = std::move(gray1), gray2 = std::move(gray2)]() {
         QString errorMsg;
         QString modelUsed;
         cv::Mat warpMatrix;
@@ -3874,6 +4921,17 @@ void MainWindow::calibrateAlignment()
 
         const cv::Size imgSz = gray1.size();
 
+        cv::Mat sig1, sig2;
+        try {
+            sig1 = alignmentSignal(gray1);
+            sig2 = alignmentSignal(gray2);
+        } catch (const cv::Exception& e) {
+            errorMsg = QString("Signal prep failed: ") + QString::fromStdString(e.what());
+        }
+
+        double finalRho = 0.0;
+        QString refineNote;
+
         auto runWithDetector = [&](cv::Ptr<cv::Feature2D> detector,
                                    cv::Ptr<cv::DescriptorMatcher> matcher,
                                    float loweRatio,
@@ -3883,39 +4941,78 @@ void MainWindow::calibrateAlignment()
                                    cv::Mat& outWarp) -> bool {
             std::vector<cv::KeyPoint> kp1, kp2;
             cv::Mat des1, des2;
-            detector->detectAndCompute(gray1, cv::noArray(), kp1, des1);
-            detector->detectAndCompute(gray2, cv::noArray(), kp2, des2);
+            cv::Mat det1, det2;
+            sig1.convertTo(det1, CV_8U, 255.0);
+            sig2.convertTo(det2, CV_8U, 255.0);
+            detector->detectAndCompute(det1, cv::noArray(), kp1, des1);
+            detector->detectAndCompute(det2, cv::noArray(), kp2, des2);
 
-            if (des1.empty() || des2.empty() || kp1.size() < 16 || kp2.size() < 16) {
-                outErr = tag + ": insufficient keypoints";
-                return false;
-            }
-
-            std::vector<std::vector<cv::DMatch>> knn;
-            matcher->knnMatch(des2, des1, knn, 2);
-
-            std::vector<cv::Point2f> ptsSrc, ptsDst;
-            ptsSrc.reserve(knn.size());
-            ptsDst.reserve(knn.size());
-            for (const auto& pair : knn) {
-                if (pair.size() < 2) continue;
-                if (pair[0].distance < loweRatio * pair[1].distance) {
-                    ptsSrc.push_back(kp2[pair[0].queryIdx].pt);
-                    ptsDst.push_back(kp1[pair[0].trainIdx].pt);
+            if (kp1.size() < 16 || kp2.size() < 16) {
+                std::vector<cv::KeyPoint> a1, a2;
+                cv::Mat d1, d2;
+                detector->detectAndCompute(gray1, cv::noArray(), a1, d1);
+                detector->detectAndCompute(gray2, cv::noArray(), a2, d2);
+                if (a1.size() > kp1.size() && a2.size() > kp2.size()) {
+                    kp1 = a1; kp2 = a2; des1 = d1; des2 = d2;
                 }
             }
 
-            if (ptsSrc.size() < 12) {
-                outErr = QString("%1: only %2 good matches").arg(tag).arg(static_cast<int>(ptsSrc.size()));
+            if (des1.empty() || des2.empty() || kp1.size() < 8 || kp2.size() < 8) {
+                outErr = QString("%1: insufficient keypoints (%2/%3)")
+                           .arg(tag).arg(static_cast<int>(kp1.size())).arg(static_cast<int>(kp2.size()));
                 return false;
             }
 
-            cv::Mat inliers;
-            cv::Mat H = cv::findHomography(ptsSrc, ptsDst, cv::RANSAC, 3.0, inliers, 5000, 0.999);
-            int inlierCount = cv::countNonZero(inliers);
-            double inlierRatio = static_cast<double>(inlierCount) / static_cast<double>(ptsSrc.size());
+            std::vector<std::vector<cv::DMatch>> knn, knnRev;
+            matcher->knnMatch(des2, des1, knn, 2);
+            matcher->knnMatch(des1, des2, knnRev, 2);
 
-            if (H.empty() || inlierCount < 10 || inlierRatio < 0.30) {
+            std::vector<int> bestRev(kp1.size(), -1);
+            for (const auto& pr : knnRev) {
+                if (pr.empty()) continue;
+                if (pr[0].queryIdx >= 0 && pr[0].queryIdx < static_cast<int>(bestRev.size()))
+                    bestRev[pr[0].queryIdx] = pr[0].trainIdx;
+            }
+
+            auto collect = [&](float ratio, bool crossCheck,
+                               std::vector<cv::Point2f>& ps,
+                               std::vector<cv::Point2f>& pd) {
+                ps.clear(); pd.clear();
+                for (const auto& pair : knn) {
+                    if (pair.empty()) continue;
+                    bool ok = (pair.size() < 2) ? true
+                                                : (pair[0].distance < ratio * pair[1].distance);
+                    if (!ok) continue;
+                    if (crossCheck) {
+                        int t = pair[0].trainIdx;
+                        if (t < 0 || t >= static_cast<int>(bestRev.size())) continue;
+                        if (bestRev[t] != pair[0].queryIdx) continue;
+                    }
+                    ps.push_back(kp2[pair[0].queryIdx].pt);
+                    pd.push_back(kp1[pair[0].trainIdx].pt);
+                }
+            };
+
+            std::vector<cv::Point2f> ptsSrc, ptsDst;
+            collect(loweRatio, true, ptsSrc, ptsDst);
+            if (ptsSrc.size() < 8) collect(0.85f, true, ptsSrc, ptsDst);
+            if (ptsSrc.size() < 8) collect(0.9f, false, ptsSrc, ptsDst);
+
+            if (ptsSrc.size() < 6) {
+                outErr = QString("%1: only %2 usable matches").arg(tag).arg(static_cast<int>(ptsSrc.size()));
+                return false;
+            }
+
+            const int minInliers = (ptsSrc.size() < 20) ? 5 : 10;
+            const double minRatio = (ptsSrc.size() < 20) ? 0.40 : 0.30;
+
+            cv::Mat inliers;
+            cv::Mat H = cv::findHomography(ptsSrc, ptsDst, cv::RANSAC, 3.0, inliers, 8000, 0.999);
+            int inlierCount = inliers.empty() ? 0 : cv::countNonZero(inliers);
+            double inlierRatio = ptsSrc.empty() ? 0.0
+                               : static_cast<double>(inlierCount) / static_cast<double>(ptsSrc.size());
+
+            if (H.empty() || inlierCount < minInliers || inlierRatio < minRatio) {
                 outErr = QString("%1: %2/%3 inliers (%4%)")
                            .arg(tag).arg(inlierCount).arg(static_cast<int>(ptsSrc.size()))
                            .arg(static_cast<int>(inlierRatio * 100));
@@ -3925,6 +5022,27 @@ void MainWindow::calibrateAlignment()
             if (!isHomographySane(H, imgSz)) {
                 outErr = QString("%1: homography rejected (geometry sanity check failed — likely repetitive pattern)").arg(tag);
                 return false;
+            }
+
+            std::vector<cv::Point2f> inSrc, inDst;
+            for (int i = 0; i < static_cast<int>(ptsSrc.size()); ++i) {
+                if (!inliers.empty() && inliers.at<uchar>(i)) {
+                    inSrc.push_back(ptsSrc[i]);
+                    inDst.push_back(ptsDst[i]);
+                }
+            }
+            if (inSrc.size() >= 6 && !sig1.empty() && !sig2.empty()) {
+                std::vector<cv::Point2f> rs = inSrc, rd = inDst;
+                if (refineCorrespondences(sig1, sig2, rs, rd, H, 10, 4)) {
+                    cv::Mat rIn;
+                    cv::Mat H2 = cv::findHomography(rs, rd, cv::RANSAC, 2.0, rIn, 8000, 0.999);
+                    int rc = rIn.empty() ? 0 : cv::countNonZero(rIn);
+                    if (!H2.empty() && rc >= minInliers && isHomographySane(H2, imgSz) &&
+                        warpDisagreement(H, H2, imgSz) < 12.0) {
+                        H = H2;
+                        refineNote = "+subpx";
+                    }
+                }
             }
 
             H.convertTo(outWarp, CV_32F);
@@ -3939,15 +5057,15 @@ void MainWindow::calibrateAlignment()
         };
 
         try {
-            auto sift = cv::SIFT::create(0, 3, 0.04, 10.0, 1.6);
+            auto sift = cv::SIFT::create(0, 3, 0.008, 12.0, 1.6);
             cv::Ptr<cv::flann::IndexParams> indexParams = cv::makePtr<cv::flann::KDTreeIndexParams>(5);
-            cv::Ptr<cv::flann::SearchParams> searchParams = cv::makePtr<cv::flann::SearchParams>(50);
+            cv::Ptr<cv::flann::SearchParams> searchParams = cv::makePtr<cv::flann::SearchParams>(64);
             cv::Ptr<cv::DescriptorMatcher> flann = cv::makePtr<cv::FlannBasedMatcher>(indexParams, searchParams);
 
             success = runWithDetector(sift, flann, 0.75f, "SIFT", errorMsg, modelUsed, warpMatrix);
 
             if (!success) {
-                auto orb = cv::ORB::create(4000);
+                auto orb = cv::ORB::create(8000, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 5);
                 cv::Ptr<cv::DescriptorMatcher> bf = cv::BFMatcher::create(cv::NORM_HAMMING, false);
                 QString orbErr, orbModel;
                 cv::Mat orbWarp;
@@ -3959,30 +5077,160 @@ void MainWindow::calibrateAlignment()
                     errorMsg += " | " + orbErr;
                 }
             }
+
+#if CV_VERSION_MAJOR < 5
+            if (!success) {
+                auto akaze = cv::AKAZE::create(cv::AKAZE::DESCRIPTOR_MLDB, 0, 3, 0.0005f, 4, 4);
+                cv::Ptr<cv::DescriptorMatcher> bf = cv::BFMatcher::create(cv::NORM_HAMMING, false);
+                QString akErr, akModel;
+                cv::Mat akWarp;
+                if (runWithDetector(akaze, bf, 0.8f, "AKAZE", akErr, akModel, akWarp)) {
+                    success = true;
+                    warpMatrix = akWarp;
+                    modelUsed = akModel;
+                } else {
+                    errorMsg += " | " + akErr;
+                }
+            }
+#endif
+
+            if (success && eccEnabled && !sig1.empty() && !sig2.empty()) {
+                cv::Mat polished = warpMatrix.clone();
+                double rho = 0.0;
+                if (eccPolish(sig1, sig2, polished, cv::MOTION_HOMOGRAPHY, 3, 200, 1e-6, rho)) {
+                    double shift = warpDisagreement(warpMatrix, polished, imgSz);
+                    if (isHomographySane(polished, imgSz) && shift < 25.0) {
+                        warpMatrix = polished;
+                        finalRho = rho;
+                        refineNote += QString("+ECC ρ%1").arg(rho, 0, 'f', 3);
+                        std::cerr << "[align] ECC polish accepted, rho=" << rho
+                                  << ", corner shift=" << shift << " px" << std::endl;
+                    } else {
+                        std::cerr << "[align] ECC polish rejected (shift=" << shift
+                                  << " px), keeping feature solution" << std::endl;
+                    }
+                } else {
+                    std::cerr << "[align] ECC did not converge, keeping feature solution" << std::endl;
+                }
+            }
         }
         catch (const cv::Exception& e) {
             errorMsg = QString("Feature stage failed: ") + QString::fromStdString(e.what());
+            success = false;
         }
 
+        if (!refineNote.isEmpty()) modelUsed += " " + refineNote.trimmed();
+
         cv::Mat resultMatrix = success ? warpMatrix : cv::Mat();
-        QMetaObject::invokeMethod(this, [this, success, resultMatrix, errorMsg, modelUsed]() {
+        QMetaObject::invokeMethod(this, [this, success, resultMatrix, errorMsg, modelUsed, imgSz, finalRho]() {
             if (success) {
                 m_eccWarpMatrix = resultMatrix;
                 m_isAligned = true;
+                m_alignCalibSize = imgSz;
+                m_alignModelInfo = modelUsed;
+                m_alignRho = finalRho;
                 setPillState(m_eccIndicator, "ok", "MATRIX READY");
                 m_statusBar->showMessage("Alignment OK [" + modelUsed + "]", 3000);
+                if (!m_chkPersistAlign || m_chkPersistAlign->isChecked()) saveAlignmentMatrix();
             }
             else {
                 m_eccWarpMatrix.release();
                 m_isAligned = false;
+                m_alignCalibSize = cv::Size(0, 0);
+                m_alignModelInfo.clear();
+                m_alignRho = 0.0;
                 setPillState(m_eccIndicator, "err", "NOT CALIBRATED");
                 m_statusBar->showMessage("Alignment failed (low texture / too different views): " + errorMsg, 5000);
+            }
+            if (m_alignDetail) {
+                m_alignDetail->setText(success ? ("Solution: " + modelUsed) : QString("No solution."));
             }
             m_btnCalibrateAlign->setEnabled(true);
             m_calibrating = false;
             updateEccPill();
         });
     });
+}
+
+void MainWindow::saveAlignmentMatrix()
+{
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    s.beginGroup("Alignment");
+    if (m_isAligned && !m_eccWarpMatrix.empty() &&
+        m_eccWarpMatrix.rows == 3 && m_eccWarpMatrix.cols == 3) {
+        cv::Mat m;
+        m_eccWarpMatrix.convertTo(m, CV_64F);
+        QStringList vals;
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                vals << QString::number(m.at<double>(r, c), 'g', 17);
+        s.setValue("warp", vals.join(','));
+        s.setValue("calibW", m_alignCalibSize.width);
+        s.setValue("calibH", m_alignCalibSize.height);
+        s.setValue("model", m_alignModelInfo);
+        s.setValue("rho", m_alignRho);
+        s.setValue("savedAt", QDateTime::currentDateTime().toString(Qt::ISODate));
+    } else {
+        s.remove("");
+    }
+    s.endGroup();
+    s.sync();
+}
+
+void MainWindow::loadAlignmentMatrix()
+{
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    s.beginGroup("Alignment");
+    const QString packed = s.value("warp").toString();
+    const int w = s.value("calibW", 0).toInt();
+    const int h = s.value("calibH", 0).toInt();
+    const QString model = s.value("model").toString();
+    const double rho = s.value("rho", 0.0).toDouble();
+    const QString savedAt = s.value("savedAt").toString();
+    s.endGroup();
+
+    if (packed.isEmpty()) return;
+
+    const QStringList vals = packed.split(',', Qt::SkipEmptyParts);
+    if (vals.size() != 9) return;
+
+    cv::Mat m(3, 3, CV_64F);
+    for (int i = 0; i < 9; ++i) {
+        bool ok = false;
+        const double v = vals[i].toDouble(&ok);
+        if (!ok || !std::isfinite(v)) return;
+        m.at<double>(i / 3, i % 3) = v;
+    }
+    if (std::abs(cv::determinant(m)) < 1e-9) return;
+
+    m.convertTo(m_eccWarpMatrix, CV_32F);
+    m_isAligned = true;
+    m_alignCalibSize = cv::Size(w, h);
+    m_alignModelInfo = model;
+    m_alignRho = rho;
+
+    if (m_alignDetail) {
+        QString txt = "Restored: " + (model.isEmpty() ? QString("saved matrix") : model);
+        if (w > 0 && h > 0) txt += QString(" @ %1x%2").arg(w).arg(h);
+        if (!savedAt.isEmpty()) txt += " (" + savedAt.left(10) + ")";
+        m_alignDetail->setText(txt);
+    }
+    if (m_eccIndicator) setPillState(m_eccIndicator, "info", "RESTORED");
+    updateEccPill();
+}
+
+void MainWindow::invalidateAlignment(const QString& reason)
+{
+    if (!m_isAligned && m_eccWarpMatrix.empty()) return;
+    m_eccWarpMatrix.release();
+    m_isAligned = false;
+    m_alignCalibSize = cv::Size(0, 0);
+    m_alignModelInfo.clear();
+    m_alignRho = 0.0;
+    if (m_eccIndicator) setPillState(m_eccIndicator, "err", "NOT CALIBRATED");
+    if (m_alignDetail) m_alignDetail->setText("Invalidated: " + reason);
+    if (m_statusBar) m_statusBar->showMessage("Alignment invalidated: " + reason, 4000);
+    updateEccPill();
 }
 
 double MainWindow::calculateFocus(const cv::Mat& frame)
@@ -4013,33 +5261,24 @@ void MainWindow::pushWorkerParams()
     m_worker->setParams(p);
 }
 
-void MainWindow::displayMat(GpuImageView* view, const cv::Mat& mat)
+void MainWindow::displayMat(ImageView* view, const cv::Mat& mat)
 {
     if (mat.empty() || view == nullptr) return;
+    if (mat.channels() != 1 && mat.channels() != 3) return;
 
     cv::Mat src = mat;
-    const int targetW = std::max(1, view->width());
-    const int targetH = std::max(1, view->height());
-    if (src.cols > targetW * 2 || src.rows > targetH * 2) {
-        double k = std::min(static_cast<double>(targetW) / src.cols,
-                            static_cast<double>(targetH) / src.rows);
-        if (k > 0.0 && k < 1.0) {
-            cv::Mat small;
-            cv::resize(src, small, cv::Size(), k, k, cv::INTER_AREA);
-            src = small;
-        }
+    const QSize target = view->targetSize(QSize(mat.cols, mat.rows));
+    if (target.isValid() && target.width() < mat.cols && target.height() < mat.rows) {
+        cv::resize(mat, src, cv::Size(target.width(), target.height()), 0, 0, cv::INTER_AREA);
     }
 
-    if (src.channels() == 1) {
-        QImage img(src.data, src.cols, src.rows, static_cast<int>(src.step), QImage::Format_Grayscale8);
-        view->setImage(img.copy());
-    }
-    else if (src.channels() == 3) {
-        cv::Mat rgb;
-        cv::cvtColor(src, rgb, cv::COLOR_BGR2RGB);
-        QImage img(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
-        view->setImage(img.copy());
-    }
+    auto* bgra = new cv::Mat();
+    cv::cvtColor(src, *bgra, src.channels() == 1 ? cv::COLOR_GRAY2BGRA : cv::COLOR_BGR2BGRA);
+    QImage img(bgra->data, bgra->cols, bgra->rows, static_cast<qsizetype>(bgra->step),
+               QImage::Format_RGB32,
+               [](void* m) { delete static_cast<cv::Mat*>(m); }, bgra);
+    img.setDevicePixelRatio(view->devicePixelRatioF());
+    view->setImage(img);
 }
 
 QString MainWindow::buildSnapshotBaseName(const QString& prefix) const
@@ -4093,6 +5332,7 @@ QString MainWindow::buildSnapshotBaseName(const QString& prefix) const
         }
         if (enabled("FH") && m_chkFlipHor2 && m_chkFlipHor2->isChecked()) parts << "FH";
         if (enabled("FV") && m_chkFlipVer2 && m_chkFlipVer2->isChecked()) parts << "FV";
+        if (enabled("K") && std::abs(m_channelK - 1.0) > 1e-9) parts << QString("K%1").arg(m_channelK, 0, 'f', 4);
     }
 
     QString result = prefix;
@@ -4187,10 +5427,7 @@ void MainWindow::showFilenameParamsDialog()
     connect(btnCancel, &QPushButton::clicked, &dlg, &QDialog::reject);
     connect(btnOk, &QPushButton::clicked, &dlg, &QDialog::accept);
 
-    if (m_animDialogsEnabled) {
-        animateDialogEntry(&dlg, m_btnConfigParams, m_animSpeedMs);
-    }
-    if (dlg.exec() != QDialog::Accepted) return;
+    if (execDialog(&dlg, m_btnConfigParams) != QDialog::Accepted) return;
 
     for (auto it = boxes.constBegin(); it != boxes.constEnd(); ++it) {
         m_paramInName[it.key()] = it.value()->isChecked();
@@ -4261,7 +5498,7 @@ void MainWindow::showExposureDialog()
         lay->setSpacing(6);
 
         QHBoxLayout* head = new QHBoxLayout();
-        QLabel* lbl = new QLabel(title.toUpper(), row);
+        QLabel* lbl = new QLabel(title, row);
         lbl->setProperty("role", "section");
         head->addWidget(lbl);
         head->addStretch();
@@ -4298,8 +5535,8 @@ void MainWindow::showExposureDialog()
     sldS->setPageStep(1000);
     sldS->setMinimumWidth(280);
 
-    QFrame* rowG = buildRow("Gain (0.10x – 10.00x)",   spnG, sldG);
-    QFrame* rowS = buildRow("Shutter (50 – 30000 µs)", spnS, sldS);
+    QFrame* rowG = buildRow("GAIN (0.10x – 10.00x)",   spnG, sldG);
+    QFrame* rowS = buildRow("SHUTTER (50 – 30000 µs)", spnS, sldS);
     root->addWidget(rowG);
     root->addWidget(rowS);
 
@@ -4404,12 +5641,7 @@ void MainWindow::showExposureDialog()
     root->addLayout(btns);
     connect(btnClose, &QPushButton::clicked, &dlg, &QDialog::accept);
 
-    if (m_animDialogsEnabled) {
-        animateDialogEntry(&dlg, m_btnExpChange, m_animSpeedMs);
-        dlg.exec();
-    } else {
-        dlg.exec();
-    }
+    execDialog(&dlg, m_btnExpChange);
 }
 
 void MainWindow::saveSnapshot()
@@ -4417,23 +5649,33 @@ void MainWindow::saveSnapshot()
     if (m_isDiffMode) {
         saveDiffSnapshot();
     } else {
-        saveDualSnapshot(true);
+        saveDualSnapshot(!(m_chkSeparateFiles && m_chkSeparateFiles->isChecked()));
     }
 }
 
-static bool saveWithExif(const QString& path, const cv::Mat& mat, const ExifParams& params) {
+static bool saveSnapshotFile(const QString& path, const cv::Mat& mat, const ExifParams& params) {
     std::vector<uint8_t> buf;
     if (!cv::imencode(".jpg", mat, buf)) return false;
 
     std::vector<uint8_t> finalData = insertExif(buf, params);
 
     QFile f(path);
-    if (f.open(QIODevice::WriteOnly)) {
-        f.write(reinterpret_cast<const char*>(finalData.data()), finalData.size());
-        f.close();
-        return true;
+    if (!f.open(QIODevice::WriteOnly)) return false;
+    const qint64 size = static_cast<qint64>(finalData.size());
+    if (f.write(reinterpret_cast<const char*>(finalData.data()), size) != size) return false;
+    f.close();
+    return true;
+}
+
+static QString uniqueBaseName(const QString& dir, const QString& base, const QStringList& suffixes)
+{
+    QString candidate = base;
+    for (int n = 2;; ++n) {
+        bool taken = false;
+        for (const QString& s : suffixes) taken = taken || QFile::exists(dir + "/" + candidate + s);
+        if (!taken) return candidate;
+        candidate = QString("%1_%2").arg(base).arg(n);
     }
-    return false;
 }
 
 void MainWindow::saveDiffSnapshot()
@@ -4446,11 +5688,11 @@ void MainWindow::saveDiffSnapshot()
     QString metricsDir = QCoreApplication::applicationDirPath() + "/metrics";
     QDir().mkpath(metricsDir);
 
-    QString filename = buildSnapshotBaseName("diff");
+    QString filename = uniqueBaseName(metricsDir, buildSnapshotBaseName("diff"), {".jpg"});
     QString filePath = metricsDir + "/" + filename + ".jpg";
 
     ExifParams p = buildExifParams("diff");
-    bool success = saveWithExif(filePath, m_lastDiffResult, p);
+    bool success = saveSnapshotFile(filePath, m_lastDiffResult, p);
 
     if (success) {
         m_statusBar->showMessage("Saved snapshot: " + filePath, 4000);
@@ -4470,7 +5712,8 @@ void MainWindow::saveDualSnapshot(bool combined)
     QString metricsDir = QCoreApplication::applicationDirPath() + "/metrics";
     QDir().mkpath(metricsDir);
 
-    QString baseName = buildSnapshotBaseName("dual");
+    const QString baseName = uniqueBaseName(metricsDir, buildSnapshotBaseName("dual"),
+        combined ? QStringList{".jpg"} : QStringList{"_cam1.jpg", "_cam2.jpg"});
 
     cv::Mat f1 = m_frame1.clone();
     cv::Mat f2 = m_frame2.clone();
@@ -4487,7 +5730,7 @@ void MainWindow::saveDualSnapshot(bool combined)
         QString filename = baseName;
         QString path = metricsDir + "/" + filename + ".jpg";
         ExifParams p = buildExifParams("dual_combined");
-        bool ok = saveWithExif(path, combo, p);
+        bool ok = saveSnapshotFile(path, combo, p);
         m_statusBar->showMessage(ok ? "Saved: " + path : "Error saving: " + path, 4000);
     } else {
         QString filename1 = baseName + "_cam1";
@@ -4498,8 +5741,8 @@ void MainWindow::saveDualSnapshot(bool combined)
         ExifParams p1 = buildExifParams("dual_cam1");
         ExifParams p2 = buildExifParams("dual_cam2");
 
-        bool ok1 = saveWithExif(path1, f1, p1);
-        bool ok2 = saveWithExif(path2, f2, p2);
+        bool ok1 = saveSnapshotFile(path1, f1, p1);
+        bool ok2 = saveSnapshotFile(path2, f2, p2);
         if (ok1 && ok2)
             m_statusBar->showMessage("Saved cam1 and cam2 snapshots.", 4000);
         else
@@ -4537,6 +5780,48 @@ ExifParams MainWindow::buildExifParams(const QString& mode) const
     obj["noiseFloor"]      = m_noiseFloorSlider ? m_noiseFloorSlider->value() : m_noiseFloor;
     obj["intensityStretch"] = m_chkStretch && m_chkStretch->isChecked();
     obj["trackPeaks"]      = m_btnPeakIntensities && m_btnPeakIntensities->isChecked();
+    obj["channelBalanceK"] = m_channelK;
+    {
+        QJsonObject kc;
+        kc["k"] = m_channelK;
+        kc["source"] = m_kCal.source.isEmpty() ? QString("none") : m_kCal.source;
+        if (m_kCal.when.isValid()) kc["at"] = m_kCal.when.toString(Qt::ISODate);
+        if (m_kCal.source == "calibrated") {
+            kc["method"] = QString("k = median over frames of the per-frame median CAM1/CAM2; pixels %1..clip-1 DN "
+                                   "in both cameras, every 2nd row and column, inside the overlap")
+                               .arg(kKCalMinLevel);
+            kc["frames"] = m_kCal.frames;
+            QJsonArray perFrame;
+            for (double v : m_kCal.perFrame) perFrame.append(std::round(v * 1e6) / 1e6);
+            kc["perFrame"] = perFrame;
+            kc["pixelsPerFrame"] = m_kCal.pixels;
+            kc["sigma"] = m_kCal.sigma;
+            kc["pixelSpread"] = m_kCal.spread;
+            kc["exposureAtCalibration"] = m_kCal.exposure;
+            kc["exposureNow"] = exposureSignature();
+            kc["frameSize"] = QJsonArray{ m_kCal.frameSize.width(), m_kCal.frameSize.height() };
+        }
+        obj["channelBalance"] = kc;
+    }
+    obj["clipLevel"]       = m_clipLevel;
+    if (m_isDiffMode && m_diffStats.valid) {
+        const DiffStats& st = m_diffStats;
+        QJsonObject d;
+        d["formula"]       = "colour index = |CAM1 - k*CAM2| * displayGain (COLORMAP_JET)";
+        d["k"]             = st.k;
+        d["noiseFloorDN"]  = st.noiseFloor;
+        d["clipLevelDN"]   = st.clipLevel;
+        d["displayGain"]   = st.gain;
+        d["fullScaleDN"]   = st.fullScale;
+        d["maxAbsDiffDN"]  = st.maxValue;
+        d["clippedBoth"]   = st.clippedBoth;
+        d["clippedOne"]    = st.clippedOne;
+        d["noOverlap"]     = st.noData;
+        d["sharpnessMatch"] = st.psfChannel
+            ? QJsonObject{ { "blurredCamera", st.psfChannel }, { "sigmaPx", st.psfSigma } }
+            : QJsonObject();
+        obj["diff"] = d;
+    }
 
     QJsonObject align;
     align["enabled"]    = m_chkAlign && m_chkAlign->isChecked();
@@ -4550,10 +5835,23 @@ ExifParams MainWindow::buildExifParams(const QString& mode) const
     };
     align["manualCam1"] = adjToJson(m_manualAdj1);
     align["manualCam2"] = adjToJson(m_manualAdj2);
+    if (m_isAligned && m_eccWarpMatrix.rows == 3 && m_eccWarpMatrix.cols == 3) {
+        cv::Mat H;
+        m_eccWarpMatrix.convertTo(H, CV_64F);
+        QJsonArray warp;
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) warp.append(H.at<double>(r, c));
+        align["warp"] = warp;
+        align["warpModel"] = m_alignModelInfo;
+        align["warpSize"] = QJsonArray{ m_alignCalibSize.width, m_alignCalibSize.height };
+    }
     obj["alignment"] = align;
+
+    const bool exposureApplied = m_manualExposure && m_libcameraSession;
 
     QJsonObject exposure;
     exposure["mode"]       = m_manualExposure ? "manual" : "auto";
+    exposure["applied"]    = exposureApplied;
     exposure["perCamera"]  = m_perCameraExposure;
     if (m_perCameraExposure) {
         QJsonObject c1; c1["gain"] = m_gainQ8  / 256.0; c1["shutterUs"] = m_shutterUs;
@@ -4575,12 +5873,22 @@ ExifParams MainWindow::buildExifParams(const QString& mode) const
     obj["diffMode"]   = m_isDiffMode;
     obj["frameCount"] = m_frameCount;
 
-    QJsonDocument doc(obj);
-    p.description = doc.toJson(QJsonDocument::Compact).toStdString();
+    const QString json = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    std::string ascii;
+    ascii.reserve(static_cast<size_t>(json.size()));
+    for (const QChar c : json) {
+        if (c.unicode() < 0x80) ascii += static_cast<char>(c.unicode());
+        else ascii += QString::asprintf("\\u%04x", c.unicode()).toStdString();
+    }
+    p.description = ascii;
 
-    p.exposureTimeNum = m_shutterUs;
-    p.exposureTimeDen = 1000000;
-    p.isoSpeed = static_cast<uint16_t>(m_gainQ8 * 100 / 256);
+    if (exposureApplied) {
+        const bool cam2 = m_perCameraExposure && mode == "dual_cam2";
+        p.exposureTimeNum = static_cast<uint32_t>(cam2 ? m_shutter2Us : m_shutterUs);
+        p.exposureTimeDen = 1000000;
+        const int gainQ8 = std::max(256, cam2 ? m_gain2Q8 : m_gainQ8);
+        p.isoSpeed = static_cast<uint16_t>(gainQ8 * 100 / 256);
+    }
 
     return p;
 }
@@ -4600,7 +5908,10 @@ void MainWindow::saveSettings()
     s.setValue("noiseFloor", m_noiseFloorSlider->value());
     s.setValue("stretchIntensity", m_chkStretch->isChecked());
     s.setValue("trackPeaks", m_btnPeakIntensities->isChecked());
+    s.setValue("channelK", m_channelK);
+    s.setValue("clipLevel", m_clipLevel);
     s.setValue("appendParams", m_chkAppendParams ? m_chkAppendParams->isChecked() : false);
+    s.setValue("separateFiles", m_chkSeparateFiles ? m_chkSeparateFiles->isChecked() : false);
     s.beginGroup("FilenameParams");
     for (auto it = m_paramInName.constBegin(); it != m_paramInName.constEnd(); ++it) {
         s.setValue(it.key(), it.value());
@@ -4642,7 +5953,12 @@ void MainWindow::saveSettings()
     s.setValue("animBottomPanelEnabled", m_animBottomPanelEnabled);
     s.setValue("animTabsEnabled", m_animTabsEnabled);
     s.setValue("animDialogsEnabled", m_animDialogsEnabled);
+    s.setValue("resourceHud", m_resHudVisible);
+    s.setValue("eccPolish", m_chkEccPolish ? m_chkEccPolish->isChecked() : true);
+    s.setValue("persistAlign", m_chkPersistAlign ? m_chkPersistAlign->isChecked() : true);
     s.sync();
+
+    if (!m_chkPersistAlign || m_chkPersistAlign->isChecked()) saveAlignmentMatrix();
 }
 
 void MainWindow::loadSettings()
@@ -4654,6 +5970,7 @@ void MainWindow::loadSettings()
     m_animBottomPanelEnabled = s.value("animBottomPanelEnabled", true).toBool();
     m_animTabsEnabled        = s.value("animTabsEnabled", true).toBool();
     m_animDialogsEnabled     = s.value("animDialogsEnabled", true).toBool();
+    m_resHudVisible          = s.value("resourceHud", false).toBool();
 
     m_comboColorMode->setCurrentIndex(s.value("colorMode", 1).toInt());
     m_chkFlipVer2->setChecked(s.value("flipVer2", false).toBool());
@@ -4667,7 +5984,10 @@ void MainWindow::loadSettings()
     m_noiseFloorSlider->setValue(s.value("noiseFloor", 15).toInt());
     m_chkStretch->setChecked(s.value("stretchIntensity", false).toBool());
     m_btnPeakIntensities->setChecked(s.value("trackPeaks", false).toBool());
+    if (m_spnChannelK) loadKCalibration(s);
+    if (m_spnClipLevel) m_spnClipLevel->setValue(s.value("clipLevel", 254).toInt());
     if (m_chkAppendParams) m_chkAppendParams->setChecked(s.value("appendParams", false).toBool());
+    if (m_chkSeparateFiles) m_chkSeparateFiles->setChecked(s.value("separateFiles", false).toBool());
     s.beginGroup("FilenameParams");
     for (const auto& spec : kFilenameParamSpecs) {
         QString key = QString::fromLatin1(spec.key);
@@ -4728,11 +6048,19 @@ void MainWindow::loadSettings()
     }
     applyAdjustToWidgets();
 
+    if (m_chkEccPolish) m_chkEccPolish->setChecked(s.value("eccPolish", true).toBool());
+    if (m_chkPersistAlign) {
+        QSignalBlocker b(m_chkPersistAlign);
+        m_chkPersistAlign->setChecked(s.value("persistAlign", true).toBool());
+    }
+    if (!m_chkPersistAlign || m_chkPersistAlign->isChecked()) loadAlignmentMatrix();
+
     if (m_comboCamSet) {
-        const int cw = s.value("camW", 0).toInt();
-        const int ch = s.value("camH", 0).toInt();
-        const int cf = s.value("camFps", 0).toInt();
+        int cw = s.value("camW", 0).toInt();
+        int ch = s.value("camH", 0).toInt();
+        int cf = s.value("camFps", 0).toInt();
         if (cw > 0 && ch > 0 && cf > 0) {
+            fitToSensor(cw, ch, cf);
             int found = -1;
             for (int i = 0; i < m_comboCamSet->count(); ++i) {
                 QVariantList v = m_comboCamSet->itemData(i).toList();
@@ -4775,6 +6103,7 @@ void MainWindow::savePreset(const QString& name)
     s.setValue("noiseFloor", m_noiseFloorSlider->value());
     s.setValue("stretchIntensity", m_chkStretch->isChecked());
     s.setValue("trackPeaks", m_btnPeakIntensities->isChecked());
+    s.setValue("clipLevel", m_clipLevel);
     s.setValue("diffMode", m_isDiffMode);
     auto writeAdj = [&s](const QString& prefix, const ManualAdjust& a) {
         s.setValue(prefix + "tx", a.tx);
@@ -4809,6 +6138,7 @@ void MainWindow::loadPreset(const QString& name)
     m_noiseFloorSlider->setValue(s.value("noiseFloor", 15).toInt());
     m_chkStretch->setChecked(s.value("stretchIntensity", false).toBool());
     m_btnPeakIntensities->setChecked(s.value("trackPeaks", false).toBool());
+    if (m_spnClipLevel) m_spnClipLevel->setValue(s.value("clipLevel", m_clipLevel).toInt());
     bool diffMode = s.value("diffMode", m_isDiffMode).toBool();
     setDiffMode(diffMode);
     auto readAdj = [&s](const QString& prefix, ManualAdjust& a) {
@@ -4985,7 +6315,9 @@ void MainWindow::initCommands()
     };
 
     m_commands = {
-        {"cmd_stream", "Start / Stop Streams", "Capture", CmdType::Action, [this](){ if (m_camerasOpen) closeCameras(); else openCameras(); }, {}},
+        {"cmd_stream", "Start / Stop Streams", "Capture", CmdType::Action, [this](){
+            cameraTransition([this]() { if (m_camerasOpen) closeCameras(); else openCameras(); });
+        }, {}},
         {"cmd_snapshot", "Take Snapshot", "Capture", CmdType::Action, [this](){ saveSnapshot(); refreshSnapshotPreview(); }, {}},
         {"cmd_mode", "Toggle Dual / Diff Mode", "Capture", CmdType::Action, [this](){ setDiffMode(!m_isDiffMode); }, {}},
         {"cmd_focus", "Toggle Focus View", "Capture", CmdType::Action, [this](){ toggleFocusView(); }, {}},
@@ -5022,6 +6354,7 @@ void MainWindow::initCommands()
         {"cmd_stretch", "Toggle Intensity Stretch", "Pipeline", CmdType::Toggle, [this](){ if (m_chkStretch) m_chkStretch->setChecked(!m_chkStretch->isChecked()); }, {}},
         {"cmd_peaks", "Toggle Tracking Peaks", "Pipeline", CmdType::Toggle, [this](){ if (m_btnPeakIntensities) m_btnPeakIntensities->setChecked(!m_btnPeakIntensities->isChecked()); }, {}},
         {"cmd_calibrate", "Calibrate Alignment", "Pipeline", CmdType::Action, [this](){ calibrateAlignment(); }, {}},
+        {"cmd_calibrate_k", "Calibrate Channel Balance k", "Pipeline", CmdType::Action, [this](){ calibrateChannelBalance(); }, {}},
         {"cmd_open_align", "Open Manual Align Dialog", "Pipeline", CmdType::Action, [this](){ if (m_btnOpenManualAlign) m_btnOpenManualAlign->click(); }, {}},
 
         {"cmd_tbuffer", "Time Buffer Size", "Pipeline Parameters", CmdType::Parameter, {}, [this, createPopup](QWidget*){ createPopup("Time Buffer Size", m_bufferSlider); }},
@@ -5044,6 +6377,7 @@ void MainWindow::initCommands()
         {"cmd_delete_preset", "Delete Selected Preset", "Presets", CmdType::Action, [this](){ if (m_btnDeletePreset) m_btnDeletePreset->click(); }, {}},
 
         {"cmd_history", "Chart History Limit", "Options", CmdType::Parameter, {}, [this, createPopup](QWidget*){ createPopup("Chart History Limit", m_historySlider); }},
+        {"cmd_resources", "Toggle Resource Monitor", "Options", CmdType::Toggle, [this](){ toggleResourceHud(); }, {}},
 
         {"cmd_tour", "Show Quick Tour", "Help", CmdType::Action, [this](){ showQuickTour(); }, {}},
         {"cmd_help", "Open Help & Tips", "Help", CmdType::Action, [this](){ showHelpDialog(); }, {}}
@@ -5057,9 +6391,10 @@ void MainWindow::initCommands()
             applyShortcut(cmd.id, QKeySequence(keyStr));
         }
     }
+    const bool minimizeConfigured = s.contains("cmd_minimize_dialogs");
     s.endGroup();
 
-    if (!m_hotkeys.contains("cmd_minimize_dialogs") || m_hotkeys.value("cmd_minimize_dialogs").isEmpty()) {
+    if (!minimizeConfigured) {
         applyShortcut("cmd_minimize_dialogs", QKeySequence("Ctrl+Shift+M"));
     }
 }
@@ -5084,8 +6419,7 @@ void MainWindow::applyShortcut(const QString& id, const QKeySequence& seq)
 
     QSettings s(settingsPath(), QSettings::IniFormat);
     s.beginGroup("Hotkeys");
-    if (seq.isEmpty()) s.remove(id);
-    else s.setValue(id, seq.toString());
+    s.setValue(id, seq.toString());
     s.endGroup();
 }
 
@@ -5167,9 +6501,7 @@ protected:
         }
         int key = e->key();
         if (key == Qt::Key_Shift || key == Qt::Key_Control || key == Qt::Key_Alt || key == Qt::Key_Meta) {
-            m_seq = QKeySequence(key);
-            setSeq(m_seq);
-            if (onSequenceChanged) onSequenceChanged(m_seq);
+            setText("Press a key...");
         } else {
             QPushButton::keyReleaseEvent(e);
         }
@@ -5179,8 +6511,6 @@ private:
     QKeySequence m_seq;
 };
 
-/* First-run interactive tour: dims the window, highlights one UI region per
-   step and explains it. Esc / Skip closes, click or Next advances. */
 class TourOverlay : public QWidget {
 public:
     struct Step { QWidget* target; QString title; QString text; };
@@ -5372,34 +6702,59 @@ static QVector<HelpTopic> helpTopics()
           "AUTO / MAN toggles automatic and manual exposure. In manual mode the "
           "current gain × shutter is shown next to the toggle, and "
           "\"Detail...\" opens per-camera gain and shutter controls with "
-          "sliders and exact values." },
+          "sliders and exact values. Manual exposure drives libcamera (CSI) "
+          "cameras; USB / DirectShow cameras keep their own exposure." },
         { "Capture workspace",
           "Color mode (grayscale / color), flipping of CAM 2 (horizontal / "
           "vertical), bilateral noise filter with strength slider, and adaptive "
           "view options." },
         { "Pipeline & Diff",
-          "Pipeline contains the processing chain: noise floor, frame buffer "
-          "size, fusion and intensity stretch. Diff highlights differences "
-          "between cameras, with a motion threshold and a motion indicator; "
-          "peak intensities can be tracked on the chart." },
+          "Pipeline contains the processing chain: the T-buffer (temporal "
+          "averaging over N frames), the motion threshold with its indicator "
+          "(motion restarts the averaging), CAM1 + CAM2 fusion and the "
+          "alignment controls. Diff shows D = CAM1 − k·CAM2 as a colour "
+          "map with a scale in DN. k balances the two channels: Calibrate k on "
+          "an unpolarized, evenly lit scene with the laser off and the exposure "
+          "you will measure with; it takes the median of CAM1 / CAM2 over 20 "
+          "frames, saves k at once with the date, spread and exposure, and "
+          "keeps it until you calibrate again (presets do not touch it). Then "
+          "point the rig at the laser. The noise floor zeroes small "
+          "|D|, stretch multiplies |D| to fill the scale (the factor is shown), "
+          "and pixels clipped in both cameras count as 0. The line under the "
+          "controls lists every step applied. Peak tracking marks the "
+          "brightest spot of each camera." },
         { "Focus view",
           "Focus shows a live sharpness metric for both cameras as a chart plus "
           "large per-camera focus values — useful for fine lens adjustment. "
           "The history length is configurable." },
         { "Alignment",
           "The NO ALIGN pill in the top bar shows the alignment state. "
-          "Automatic ECC alignment can be enabled in the controls; manual "
-          "6-DOF alignment (shift, scale, rotation) is available in its own "
-          "dialog and is saved between sessions." },
+          "Calibrate (Pipeline) solves the CAM2 -> CAM1 warp from image "
+          "features, refines it to sub-pixel accuracy and, with ECC polish "
+          "on, by ECC; Apply to CAM2 uses it on every frame and Remember keeps "
+          "it between sessions. Manual 6-DOF alignment (shift, scale, "
+          "rotation) is available in its own dialog and is saved too." },
         { "Snapshots & gallery",
-          "SNAP saves a snapshot from both cameras. The filename is built from "
-          "a template with parameters (exposure, filters, etc.) — configure "
-          "them in the Snapshot workspace. The gallery (\"G\") lists recent "
-          "snapshots; \"Snapshots\" in the top bar opens the folder in the OS." },
+          "SNAP saves a snapshot from both cameras (side by side, or as two "
+          "files with \"Separate files\"); in DIFF mode it saves the difference "
+          "map. All settings are stored inside the image file, in its EXIF "
+          "metadata.The filename is built from a template with parameters "
+          "(exposure, filters, etc.) — configure them in the Snapshot "
+          "workspace. The gallery (\"G\") lists recent snapshots; "
+          "\"Snapshots\" in the top bar opens the folder in the OS." },
         { "Analysis viewers",
           "From a snapshot you can open analysis views: an intensity profile "
           "along a line (2D chart) and a 3D surface of a region's intensity "
           "with rotation, zoom, point picking and CSV export." },
+        { "Resource monitor",
+          "The CPU pill in the top bar shows machine CPU load and SoC "
+          "temperature; it turns amber at 70 \u00B0C, high CPU or a frequency "
+          "cap and red at 80 \u00B0C, throttling or under-voltage. Click it (or "
+          "bind \"Toggle Resource Monitor\") for an overlay with per-core load, "
+          "app / GUI / camera-thread CPU, ARM clock, fan, throttle flags, RAM "
+          "and camera / shown / dropped FPS. While streaming, the STREAMING "
+          "pill shows the camera FPS and turns amber when it falls behind the "
+          "requested rate." },
         { "Presets & settings",
           "Presets save the whole processing configuration and can be loaded "
           "or deleted in one click. Settings contains animation speed and "
@@ -5497,10 +6852,7 @@ void MainWindow::showHelpDialog()
 
     root->addWidget(bottomBar);
 
-    if (m_animDialogsEnabled) {
-        animateDialogEntry(&dlg, m_btnHelpDocs, m_animSpeedMs);
-    }
-    dlg.exec();
+    execDialog(&dlg, m_btnHelpDocs);
 }
 
 void MainWindow::showQuickTour()
@@ -5669,9 +7021,7 @@ void MainWindow::showActionsMenu()
 
     QFrame* bottomBar = new QFrame(&dlg);
     bottomBar->setObjectName("hotkeysBottomBar");
-    /* Scoped selector: an unscoped "background:" in a widget stylesheet is
-       inherited by every child — the Reset button was picking up the bar's
-       dark background under its own dark-on-accent text. */
+
     bottomBar->setStyleSheet(QString(
         "QFrame#hotkeysBottomBar { background: %1; border-top: 1px solid %2; }")
         .arg(T::bg2).arg(T::border));
@@ -5704,10 +7054,7 @@ void MainWindow::showActionsMenu()
 
     root->addWidget(bottomBar);
 
-    if (m_animDialogsEnabled) {
-        animateDialogEntry(&dlg, m_btnHelp, m_animSpeedMs);
-    }
-    dlg.exec();
+    execDialog(&dlg, m_btnHelp);
 }
 
 #include "mainwindow.moc"

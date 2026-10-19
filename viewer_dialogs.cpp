@@ -191,7 +191,8 @@ QDialog* makeProfileDialog(const QJsonObject& obj, QWidget* parent) {
         const QString dir = QDir::homePath();
         QString fileName = QFileDialog::getSaveFileName(w, "Export profile to CSV",
             dir + "/" + suggested,
-            "CSV file (*.csv);;Tab-separated (*.tsv);;Text file (*.txt)");
+            "CSV file (*.csv);;Tab-separated (*.tsv);;Text file (*.txt)",
+            nullptr, QFileDialog::DontUseNativeDialog);
         if (fileName.isEmpty()) return;
         const bool tabSep = fileName.endsWith(".tsv", Qt::CaseInsensitive);
         const QChar sep = tabSep ? QChar('\t') : QChar(',');
@@ -286,8 +287,7 @@ QDialog* makeSurfaceDialog(const QJsonObject& obj, QWidget* parent) {
 
     Q3DTheme* theme = new Q3DTheme(darkTheme ? Q3DTheme::ThemeEbony : Q3DTheme::ThemePrimaryColors);
     if (darkTheme) {
-        /* No "aquarium": the bright back/side walls are what made the dark
-           view ugly. Floating grid on the window background instead. */
+
         theme->setBackgroundEnabled(false);
         theme->setWindowColor(QColor("#0a0a0a"));
         theme->setLabelTextColor(QColor("#f2efee"));
@@ -309,8 +309,6 @@ QDialog* makeSurfaceDialog(const QJsonObject& obj, QWidget* parent) {
     }
     surface->setActiveTheme(theme);
 
-    /* Default camera: closer and at a readable isometric angle instead of
-       the far-away default. */
     if (surface->scene() && surface->scene()->activeCamera()) {
         Q3DCamera* cam = surface->scene()->activeCamera();
         cam->setCameraPreset(Q3DCamera::CameraPresetIsometricLeftHigh);
@@ -401,7 +399,7 @@ QDialog* makeSurfaceDialog(const QJsonObject& obj, QWidget* parent) {
             "Long form CSV — x,y,intensity (*.csv);;"
             "Matrix CSV — rows=Y, cols=X (*_matrix.csv);;"
             "Tab-separated long form (*.tsv)",
-            nullptr);
+            nullptr, QFileDialog::DontUseNativeDialog);
         if (fileName.isEmpty()) return;
 
         const bool matrixForm = fileName.contains("_matrix", Qt::CaseInsensitive)
@@ -458,7 +456,8 @@ QDialog* makeSurfaceDialog(const QJsonObject& obj, QWidget* parent) {
         QString dir = QDir::homePath();
         QString fileName = QFileDialog::getSaveFileName(w, "Save 3D snapshot",
             dir + "/" + suggested,
-            "PNG image (*.png);;JPEG image (*.jpg *.jpeg)");
+            "PNG image (*.png);;JPEG image (*.jpg *.jpeg)",
+            nullptr, QFileDialog::DontUseNativeDialog);
         if (fileName.isEmpty()) return;
         if (!fileName.endsWith(".png", Qt::CaseInsensitive)
             && !fileName.endsWith(".jpg", Qt::CaseInsensitive)

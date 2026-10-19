@@ -1,0 +1,64 @@
+# Build output
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake intermediate files at repo root (in case of in-source build)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakePresets.json
+!CMakeLists.txt
+
+# Compiled artifacts
+*.exe
+*.dll
+*.so
+*.so.*
+*.dylib
+*.a
+*.lib
+*.o
+*.obj
+*.exp
+*.pdb
+*.ilk
+DualCam
+DualCamViewer
+
+# Qt auto-generated
+*_autogen/
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.user.*
+*.swp
+*.swo
+.cache/
+
+# Local data
+metrics/
+*.7z
+*.zip
+*.tar
+*.gz
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Not part of the source repository
+dist/
+state/
+blender/
+.claude/
+/*.jpg
