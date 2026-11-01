@@ -16,8 +16,11 @@
 
 #include <deque>
 #include <vector>
+#include <array>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <QString>
 #include <QKeySequence>
 #include <QShortcut>
@@ -33,6 +36,8 @@
 #include <QList>
 #include <QPair>
 #include <QColor>
+#include <QElapsedTimer>
+#include <QPointF>
 
 enum class CmdType { Action, Toggle, Parameter };
 
@@ -107,6 +112,29 @@ private:
     QString m_scaleTitle;
 };
 
+struct FpsSample {
+    std::array<double, 3> fps{};
+    std::array<double, 2> lost{};
+    std::array<double, 2> unused{};
+    double notShown = 0.0;
+};
+
+class FpsPanel : public QWidget {
+    Q_OBJECT
+public:
+    explicit FpsPanel(QWidget* parent = nullptr);
+    void setHistory(const std::deque<FpsSample>& history, int requestedFps, int windowSeconds);
+    QSize sizeHint() const override;
+
+protected:
+    void paintEvent(QPaintEvent* event) override;
+
+private:
+    std::deque<FpsSample> m_history;
+    int m_requested = 0;
+    int m_window = 30;
+};
+
 struct DiffStats {
     bool valid = false;
     double k = 1.0;
@@ -131,6 +159,7 @@ struct KCalibration {
     double sigma = 0.0;
     double spread = 0.0;
     QString exposure;
+    QString flatField;
     QSize frameSize;
     std::vector<double> perFrame;
 };
@@ -157,6 +186,27 @@ struct WorkerParams {
     bool applyBilateral = false;
     int bilateralStrength = 5;
     int noiseFloor = 15;
+    int clipLevel = 254;
+};
+
+enum FieldKind { FieldDark = 1, FieldFlat = 2 };
+
+struct FieldFrame {
+    std::array<cv::Mat, 2> mean;
+    std::array<double, 2> noise{};
+    QDateTime when;
+    int frames = 0;
+    QString exposure;
+    bool valid() const { return !mean[0].empty() && !mean[1].empty(); }
+};
+
+struct FlatFieldStats {
+    std::array<double, 2> level{};
+    std::array<double, 2> gainMin{};
+    std::array<double, 2> gainMax{};
+    std::array<double, 2> noise{};
+    std::array<double, 2> clipped{};
+    std::array<int, 2> dead{};
 };
 
 class CameraWorker : public QThread {
@@ -169,38 +219,67 @@ public:
     bool startCamerasV4L2(int id1, int id2, int w, int h, int fps);
     void stopCameras();
     void setParams(const WorkerParams& p);
+    void setFlatField(const std::array<cv::Mat, 2>& gain, const std::array<cv::Mat, 2>& offset);
+    void startFieldCapture(int kind, int frames);
+    void cancelFieldCapture();
+    int fieldCaptureProgress();
 
     qint64 processedFrames() const { return m_statProcessed.load(); }
     qint64 droppedFrames() const { return m_statDropped.load(); }
+    qint64 cameraFrames(int cam) const { return m_statCam[cam].load(); }
+    qint64 lostFrames(int cam) const { return m_statLost[cam].load(); }
+    qint64 unusedFrames(int cam) const { return m_statUnused[cam].load(); }
     int threadId() const { return m_threadId.load(); }
 
 signals:
     void framesProcessed(cv::Mat f1, cv::Mat f2, double focus1, double focus2, bool motion, qint64 frameCount);
+    void fieldCaptured(int kind, int frames, cv::Mat sum1, cv::Mat sumSq1, cv::Mat sum2, cv::Mat sumSq2);
     void cameraError(QString msg);
 
 protected:
     void run() override;
 
 private:
-    cv::Mat applyTemporalDenoise(cv::Mat& frame, cv::Mat& ema, int bufferSize);
+    void launch();
+    void grabLoop(int cam);
+    void accumulateField(int cam, const cv::Mat& frame);
+    void applyTemporalDenoise(std::array<cv::Mat, 2>& frames, int bufferSize);
     double detectMotion(const cv::Mat& frame);
-    double calculateFocus(const cv::Mat& frame);
+    std::array<double, 2> calculateFocus(const std::array<cv::Mat, 2>& frames);
     cv::Mat toWorkingFormat(const cv::Mat& frame, ColorMode mode);
 
     cv::VideoCapture m_cap1;
     cv::VideoCapture m_cap2;
     std::atomic<bool> m_running{false};
+    std::array<QThread*, 2> m_grabbers{};
+
+    std::mutex m_slotMutex;
+    std::condition_variable m_slotCv;
+    std::array<cv::Mat, 2> m_slot;
+    std::array<quint64, 2> m_slotSeq{};
 
     QMutex m_paramMutex;
     WorkerParams m_params;
+    std::array<cv::Mat, 2> m_ffGain;
+    std::array<cv::Mat, 2> m_ffOffset;
+
+    QMutex m_captureMutex;
+    int m_captureKind = 0;
+    int m_captureTarget = 0;
+    std::array<int, 2> m_captureCount{};
+    std::array<cv::Mat, 2> m_captureSum;
+    std::array<cv::Mat, 2> m_captureSumSq;
 
     cv::Ptr<cv::BackgroundSubtractorMOG2> m_bgSubtractor;
-    cv::Mat m_ema1;
-    cv::Mat m_ema2;
+    std::array<cv::Mat, 2> m_ema;
     qint64 m_frameCount = 0;
 
     std::atomic<qint64> m_statProcessed{0};
     std::atomic<qint64> m_statDropped{0};
+    std::array<std::atomic<qint64>, 2> m_statCam{};
+    std::array<std::atomic<qint64>, 2> m_statLost{};
+    std::array<std::atomic<qint64>, 2> m_statUnused{};
+    double m_nominalIntervalMs = 0.0;
     std::atomic<int> m_threadId{0};
 
 public:
@@ -284,6 +363,7 @@ private:
     void updateEccPill();
     void updateFpsPill();
     void toggleResourceHud();
+    void toggleFpsHud();
     void updateResourceDisplay(const ResourceStats& st);
     QString formatResourceStats(const ResourceStats& st) const;
     void setNavItem(NavItem item);
@@ -314,6 +394,17 @@ private:
     void updateKInfo();
     QString exposureSignature() const;
     void updateDiffReadout(bool force = false);
+
+    void startFieldCapture(int kind);
+    void onFieldCaptured(int kind, int frames, cv::Mat sum1, cv::Mat sumSq1, cv::Mat sum2, cv::Mat sumSq2);
+    void rebuildFlatField();
+    void clearFlatField();
+    bool flatFieldActive() const;
+    QString flatFieldMismatch() const;
+    QString flatFieldSignature() const;
+    void updateFlatInfo();
+    bool saveFlatField();
+    void loadFlatField(QSettings& s);
 
     QStringList getLibCameraIds();
     void probeCameras();
@@ -357,6 +448,9 @@ private:
     cv::Mat m_frame2;
     cv::Mat m_eccWarpMatrix;
     cv::Mat m_lastDiffResult;
+    std::vector<double> m_validKey;
+    cv::Mat m_valid1;
+    cv::Mat m_valid2;
 
     cv::Size m_alignCalibSize{0, 0};
     QString m_alignModelInfo;
@@ -417,7 +511,7 @@ private:
     QMap<NavItem, QPushButton*> m_navButtons;
     QListWidget* m_snapshotRecent = nullptr;
 
-    QLabel* m_fpsPill;
+    QLabel* m_fpsPill = nullptr;
     QLabel* m_eccPill;
     QPushButton* m_btnGallery;
     QPushButton* m_btnHelp;
@@ -494,6 +588,20 @@ private:
     QLabel* m_lblKInfo = nullptr;
     QSpinBox* m_spnClipLevel = nullptr;
     QLabel* m_lblDiffInfo = nullptr;
+    QLabel* m_lblStretchGain = nullptr;
+
+    QCheckBox* m_chkFlatField = nullptr;
+    QPushButton* m_btnFlatDark = nullptr;
+    QPushButton* m_btnFlatFlat = nullptr;
+    QPushButton* m_btnFlatClear = nullptr;
+    QSpinBox* m_spnFlatFrames = nullptr;
+    QLabel* m_lblFlatInfo = nullptr;
+    FieldFrame m_ffDark;
+    FieldFrame m_ffFlat;
+    FlatFieldStats m_ffStats;
+    std::array<cv::Mat, 2> m_ffGain;
+    std::array<cv::Mat, 2> m_ffOffset;
+    int m_ffCapturing = 0;
 
     QLabel* m_lblFocus1Big;
     QLabel* m_lblFocus2Big;
@@ -503,6 +611,9 @@ private:
     QChart* m_chart;
     QLineSeries* m_seriesCam1;
     QLineSeries* m_seriesCam2;
+    QElapsedTimer m_focusChartClock;
+    QList<QPointF> m_focusPending1;
+    QList<QPointF> m_focusPending2;
 
     QWidget* m_focusDataWidget;
     QListWidget* m_snapshotPreview = nullptr;
@@ -552,6 +663,10 @@ private:
     QLabel* m_resHudText = nullptr;
     bool m_resHudVisible = false;
     qint64 m_displayedFrames = 0;
+    std::array<double, 2> m_camFps{-1.0, -1.0};
+    FpsPanel* m_fpsHud = nullptr;
+    bool m_fpsHudVisible = false;
+    std::deque<FpsSample> m_fpsHistory;
 };
 
 #endif

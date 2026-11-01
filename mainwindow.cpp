@@ -78,6 +78,7 @@
 #include <opencv2/calib3d.hpp>
 
 #include <iostream>
+#include <chrono>
 #ifdef Q_OS_LINUX
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -328,9 +329,27 @@ CameraWorker::CameraWorker(QObject* parent) : QThread(parent) {
 CameraWorker::~CameraWorker() {
     stopCameras();
 }
+void CameraWorker::launch() {
+    {
+        std::lock_guard<std::mutex> lock(m_slotMutex);
+        for (int i = 0; i < 2; ++i) {
+            m_slot[i].release();
+            m_slotSeq[i] = 0;
+        }
+    }
+    cancelFieldCapture();
+    m_frameCount = 0;
+    m_running = true;
+    for (int i = 0; i < 2; ++i) {
+        m_grabbers[i] = QThread::create([this, i]() { grabLoop(i); });
+        m_grabbers[i]->start();
+    }
+    start();
+}
 bool CameraWorker::startCameras(const std::string& pipe1, const std::string& pipe2, int w, int h, int fps) {
-    Q_UNUSED(w); Q_UNUSED(h); Q_UNUSED(fps);
+    Q_UNUSED(w); Q_UNUSED(h);
     stopCameras();
+    m_nominalIntervalMs = fps > 0 ? 1000.0 / fps : 0.0;
     m_cap1.open(pipe1, cv::CAP_GSTREAMER);
     m_cap2.open(pipe2, cv::CAP_GSTREAMER);
     if (!m_cap1.isOpened() || !m_cap2.isOpened()) {
@@ -339,13 +358,12 @@ bool CameraWorker::startCameras(const std::string& pipe1, const std::string& pip
         m_cap2.release();
         return false;
     }
-    m_frameCount = 0;
-    m_running = true;
-    start();
+    launch();
     return true;
 }
 bool CameraWorker::startCamerasV4L2(int id1, int id2, int w, int h, int fps) {
     stopCameras();
+    m_nominalIntervalMs = 0.0;
 #ifdef Q_OS_LINUX
     m_cap1.open(id1, cv::CAP_V4L2);
     m_cap2.open(id2, cv::CAP_V4L2);
@@ -365,21 +383,32 @@ bool CameraWorker::startCamerasV4L2(int id1, int id2, int w, int h, int fps) {
     m_cap2.set(cv::CAP_PROP_FRAME_WIDTH, w);
     m_cap2.set(cv::CAP_PROP_FRAME_HEIGHT, h);
     m_cap2.set(cv::CAP_PROP_FPS, fps);
-    m_frameCount = 0;
-    m_running = true;
-    start();
+    launch();
     return true;
 }
 void CameraWorker::stopCameras() {
     m_running = false;
+    m_slotCv.notify_all();
 
-    if (isRunning() && !wait(2000)) {
+    QList<QThread*> threads{this};
+    for (QThread* g : m_grabbers)
+        if (g) threads << g;
+    bool stalled = false;
+    for (QThread* t : threads)
+        if (t->isRunning() && !t->wait(2000)) stalled = true;
+    if (stalled) {
         m_cap1.release();
         m_cap2.release();
-        if (!wait(1000)) {
-            terminate();
-            wait();
+        for (QThread* t : threads) {
+            if (t->isRunning() && !t->wait(1000)) {
+                t->terminate();
+                t->wait();
+            }
         }
+    }
+    for (QThread*& g : m_grabbers) {
+        delete g;
+        g = nullptr;
     }
     if (m_cap1.isOpened()) m_cap1.release();
     if (m_cap2.isOpened()) m_cap2.release();
@@ -388,6 +417,53 @@ void CameraWorker::setParams(const WorkerParams& p) {
     m_paramMutex.lock();
     m_params = p;
     m_paramMutex.unlock();
+}
+void CameraWorker::setFlatField(const std::array<cv::Mat, 2>& gain, const std::array<cv::Mat, 2>& offset) {
+    QMutexLocker lock(&m_paramMutex);
+    m_ffGain = gain;
+    m_ffOffset = offset;
+}
+void CameraWorker::startFieldCapture(int kind, int frames) {
+    QMutexLocker lock(&m_captureMutex);
+    m_captureKind = kind;
+    m_captureTarget = frames;
+    for (int i = 0; i < 2; ++i) {
+        m_captureCount[i] = 0;
+        m_captureSum[i].release();
+        m_captureSumSq[i].release();
+    }
+}
+void CameraWorker::cancelFieldCapture() {
+    startFieldCapture(0, 0);
+}
+int CameraWorker::fieldCaptureProgress() {
+    QMutexLocker lock(&m_captureMutex);
+    return std::min(m_captureCount[0], m_captureCount[1]);
+}
+void CameraWorker::accumulateField(int cam, const cv::Mat& frame) {
+    QMutexLocker lock(&m_captureMutex);
+    if (m_captureTarget <= 0 || m_captureCount[cam] >= m_captureTarget || frame.depth() != CV_8U) return;
+    cv::Mat& sum = m_captureSum[cam];
+    cv::Mat& sumSq = m_captureSumSq[cam];
+    if (sum.size() != frame.size() || sum.channels() != frame.channels()) {
+        sum = cv::Mat::zeros(frame.size(), CV_32FC(frame.channels()));
+        sumSq = cv::Mat::zeros(frame.size(), CV_32FC(frame.channels()));
+        m_captureCount[cam] = 0;
+    }
+    cv::accumulate(frame, sum);
+    cv::accumulateSquare(frame, sumSq);
+    ++m_captureCount[cam];
+    if (m_captureCount[0] < m_captureTarget || m_captureCount[1] < m_captureTarget) return;
+
+    const int kind = m_captureKind, frames = m_captureTarget;
+    const std::array<cv::Mat, 2> sums = m_captureSum, squares = m_captureSumSq;
+    m_captureTarget = 0;
+    for (int i = 0; i < 2; ++i) {
+        m_captureSum[i].release();
+        m_captureSumSq[i].release();
+    }
+    lock.unlock();
+    emit fieldCaptured(kind, frames, sums[0], squares[0], sums[1], squares[1]);
 }
 cv::Mat CameraWorker::toWorkingFormat(const cv::Mat& frame, ColorMode mode) {
     if (frame.empty()) return frame;
@@ -415,87 +491,179 @@ double CameraWorker::detectMotion(const cv::Mat& frame) {
     double nonZero = cv::countNonZero(fgMask);
     return nonZero / (src.cols * src.rows);
 }
-cv::Mat CameraWorker::applyTemporalDenoise(cv::Mat& frame, cv::Mat& ema, int bufferSize) {
-    if (bufferSize <= 1 || frame.empty()) return frame;
-    double alpha = 1.0 / static_cast<double>(bufferSize);
-    int cvType = (frame.channels() == 3) ? CV_32FC3 : CV_32F;
-    if (ema.empty() || ema.size() != frame.size() || ema.type() != cvType) {
-        frame.convertTo(ema, cvType);
-    } else {
-        cv::accumulateWeighted(frame, ema, alpha);
+template <typename Fn>
+static void forEachRowBand(const std::array<cv::Mat, 2>& frames, const Fn& fn)
+{
+    const int rows0 = frames[0].rows, rows1 = frames[1].rows;
+    if (rows0 + rows1 <= 0) return;
+    cv::parallel_for_(cv::Range(0, rows0 + rows1), [&](const cv::Range& r) {
+        if (r.start < rows0) fn(0, cv::Range(r.start, std::min(r.end, rows0)));
+        if (r.end > rows0) fn(1, cv::Range(std::max(r.start, rows0) - rows0, r.end - rows0));
+    }, std::max(2, 4 * cv::getNumThreads()));
+}
+void CameraWorker::applyTemporalDenoise(std::array<cv::Mat, 2>& frames, int bufferSize) {
+    if (bufferSize <= 1) return;
+    const double alpha = 1.0 / static_cast<double>(bufferSize);
+    std::array<cv::Mat, 2> out;
+    std::array<bool, 2> seed{};
+    for (int i = 0; i < 2; ++i) {
+        if (frames[i].empty()) continue;
+        const int type = CV_MAKETYPE(CV_32F, frames[i].channels());
+        seed[i] = m_ema[i].size() != frames[i].size() || m_ema[i].type() != type;
+        if (seed[i]) m_ema[i].create(frames[i].size(), type);
+        out[i].create(frames[i].size(), frames[i].type());
     }
-    cv::Mat res;
-    ema.convertTo(res, frame.type());
-    return res;
+    forEachRowBand(frames, [&](int cam, const cv::Range& rows) {
+        const cv::Mat src = frames[cam].rowRange(rows);
+        cv::Mat ema = m_ema[cam].rowRange(rows);
+        cv::Mat dst = out[cam].rowRange(rows);
+        if (seed[cam]) src.convertTo(ema, ema.type());
+        else cv::accumulateWeighted(src, ema, alpha);
+        ema.convertTo(dst, dst.type());
+    });
+    frames = out;
 }
-double CameraWorker::calculateFocus(const cv::Mat& frame) {
-    if (frame.empty()) return 0.0;
-    cv::Mat gray;
-    if (frame.channels() == 3) cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-    else gray = frame;
-    cv::Mat laplacian;
-    cv::Laplacian(gray, laplacian, gray.depth() == CV_8U ? CV_16S : CV_64F);
-    cv::Scalar mean, stddev;
-    cv::meanStdDev(laplacian, mean, stddev);
-    return stddev.val[0] * stddev.val[0];
+std::array<double, 2> CameraWorker::calculateFocus(const std::array<cv::Mat, 2>& frames) {
+    std::array<cv::Mat, 2> gray;
+    for (int i = 0; i < 2; ++i) {
+        if (frames[i].channels() == 3) cv::cvtColor(frames[i], gray[i], cv::COLOR_BGR2GRAY);
+        else gray[i] = frames[i];
+    }
+    std::mutex sumMutex;
+    std::array<double, 2> sum{}, sumSq{};
+    forEachRowBand(gray, [&](int cam, const cv::Range& rows) {
+        cv::Mat laplacian;
+        cv::Laplacian(gray[cam].rowRange(rows), laplacian, gray[cam].depth() == CV_8U ? CV_16S : CV_64F);
+        const double s = cv::sum(laplacian)[0];
+        const double q = laplacian.dot(laplacian);
+        std::lock_guard<std::mutex> lock(sumMutex);
+        sum[cam] += s;
+        sumSq[cam] += q;
+    });
+    std::array<double, 2> focus{};
+    for (int i = 0; i < 2; ++i) {
+        const double n = static_cast<double>(gray[i].total());
+        if (n <= 0.0) continue;
+        const double mean = sum[i] / n;
+        focus[i] = std::max(0.0, sumSq[i] / n - mean * mean);
+    }
+    return focus;
 }
+static cv::Mat applyFlatField(const cv::Mat& raw, const cv::Mat& gain, const cv::Mat& offset, int clip)
+{
+    cv::Mat out(raw.size(), raw.type());
+    const int n = raw.cols * raw.channels();
+    for (int y = 0; y < raw.rows; ++y) {
+        const uchar* r = raw.ptr<uchar>(y);
+        const float* g = gain.ptr<float>(y);
+        const float* o = offset.ptr<float>(y);
+        uchar* d = out.ptr<uchar>(y);
+        for (int x = 0; x < n; ++x) {
+            const float v = std::clamp(r[x] * g[x] - o[x] + 0.5f, 0.0f, 255.0f);
+            d[x] = r[x] >= clip ? uchar(255) : static_cast<uchar>(v);
+        }
+    }
+    return out;
+}
+
+void CameraWorker::grabLoop(int cam) {
+    using Clock = std::chrono::steady_clock;
+    cv::VideoCapture& cap = cam == 0 ? m_cap1 : m_cap2;
+    int failedReads = 0;
+    Clock::time_point lastArrival;
+    std::array<double, 15> intervals{};
+    int intervalCount = 0;
+    qint64 suspected = 0;
+    cv::Mat raw;
+    while (m_running) {
+        if (!cap.read(raw) || raw.empty()) {
+            if (++failedReads == 200)
+                emit cameraError(QString("CAM%1 stream stalled: no frames are arriving").arg(cam + 1));
+            QThread::msleep(10);
+            continue;
+        }
+        failedReads = 0;
+        m_statCam[cam].fetch_add(1);
+
+        const Clock::time_point now = Clock::now();
+        if (lastArrival != Clock::time_point()) {
+            const double dt = std::chrono::duration<double, std::milli>(now - lastArrival).count();
+            intervals[intervalCount++ % intervals.size()] = dt;
+            double period = m_nominalIntervalMs;
+            if (period <= 0.0 && intervalCount >= 5) {
+                std::array<double, 15> sorted = intervals;
+                const size_t n = std::min<size_t>(intervalCount, sorted.size());
+                std::nth_element(sorted.begin(), sorted.begin() + n / 2, sorted.begin() + n);
+                period = sorted[n / 2];
+            }
+            if (period > 0.0 && intervalCount > 10) {
+                if (suspected > 0 && dt >= 0.5 * period) m_statLost[cam].fetch_add(suspected);
+                suspected = std::max<qint64>(0, std::llround(dt / period) - 1);
+            }
+        }
+        lastArrival = now;
+
+        m_paramMutex.lock();
+        const ColorMode mode = m_params.colorMode;
+        const int clip = m_params.clipLevel;
+        const cv::Mat gain = m_ffGain[cam];
+        const cv::Mat offset = m_ffOffset[cam];
+        m_paramMutex.unlock();
+
+        cv::Mat frame = toWorkingFormat(raw, mode);
+        accumulateField(cam, frame);
+        if (!gain.empty() && frame.depth() == CV_8U && gain.size() == frame.size()
+            && gain.channels() == frame.channels())
+            frame = applyFlatField(frame, gain, offset, clip);
+        if (frame.datastart == raw.datastart) raw.release();
+
+        {
+            std::lock_guard<std::mutex> lock(m_slotMutex);
+            m_slot[cam] = frame;
+            ++m_slotSeq[cam];
+        }
+        m_slotCv.notify_one();
+    }
+}
+
 void CameraWorker::run() {
 #ifdef Q_OS_LINUX
     m_threadId = static_cast<int>(::syscall(SYS_gettid));
 #elif defined(Q_OS_WIN)
     m_threadId = static_cast<int>(reinterpret_cast<quintptr>(QThread::currentThreadId()));
 #endif
-    int failedGrabs = 0;
+    std::array<quint64, 2> taken{};
     while (m_running) {
-        cv::Mat f1, f2;
-        if (!m_cap1.grab() || !m_cap2.grab()) {
-            if (++failedGrabs == 200) emit cameraError("Camera stream stalled: no frames are arriving");
-            QThread::msleep(10);
-            continue;
+        std::array<cv::Mat, 2> f;
+        {
+            std::unique_lock<std::mutex> lock(m_slotMutex);
+            const auto fresh = [&]() { return m_slotSeq[0] != taken[0] && m_slotSeq[1] != taken[1]; };
+            m_slotCv.wait_for(lock, std::chrono::milliseconds(100), [&]() { return !m_running || fresh(); });
+            if (!m_running || !fresh()) continue;
+            for (int i = 0; i < 2; ++i)
+                if (taken[i] > 0) m_statUnused[i].fetch_add(qint64(m_slotSeq[i] - taken[i] - 1));
+            taken = m_slotSeq;
+            f[0] = std::move(m_slot[0]);
+            f[1] = std::move(m_slot[1]);
         }
-        failedGrabs = 0;
-        m_cap1.retrieve(f1);
-        m_cap2.retrieve(f2);
-
-        if (f1.empty() || f2.empty()) continue;
 
         m_paramMutex.lock();
         WorkerParams p = m_params;
         m_paramMutex.unlock();
 
-        if (p.flipHor2 && p.flipVer2) cv::flip(f2, f2, -1);
-        else if (p.flipHor2) cv::flip(f2, f2, 1);
-        else if (p.flipVer2) cv::flip(f2, f2, 0);
+        for (cv::Mat& m : f) m = toWorkingFormat(m, p.colorMode);
 
-        f1 = toWorkingFormat(f1, p.colorMode);
-        f2 = toWorkingFormat(f2, p.colorMode);
+        if (p.flipHor2 && p.flipVer2) cv::flip(f[1], f[1], -1);
+        else if (p.flipHor2) cv::flip(f[1], f[1], 1);
+        else if (p.flipVer2) cv::flip(f[1], f[1], 0);
 
-        double motion = detectMotion(f2);
+        double motion = detectMotion(f[1]);
         bool motionDetected = (motion > p.motionThr);
 
-        if (motionDetected) {
-            m_ema1.release();
-            m_ema2.release();
-        }
+        if (motionDetected)
+            for (cv::Mat& ema : m_ema) ema.release();
 
-        f1 = applyTemporalDenoise(f1, m_ema1, p.bufferSize);
-        f2 = applyTemporalDenoise(f2, m_ema2, p.bufferSize);
-
-        if (p.applyBilateral) {
-            const int depth = f1.depth();
-            if (depth == CV_8U || depth == CV_32F) {
-                int s = std::max(1, std::min(20, p.bilateralStrength));
-                int d = (s % 2 == 0) ? s + 1 : s;
-                double sigma = 10.0 * s;
-                cv::Mat b1, b2;
-                cv::bilateralFilter(f1, b1, d, sigma, sigma);
-                cv::bilateralFilter(f2, b2, d, sigma, sigma);
-                f1 = b1; f2 = b2;
-            }
-        }
-
-        double focus1 = calculateFocus(f1);
-        double focus2 = calculateFocus(f2);
+        applyTemporalDenoise(f, p.bufferSize);
 
         m_frameCount++;
         m_statProcessed.fetch_add(1);
@@ -504,8 +672,25 @@ void CameraWorker::run() {
             m_statDropped.fetch_add(1);
             continue;
         }
+
+        if (p.applyBilateral) {
+            const int depth = f[0].depth();
+            if (depth == CV_8U || depth == CV_32F) {
+                int s = std::max(1, std::min(20, p.bilateralStrength));
+                int d = (s % 2 == 0) ? s + 1 : s;
+                double sigma = 10.0 * s;
+                for (cv::Mat& m : f) {
+                    cv::Mat b;
+                    cv::bilateralFilter(m, b, d, sigma, sigma);
+                    m = b;
+                }
+            }
+        }
+
+        const std::array<double, 2> focus = calculateFocus(f);
+
         m_pendingFrames.fetch_add(1);
-        emit framesProcessed(f1, f2, focus1, focus2, motionDetected, m_frameCount);
+        emit framesProcessed(f[0], f[1], focus[0], focus[1], motionDetected, m_frameCount);
     }
     m_threadId = 0;
 }
@@ -804,9 +989,191 @@ static void setPillState(QLabel* lbl, const char* state, const QString& text = Q
     lbl->update();
 }
 
+static QFont monoFont(int pixelSize, bool bold)
+{
+    QFont f;
+    f.setFamilies({"Space Mono", "JetBrains Mono", "Consolas", "DejaVu Sans Mono", "Liberation Mono"});
+    f.setStyleHint(QFont::Monospace);
+    f.setPixelSize(pixelSize);
+    f.setBold(bold);
+    return f;
+}
+
+static QString fpsSegment(const QString& name, const QString& value, bool warn)
+{
+    return QString("<span style='color:%1'>%2&nbsp;%3&nbsp;FPS</span>")
+        .arg(warn ? "#f5c98a" : "#8fe0a4", name, value);
+}
+
+static QString fpsPillText(const std::array<QString, 3>& values, const std::array<bool, 3>& warn)
+{
+    static const char* names[3] = {"C1", "C2", "P"};
+    QStringList parts;
+    for (int i = 0; i < 3; ++i) parts << fpsSegment(names[i], values[size_t(i)], warn[size_t(i)]);
+    return parts.join("&nbsp;&nbsp;·&nbsp;&nbsp;");
+}
+
+static constexpr int kFpsPad = 12;
+static constexpr int kFpsTitleH = 18;
+static constexpr int kFpsNameH = 20;
+static constexpr int kFpsLineH = 17;
+static constexpr int kFpsGap = 10;
+static constexpr int kFpsTextW = 232;
+static constexpr int kFpsPlotW = 180;
+
+FpsPanel::FpsPanel(QWidget* parent)
+    : QWidget(parent)
+{
+    setAttribute(Qt::WA_TransparentForMouseEvents);
+}
+
+void FpsPanel::setHistory(const std::deque<FpsSample>& history, int requestedFps, int windowSeconds)
+{
+    m_history = history;
+    m_requested = requestedFps;
+    m_window = std::max(2, windowSeconds);
+    update();
+}
+
+QSize FpsPanel::sizeHint() const
+{
+    const int blocks = 3 * kFpsNameH + 7 * kFpsLineH + 2 * kFpsGap;
+    return QSize(2 * kFpsPad + kFpsTextW + 14 + kFpsPlotW, 2 * kFpsPad + kFpsTitleH + 8 + blocks);
+}
+
+void FpsPanel::paintEvent(QPaintEvent*)
+{
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setPen(QPen(QColor(255, 255, 255, 40), 1.0));
+    p.setBrush(QColor(12, 12, 12, 235));
+    p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8);
+
+    const QColor textCol(T::text), dimCol(T::textDim), okCol(T::ok), warnCol(T::warn), lossCol(T::err);
+    const QColor refCol(255, 255, 255, 90);
+    const int plotLeft = kFpsPad + kFpsTextW + 14;
+    const int right = width() - kFpsPad;
+
+    p.setFont(monoFont(11, true));
+    p.setPen(dimCol);
+    const QRect titleRect(kFpsPad, kFpsPad, right - kFpsPad, kFpsTitleH);
+    p.drawText(titleRect, Qt::AlignLeft | Qt::AlignVCenter, QString("FRAME RATE · LAST %1 s").arg(m_window));
+    if (m_requested > 0) {
+        const QString legend = QString("requested %1").arg(m_requested);
+        p.drawText(titleRect, Qt::AlignRight | Qt::AlignVCenter, legend);
+        const int lx = right - p.fontMetrics().horizontalAdvance(legend) - 8;
+        const double ly = titleRect.center().y() + 0.5;
+        p.setPen(QPen(refCol, 1.0, Qt::DashLine));
+        p.drawLine(QPointF(lx - 18, ly), QPointF(lx, ly));
+    }
+
+    const int n = int(m_history.size());
+    double scaleMax = std::max(1.0, double(m_requested));
+    for (const FpsSample& s : m_history)
+        for (double v : s.fps) scaleMax = std::max(scaleMax, v);
+    scaleMax *= 1.1;
+
+    struct Row { QString name; QColor color; int index; int lines; };
+    const Row rows[3] = {
+        { "C1", QColor(T::cam1), 0, 2 },
+        { "C2", QColor(T::cam2), 1, 2 },
+        { "P",  textCol,         2, 3 },
+    };
+    int y0 = kFpsPad + kFpsTitleH + 8;
+    for (const Row& row : rows) {
+        const int idx = row.index;
+        const int blockH = kFpsNameH + row.lines * kFpsLineH;
+
+        double mn = 0.0, mx = 0.0, sum = 0.0, lossA = 0.0, lossB = 0.0, notShown = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const FpsSample& s = m_history[size_t(i)];
+            const double v = s.fps[size_t(idx)];
+            mn = i == 0 ? v : std::min(mn, v);
+            mx = i == 0 ? v : std::max(mx, v);
+            sum += v;
+            if (idx < 2) {
+                lossA += s.lost[size_t(idx)];
+            } else {
+                lossA += s.unused[0];
+                lossB += s.unused[1];
+                notShown += s.notShown;
+            }
+        }
+
+        p.setFont(monoFont(15, true));
+        p.setPen(row.color);
+        p.drawText(QRect(kFpsPad, y0, 34, kFpsNameH), Qt::AlignLeft | Qt::AlignVCenter, row.name);
+        p.setPen(textCol);
+        p.drawText(QRect(kFpsPad + 34, y0, kFpsTextW - 34, kFpsNameH), Qt::AlignLeft | Qt::AlignVCenter,
+                   n > 0 ? QString("%1 FPS").arg(m_history.back().fps[size_t(idx)], 0, 'f', 1) : QString("—"));
+
+        p.setFont(monoFont(12, false));
+        auto line = [&](int k, const QColor& c, const QString& t) {
+            p.setPen(c);
+            p.drawText(QRect(kFpsPad, y0 + kFpsNameH + k * kFpsLineH, kFpsTextW, kFpsLineH),
+                       Qt::AlignLeft | Qt::AlignVCenter, t);
+        };
+        if (n > 0) {
+            line(0, dimCol, QString("min %1  avg %2  max %3")
+                                .arg(mn, 0, 'f', 1).arg(sum / n, 0, 'f', 1).arg(mx, 0, 'f', 1));
+            if (idx < 2) {
+                const qint64 total = std::llround(lossA);
+                line(1, total > 0 ? warnCol : okCol,
+                     total > 0 ? QString("lost %1  ·  %2/s").arg(total).arg(lossA / n, 0, 'f', 1)
+                               : QString("no frames lost"));
+            } else {
+                const bool unused = std::llround(lossA) > 0 || std::llround(lossB) > 0;
+                line(1, unused ? warnCol : okCol, QString("unused C1 %1  C2 %2 /s")
+                                                      .arg(lossA / n, 0, 'f', 1).arg(lossB / n, 0, 'f', 1));
+                line(2, std::llround(notShown) > 0 ? warnCol : okCol,
+                     QString("not shown %1 /s").arg(notShown / n, 0, 'f', 1));
+            }
+        }
+
+        const QRectF plot(plotLeft, y0 + 3, right - plotLeft, blockH - 8);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(255, 255, 255, 10));
+        p.drawRoundedRect(plot.adjusted(-4, -3, 4, 3), 4, 4);
+        auto yOf = [&](double v) { return plot.bottom() - v / scaleMax * plot.height(); };
+        if (m_requested > 0) {
+            p.setPen(QPen(refCol, 1.0, Qt::DashLine));
+            p.drawLine(QPointF(plot.left(), yOf(m_requested)), QPointF(plot.right(), yOf(m_requested)));
+        }
+        if (n > 0) {
+            const double step = plot.width() / (m_window - 1);
+            auto xOf = [&](int i) { return plot.right() - (n - 1 - i) * step; };
+            QPolygonF trace;
+            for (int i = 0; i < n; ++i) trace << QPointF(xOf(i), yOf(m_history[size_t(i)].fps[size_t(idx)]));
+            p.setPen(QPen(row.color, 1.8));
+            p.setBrush(Qt::NoBrush);
+            p.drawPolyline(trace);
+            p.setPen(Qt::NoPen);
+            p.setBrush(lossCol);
+            for (int i = 0; i < n; ++i) {
+                const FpsSample& s = m_history[size_t(i)];
+                const double loss = idx < 2 ? s.lost[size_t(idx)] : s.unused[0] + s.unused[1] + s.notShown;
+                if (loss >= 0.5) p.drawEllipse(QPointF(xOf(i), plot.bottom()), 2.4, 2.4);
+            }
+        }
+        y0 += blockH + kFpsGap;
+    }
+}
+
 static constexpr int kKCalFrames = 20;
 static constexpr int kKCalMinLevel = 24;
 static constexpr int kKCalMinPixels = 1000;
+
+static constexpr double kGainMin = 1.0;
+static constexpr double kGainMax = 20.0;
+static constexpr int kShutterMinUs = 50;
+static constexpr int kShutterMaxUs = 40000;
+static constexpr int kFrameMarginUs = 500;
+
+static constexpr int kFpsWindowSeconds = 30;
+static constexpr qint64 kFocusChartIntervalMs = 50;
+
+static constexpr int kFieldFramesDefault = 64;
+static constexpr double kFieldDeadFraction = 0.1;
 
 static QString settingsPath()
 {
@@ -828,6 +1195,7 @@ static const FilenameParamSpec kFilenameParamSpecs[] = {
     {"ECC", "Align (ECC)"},
     {"NF",  "Noise Floor (NF#)"},
     {"ST",  "Intensity Stretch (ST)"},
+    {"FF",  "Flat field (FF)"},
     {"G",   "Gain (G#x)"},
     {"SH",  "Shutter (SH#us)"},
     {"CM",  "Color Mode (RGB/GRY)"},
@@ -849,6 +1217,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_worker, &CameraWorker::cameraError, this, [this](const QString& msg) {
         if (m_statusBar) m_statusBar->showMessage(msg, 5000);
     });
+    connect(m_worker, &CameraWorker::fieldCaptured, this, &MainWindow::onFieldCaptured, Qt::QueuedConnection);
 
     for (const auto& spec : kFilenameParamSpecs) {
         m_paramInName[QString::fromLatin1(spec.key)] = true;
@@ -864,6 +1233,12 @@ MainWindow::MainWindow(QWidget* parent)
     m_resMonitor = new ResourceMonitor([this]() {
         ResourceMonitor::FrameCounters c;
         if (m_worker) {
+            c.cam1 = m_worker->cameraFrames(0);
+            c.cam2 = m_worker->cameraFrames(1);
+            c.lost1 = m_worker->lostFrames(0);
+            c.lost2 = m_worker->lostFrames(1);
+            c.unused1 = m_worker->unusedFrames(0);
+            c.unused2 = m_worker->unusedFrames(1);
             c.processed = m_worker->processedFrames();
             c.dropped = m_worker->droppedFrames();
             c.workerThreadId = m_worker->threadId();
@@ -1180,6 +1555,10 @@ void MainWindow::initUI()
     m_fpsPill = new QLabel("IDLE", this);
     m_fpsPill->setProperty("role", "pill");
     m_fpsPill->setProperty("pillState", "idle");
+    m_fpsPill->setTextFormat(Qt::RichText);
+    m_fpsPill->setCursor(Qt::PointingHandCursor);
+    m_fpsPill->setToolTip("Frame rate of CAM1, CAM2 and the pipeline (P) — click for the last 30 s");
+    m_fpsPill->installEventFilter(this);
     m_eccPill = new QLabel("NO ALIGN", this);
     m_eccPill->setProperty("role", "pill");
     m_eccPill->setProperty("pillState", "err");
@@ -1230,40 +1609,40 @@ void MainWindow::initUI()
 
     auto buildGainSpin = [this](int q8) {
         auto* s = new QDoubleSpinBox(this);
-        s->setRange(0.1, 10.0);
+        s->setRange(kGainMin, kGainMax);
         s->setDecimals(2);
         s->setSingleStep(0.1);
         s->setSuffix("x");
-        s->setValue(qBound(0.1, q8 / 256.0, 10.0));
+        s->setValue(qBound(kGainMin, q8 / 256.0, kGainMax));
         s->setKeyboardTracking(false);
         s->hide();
         return s;
     };
     auto buildGainSlider = [this](double initVal) {
         auto* s = new QSlider(Qt::Horizontal, this);
-        s->setRange(10, 1000);
+        s->setRange(int(kGainMin * 100), int(kGainMax * 100));
         s->setSingleStep(10);
         s->setPageStep(50);
-        s->setValue(qBound(10, static_cast<int>(initVal * 100.0 + 0.5), 1000));
+        s->setValue(qBound(int(kGainMin * 100), static_cast<int>(initVal * 100.0 + 0.5), int(kGainMax * 100)));
         s->hide();
         return s;
     };
     auto buildShutterSpin = [this](int us) {
         auto* s = new QSpinBox(this);
-        s->setRange(50, 30000);
+        s->setRange(kShutterMinUs, kShutterMaxUs);
         s->setSingleStep(100);
         s->setSuffix(" us");
-        s->setValue(qBound(50, us, 30000));
+        s->setValue(qBound(kShutterMinUs, us, kShutterMaxUs));
         s->setKeyboardTracking(false);
         s->hide();
         return s;
     };
     auto buildShutterSlider = [this](int initVal) {
         auto* s = new QSlider(Qt::Horizontal, this);
-        s->setRange(50, 30000);
+        s->setRange(kShutterMinUs, kShutterMaxUs);
         s->setSingleStep(100);
         s->setPageStep(1000);
-        s->setValue(qBound(50, initVal, 30000));
+        s->setValue(qBound(kShutterMinUs, initVal, kShutterMaxUs));
         s->hide();
         return s;
     };
@@ -1512,6 +1891,9 @@ void MainWindow::initUI()
     hudLay->addWidget(m_resHudText);
     m_resHud->hide();
 
+    m_fpsHud = new FpsPanel(m_videoArea);
+    m_fpsHud->hide();
+
     m_videoArea->installEventFilter(this);
 
     m_mainSplit = new QSplitter(Qt::Horizontal, this);
@@ -1671,7 +2053,57 @@ QWidget* MainWindow::buildCaptureTab()
         if (m_view2) m_view2->setStretch(stretch);
         if (m_resultView) m_resultView->setStretch(stretch);
     });
-    grid->addWidget(m_chkStretchView, 3, 0);
+    grid->addWidget(m_chkStretchView, 3, 0, Qt::AlignTop);
+
+    grid->addWidget(sectionLabel("FLAT FIELD"), 2, 1, 1, 2);
+    QWidget* ffBox = new QWidget(this);
+    QVBoxLayout* ffCol = new QVBoxLayout(ffBox);
+    ffCol->setContentsMargins(0, 0, 0, 0);
+    ffCol->setSpacing(4);
+    QHBoxLayout* ffLay = new QHBoxLayout();
+    ffLay->setContentsMargins(0, 0, 0, 0);
+    ffLay->setSpacing(6);
+    m_chkFlatField = new QCheckBox("Apply", this);
+    m_chkFlatField->setEnabled(false);
+    m_chkFlatField->setToolTip("Flat-field correction of each camera, pixel by pixel, right after capture:\n"
+                               "C = (R − D)·m / (F − D), m = frame mean of (F − D).\n"
+                               "Removes vignetting and pixel-response non-uniformity, so CAM1/CAM2 becomes one\n"
+                               "ratio over the whole field. Recalibrate k after switching it on or off.");
+    connect(m_chkFlatField, &QCheckBox::toggled, this, [this]() { rebuildFlatField(); });
+    m_btnFlatDark = new QPushButton("Dark frame", this);
+    m_btnFlatDark->setToolTip("Averages the frames with both lenses capped, exposure as for the measurement.\n"
+                              "Optional: without it D = 0 (the libcamera ISP already subtracts the black level).\n"
+                              "Click again to cancel.");
+    connect(m_btnFlatDark, &QPushButton::clicked, this, [this]() { startFieldCapture(FieldDark); });
+    m_btnFlatFlat = new QPushButton("Flat frame", this);
+    m_btnFlatFlat->setToolTip("Averages the frames of a uniform, unpolarized target that fills the view: an opal\n"
+                              "diffuser over the lens or a matte white sheet, slightly defocused. Not the sky:\n"
+                              "skylight is polarized, and its polarization would be divided out of every frame.\n"
+                              "Exposure as for the measurement, 50–80 % of full scale. Click again to cancel.");
+    connect(m_btnFlatFlat, &QPushButton::clicked, this, [this]() { startFieldCapture(FieldFlat); });
+    m_spnFlatFrames = new QSpinBox(this);
+    m_spnFlatFrames->setRange(8, 256);
+    m_spnFlatFrames->setValue(kFieldFramesDefault);
+    m_spnFlatFrames->setSuffix(" fr");
+    m_spnFlatFrames->setToolTip("Frames averaged per map. The noise of the map falls as 1/√N and stays in every\n"
+                                "corrected frame as a fixed pattern, so it must be well below the pixel-response\n"
+                                "non-uniformity it corrects (0.3–1 %).");
+    m_btnFlatClear = new QPushButton("Clear", this);
+    m_btnFlatClear->setProperty("kind", "ghost");
+    connect(m_btnFlatClear, &QPushButton::clicked, this, &MainWindow::clearFlatField);
+    ffLay->addWidget(m_chkFlatField);
+    ffLay->addWidget(m_btnFlatDark);
+    ffLay->addWidget(m_btnFlatFlat);
+    ffLay->addWidget(m_spnFlatFrames);
+    ffLay->addWidget(m_btnFlatClear);
+    ffLay->addStretch();
+    ffCol->addLayout(ffLay);
+    m_lblFlatInfo = new QLabel(this);
+    m_lblFlatInfo->setWordWrap(true);
+    m_lblFlatInfo->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    ffCol->addWidget(m_lblFlatInfo);
+    grid->addWidget(ffBox, 3, 1, 1, 2, Qt::AlignTop);
+    updateFlatInfo();
 
     grid->setColumnStretch(0, 1);
     grid->setColumnStretch(1, 1);
@@ -1883,7 +2315,18 @@ QWidget* MainWindow::buildDiffTab()
         updateView();
         updateDiffReadout(true);
     });
-    grid->addWidget(m_chkStretch, 1, 1);
+    m_lblStretchGain = new QLabel(this);
+    m_lblStretchGain->setProperty("role", "mono");
+    m_lblStretchGain->setToolTip("Display gain G applied to |D| (colour index = |D|·G) and the top of the\n"
+                                 "colour scale 255/G in DN. Without stretch G = 1.");
+    QWidget* stretchBox = new QWidget(this);
+    QHBoxLayout* stretchLay = new QHBoxLayout(stretchBox);
+    stretchLay->setContentsMargins(0, 0, 0, 0);
+    stretchLay->setSpacing(10);
+    stretchLay->addWidget(m_chkStretch);
+    stretchLay->addWidget(m_lblStretchGain);
+    stretchLay->addStretch();
+    grid->addWidget(stretchBox, 1, 1);
 
     grid->addWidget(sectionLabel("PEAKS"), 0, 2);
     m_btnPeakIntensities = new QPushButton("Track peaks", this);
@@ -1951,6 +2394,8 @@ QWidget* MainWindow::buildDiffTab()
                                "cameras they are equal by definition, so D = 0 there whatever k is.");
     connect(m_spnClipLevel, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
         m_clipLevel = v;
+        pushWorkerParams();
+        updateFlatInfo();
         updateView();
         updateDiffReadout(true);
     });
@@ -3364,12 +3809,23 @@ void MainWindow::positionFloatingButtons(bool animate)
 
         animateButton(m_btnFloatingPreviewToggle, m_previewMode, QPoint(pad, pad));
     }
+    int hudTop = 40;
+    if (m_fpsHud) {
+        const bool show = m_fpsHudVisible && !camerasHidden;
+        if (show) {
+            m_fpsHud->resize(m_fpsHud->sizeHint());
+            m_fpsHud->move(w - pad - m_fpsHud->width(), hudTop);
+            m_fpsHud->raise();
+            hudTop += m_fpsHud->height() + 6;
+        }
+        m_fpsHud->setVisible(show);
+    }
     if (m_resHud) {
 
         const bool show = m_resHudVisible && !camerasHidden;
         if (show) {
             m_resHud->adjustSize();
-            m_resHud->move(w - pad - m_resHud->width(), 40);
+            m_resHud->move(w - pad - m_resHud->width(), hudTop);
             m_resHud->raise();
         }
         m_resHud->setVisible(show);
@@ -3531,12 +3987,19 @@ void MainWindow::updateEccPill()
 void MainWindow::updateFpsPill()
 {
     if (!m_fpsPill) return;
-    if (m_camerasOpen) {
-        setPillState(m_fpsPill, "ok", "STREAMING");
-    } else {
+    if (m_camerasOpen)
+        setPillState(m_fpsPill, "ok", fpsPillText({"--", "--", "--"}, {false, false, false}));
+    else
         setPillState(m_fpsPill, "idle", "IDLE");
-        m_fpsPill->setToolTip(QString());
-    }
+    m_fpsHistory.clear();
+    if (m_fpsHud) m_fpsHud->setHistory(m_fpsHistory, m_camerasOpen ? m_requestedFps : 0, kFpsWindowSeconds);
+}
+
+void MainWindow::toggleFpsHud()
+{
+    m_fpsHudVisible = !m_fpsHudVisible;
+    if (m_fpsHud) m_fpsHud->setHistory(m_fpsHistory, m_camerasOpen ? m_requestedFps : 0, kFpsWindowSeconds);
+    positionFloatingButtons(false);
 }
 
 void MainWindow::toggleResourceHud()
@@ -3562,7 +4025,7 @@ QString MainWindow::formatResourceStats(const ResourceStats& st) const
     if (st.appCpu >= 0) {
         QString l = "APP    " + pct(st.appCpu);
         if (st.guiThreadCpu >= 0)    l += QString("   GUI %1%").arg(qRound(st.guiThreadCpu));
-        if (st.workerThreadCpu >= 0) l += QString("  CAM %1%").arg(qRound(st.workerThreadCpu));
+        if (st.workerThreadCpu >= 0) l += QString("  PIPE %1%").arg(qRound(st.workerThreadCpu));
         lines << l;
     }
     if (st.tempC >= 0 || st.armMHz > 0) {
@@ -3587,7 +4050,9 @@ QString MainWindow::formatResourceStats(const ResourceStats& st) const
         lines << l;
     }
     if (st.processedFps >= 0) {
-        lines << QString("FPS   camera %1   shown %2   dropped %3")
+        lines << QString("FPS   CAM1 %1   CAM2 %2   pipeline %3   shown %4   not shown %5")
+                     .arg(st.cam1Fps, 0, 'f', 1)
+                     .arg(st.cam2Fps, 0, 'f', 1)
                      .arg(st.processedFps, 0, 'f', 1)
                      .arg(st.displayedFps, 0, 'f', 1)
                      .arg(st.droppedFps, 0, 'f', 1);
@@ -3615,17 +4080,31 @@ void MainWindow::updateResourceDisplay(const ResourceStats& st)
         else if (now & PiThrottle::UnderVoltageNow) text += " \u00B7 LOW V";
         setPillState(m_resPill, state, text);
         m_resPill->setToolTip(formatResourceStats(st)
-                              + "\n\nAPP/GUI/CAM are % of one core (4 cores = 400%)."
+                              + "\n\nAPP/GUI/PIPE are % of one core (4 cores = 400%)."
                                 "\nClick to toggle the overlay.");
     }
 
     if (m_fpsPill && m_camerasOpen && st.processedFps >= 0) {
-        const bool behind = m_requestedFps > 0 && st.processedFps < 0.9 * m_requestedFps;
-        setPillState(m_fpsPill, behind ? "warn" : "ok",
-                     QString("STREAMING %1 FPS").arg(qRound(st.processedFps), 2));
-        m_fpsPill->setToolTip(QString("Camera %1 fps (requested %2), shown %3 fps, dropped %4 fps")
-                                  .arg(st.processedFps, 0, 'f', 1).arg(m_requestedFps)
-                                  .arg(st.displayedFps, 0, 'f', 1).arg(st.droppedFps, 0, 'f', 1));
+        m_camFps = {st.cam1Fps, st.cam2Fps};
+        FpsSample sample;
+        sample.fps = {st.cam1Fps, st.cam2Fps, st.processedFps};
+        sample.lost = {st.cam1Lost, st.cam2Lost};
+        sample.unused = {st.cam1Unused, st.cam2Unused};
+        sample.notShown = st.droppedFps;
+        m_fpsHistory.push_back(sample);
+        while (int(m_fpsHistory.size()) > kFpsWindowSeconds) m_fpsHistory.pop_front();
+
+        auto cameraBehind = [this](double fps, double lost) {
+            return (m_requestedFps > 0 && fps < 0.9 * m_requestedFps) || lost >= 0.5;
+        };
+        const double slowest = std::min(st.cam1Fps, st.cam2Fps);
+        const std::array<bool, 3> warn = {cameraBehind(st.cam1Fps, st.cam1Lost),
+                                          cameraBehind(st.cam2Fps, st.cam2Lost),
+                                          st.processedFps < 0.9 * slowest};
+        setPillState(m_fpsPill, warn[0] || warn[1] || warn[2] ? "warn" : "ok",
+                     fpsPillText({QString::number(qRound(st.cam1Fps)), QString::number(qRound(st.cam2Fps)),
+                                  QString::number(qRound(st.processedFps))}, warn));
+        if (m_fpsHud && m_fpsHudVisible) m_fpsHud->setHistory(m_fpsHistory, m_requestedFps, kFpsWindowSeconds);
     }
 
     if (m_resHud && m_resHudVisible && m_resHudText) {
@@ -3843,6 +4322,7 @@ void MainWindow::openCameras()
     }
 
     bool started = false;
+    QString fpsNote;
     QStringList camPaths = getLibCameraIds();
     const bool libcamera = camPaths.size() >= 2;
     if (!libcamera) {
@@ -3867,6 +4347,15 @@ void MainWindow::openCameras()
             return;
         }
     } else {
+        if (m_manualExposure) {
+            const int longest = m_perCameraExposure ? std::max(m_shutterUs, m_shutter2Us) : m_shutterUs;
+            const int fpsLimit = std::max(1, 1000000 / (longest + kFrameMarginUs));
+            if (reqFps > fpsLimit) {
+                fpsNote = QString(" Shutter %1 us does not fit into a frame at %2 FPS: frame rate lowered to %3 FPS.")
+                              .arg(longest).arg(reqFps).arg(fpsLimit);
+                reqFps = fpsLimit;
+            }
+        }
         std::string p1 = makeGStreamerPipeline(camPaths[0], reqW, reqH, reqFps, 0);
         std::string p2 = makeGStreamerPipeline(camPaths[1], reqW, reqH, reqFps, 1);
         started = m_worker->startCameras(p1, p2, reqW, reqH, reqFps);
@@ -3903,6 +4392,9 @@ void MainWindow::openCameras()
     m_frameCount = 0;
     m_seriesCam1->clear();
     m_seriesCam2->clear();
+    m_focusPending1.clear();
+    m_focusPending2.clear();
+    m_focusChartClock.invalidate();
 
     m_chart->axes(Qt::Horizontal).first()->setRange(0, m_maxHistory);
 
@@ -3913,14 +4405,20 @@ void MainWindow::openCameras()
     m_btnFabStream->style()->polish(m_btnFabStream);
     updateDiffReadout(true);
 
-    m_statusBar->showMessage("Cameras OK. Noise suppression active.", 4000);
+    m_statusBar->showMessage("Cameras OK. Noise suppression active." + fpsNote, fpsNote.isEmpty() ? 4000 : 10000);
 }
 
 void MainWindow::closeCameras()
 {
     m_worker->stopCameras();
     m_camerasOpen = false;
+    m_camFps = {-1.0, -1.0};
     if (m_kCalTarget > 0) stopKCalibration("Calibrate k: stopped, cameras closed. k unchanged.");
+    if (m_ffCapturing) {
+        m_ffCapturing = 0;
+        updateFlatInfo();
+        if (m_statusBar) m_statusBar->showMessage("Flat field: capture stopped, cameras closed.", 5000);
+    }
 
     if (m_comboCamSet) m_comboCamSet->setEnabled(true);
 
@@ -4021,8 +4519,10 @@ cv::Mat MainWindow::applyDiffView(const cv::Mat& d1, const cv::Mat& d2,
             int k = static_cast<int>(std::ceil(sigma * 3.0)) | 1;
             if (k < 3) k = 3;
             if (k > 31) k = 31;
-            if (f1 > f2) cv::GaussianBlur(ga, ga, cv::Size(k, k), sigma);
-            else         cv::GaussianBlur(gb, gb, cv::Size(k, k), sigma);
+            cv::Mat& sharper = (f1 > f2) ? ga : gb;
+            cv::Mat blurred;
+            cv::GaussianBlur(sharper, blurred, cv::Size(k, k), sigma);
+            sharper = blurred;
             st.psfChannel = (f1 > f2) ? 1 : 2;
             st.psfSigma = sigma;
         }
@@ -4197,6 +4697,7 @@ void MainWindow::collectKSample()
     rec.sigma = n > 1 ? std::sqrt(var / (n - 1)) : 0.0;
     rec.spread = medianOf(m_kCalSpreads);
     rec.exposure = exposureSignature();
+    rec.flatField = flatFieldSignature();
     rec.frameSize = QSize(m_lastDiffA.cols, m_lastDiffA.rows);
     rec.perFrame = m_kCalSamples;
     const double k = std::clamp(medianOf(m_kCalSamples), m_spnChannelK->minimum(), m_spnChannelK->maximum());
@@ -4252,6 +4753,7 @@ void MainWindow::saveKCalibration()
         s.setValue("sigma", m_kCal.sigma);
         s.setValue("pixelSpread", m_kCal.spread);
         s.setValue("exposure", m_kCal.exposure);
+        s.setValue("flatField", m_kCal.flatField.isEmpty() ? QString("off") : m_kCal.flatField);
         s.setValue("frameWidth", m_kCal.frameSize.width());
         s.setValue("frameHeight", m_kCal.frameSize.height());
         QStringList perFrame;
@@ -4274,6 +4776,7 @@ void MainWindow::loadKCalibration(QSettings& s)
     rec.sigma = s.value("sigma", 0.0).toDouble();
     rec.spread = s.value("pixelSpread", 0.0).toDouble();
     rec.exposure = s.value("exposure").toString();
+    rec.flatField = s.value("flatField", "off").toString();
     rec.frameSize = QSize(s.value("frameWidth", 0).toInt(), s.value("frameHeight", 0).toInt());
     for (const QString& v : s.value("perFrame").toStringList()) rec.perFrame.push_back(v.toDouble());
     s.endGroup();
@@ -4301,6 +4804,8 @@ void MainWindow::updateKInfo()
                    .arg(when).arg(c.frames).arg(c.sigma, 0, 'f', 4).arg(c.spread * 100.0, 0, 'f', 1);
         if (!c.exposure.isEmpty() && c.exposure != exposureSignature())
             warning = "Exposure changed since calibration: recalibrate k.";
+        else if ((c.flatField.isEmpty() ? QString("off") : c.flatField) != flatFieldSignature())
+            warning = "Flat-field correction changed since calibration: recalibrate k.";
     } else if (c.source == "manual") {
         text = QString("Entered by hand %1").arg(when);
     } else {
@@ -4328,12 +4833,22 @@ void MainWindow::updateDiffReadout(bool force)
     }
     if (m_diffReadoutTimer) m_diffReadoutTimer->stop();
     updateKInfo();
+    updateFlatInfo();
 
     const DiffStats& st = m_diffStats;
     const bool stretch = m_chkStretch && m_chkStretch->isChecked();
+    if (m_lblStretchGain) {
+        const bool live = m_isDiffMode && m_camerasOpen && st.valid;
+        const QString gainText = !live ? QString("×%1").arg(stretch ? QString("—") : QString("1"))
+            : QString("×%1  ·  top %2 DN")
+                  .arg(st.gain, 0, 'f', st.gain < 10.0 ? 2 : 1)
+                  .arg(st.fullScale, 0, 'f', st.fullScale < 10.0 ? 1 : 0);
+        if (m_lblStretchGain->text() != gainText) m_lblStretchGain->setText(gainText);
+    }
     QStringList lines;
     lines << QString("D = CAM1 − k·CAM2, k = %1  ·  |D| ≤ %2 DN shown as 0  ·  clipped ≥ %3 DN")
                  .arg(m_channelK, 0, 'f', 4).arg(m_noiseFloor).arg(m_clipLevel);
+    if (flatFieldSignature() != "off") lines.back() += "  ·  flat-field corrected";
     if (m_isDiffMode && m_camerasOpen && st.valid) {
         lines << QString("Colour = |D| × %1  (%2: top of scale = %3 DN)  ·  max |D| %4 DN")
                      .arg(st.gain, 0, 'f', st.gain < 10.0 ? 2 : 1)
@@ -4358,6 +4873,322 @@ void MainWindow::updateDiffReadout(bool force)
     if (m_lblDiffInfo->text() != text) m_lblDiffInfo->setText(text);
 }
 
+static double meanLevel(const cv::Mat& m)
+{
+    const cv::Scalar s = cv::mean(m);
+    double sum = 0.0;
+    for (int c = 0; c < m.channels(); ++c) sum += s[c];
+    return m.channels() > 0 ? sum / m.channels() : 0.0;
+}
+
+static bool sameShape(const cv::Mat& a, const cv::Mat& b)
+{
+    return a.size() == b.size() && a.channels() == b.channels();
+}
+
+static QString fieldShape(const cv::Mat& m)
+{
+    return QString("%1x%2 %3").arg(m.cols).arg(m.rows).arg(m.channels() == 1 ? "grey" : "colour");
+}
+
+static QString flatFieldDir()
+{
+    return QFileInfo(settingsPath()).absolutePath() + "/flatfield";
+}
+
+static bool writeFieldMap(const QString& path, const cv::Mat& mean)
+{
+    cv::Mat u16;
+    mean.convertTo(u16, CV_16U, 256.0);
+    std::vector<uchar> buf;
+    if (!cv::imencode(".png", u16, buf)) return false;
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly)) return false;
+    return f.write(reinterpret_cast<const char*>(buf.data()), qint64(buf.size())) == qint64(buf.size());
+}
+
+static cv::Mat readFieldMap(const QString& path)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return cv::Mat();
+    const QByteArray data = f.readAll();
+    if (data.isEmpty()) return cv::Mat();
+    const cv::Mat encoded(1, int(data.size()), CV_8U, const_cast<char*>(data.constData()));
+    const cv::Mat u16 = cv::imdecode(encoded, cv::IMREAD_UNCHANGED);
+    if (u16.empty() || u16.depth() != CV_16U) return cv::Mat();
+    cv::Mat mean;
+    u16.convertTo(mean, CV_32F, 1.0 / 256.0);
+    return mean;
+}
+
+void MainWindow::startFieldCapture(int kind)
+{
+    if (m_ffCapturing) {
+        m_worker->cancelFieldCapture();
+        m_ffCapturing = 0;
+        updateFlatInfo();
+        m_statusBar->showMessage("Flat field: capture cancelled, nothing changed.", 4000);
+        return;
+    }
+    if (!m_camerasOpen) {
+        m_statusBar->showMessage("Flat field: open the cameras first.", 3000);
+        return;
+    }
+    m_ffCapturing = kind;
+    m_worker->startFieldCapture(kind, m_spnFlatFrames ? m_spnFlatFrames->value() : kFieldFramesDefault);
+    updateFlatInfo();
+    m_statusBar->showMessage(kind == FieldDark
+                                 ? "Dark frame: averaging, keep both lenses capped."
+                                 : "Flat frame: averaging the uniform target, keep the rig still.");
+}
+
+void MainWindow::onFieldCaptured(int kind, int frames, cv::Mat sum1, cv::Mat sumSq1, cv::Mat sum2, cv::Mat sumSq2)
+{
+    if (kind != m_ffCapturing || frames <= 0) return;
+    m_ffCapturing = 0;
+    if (!sameShape(sum1, sum2)) {
+        updateFlatInfo();
+        m_statusBar->showMessage("Flat field: the two cameras delivered different frame formats. Nothing changed.", 8000);
+        return;
+    }
+
+    FieldFrame f;
+    f.when = QDateTime::currentDateTime();
+    f.frames = frames;
+    f.exposure = exposureSignature();
+    const std::array<cv::Mat, 2> sums{sum1, sum2};
+    const std::array<cv::Mat, 2> squares{sumSq1, sumSq2};
+    for (int i = 0; i < 2; ++i) {
+        f.mean[i] = sums[i] / frames;
+        cv::Mat var = squares[i] / frames - f.mean[i].mul(f.mean[i]);
+        var = cv::max(var, 0.0);
+        cv::Mat stdErr;
+        cv::sqrt(var / frames, stdErr);
+        std::vector<float> v;
+        stdErr.reshape(1, 1).copyTo(v);
+        f.noise[i] = v.empty() ? 0.0 : medianOf(v);
+    }
+
+    QString msg;
+    if (kind == FieldDark) {
+        m_ffDark = f;
+        msg = QString("Dark frame: %1 frames, CAM1 %2 DN, CAM2 %3 DN.")
+                  .arg(frames).arg(meanLevel(f.mean[0]), 0, 'f', 2).arg(meanLevel(f.mean[1]), 0, 'f', 2);
+        if (std::max(meanLevel(f.mean[0]), meanLevel(f.mean[1])) > 20.0)
+            msg += " That is bright for a dark frame: are both lenses capped?";
+    } else {
+        m_ffFlat = f;
+    }
+    rebuildFlatField();
+    if (kind == FieldFlat) {
+        const FlatFieldStats& s = m_ffStats;
+        msg = QString("Flat frame: %1 frames, CAM1 %2 DN (gain %3–%4), CAM2 %5 DN (gain %6–%7), noise %8 / %9 %.")
+                  .arg(frames)
+                  .arg(s.level[0], 0, 'f', 1).arg(s.gainMin[0], 0, 'f', 3).arg(s.gainMax[0], 0, 'f', 3)
+                  .arg(s.level[1], 0, 'f', 1).arg(s.gainMin[1], 0, 'f', 3).arg(s.gainMax[1], 0, 'f', 3)
+                  .arg(s.noise[0] * 100.0, 0, 'f', 2).arg(s.noise[1] * 100.0, 0, 'f', 2);
+        if (!flatFieldActive()) msg += " Tick Apply to correct the frames, then recalibrate k.";
+        else msg += " Recalibrate k.";
+    }
+    msg += saveFlatField() ? " Saved." : " Could not save to " + flatFieldDir() + ".";
+    m_statusBar->showMessage(msg, 15000);
+}
+
+void MainWindow::rebuildFlatField()
+{
+    m_ffStats = FlatFieldStats();
+    for (int i = 0; i < 2; ++i) {
+        m_ffGain[i].release();
+        m_ffOffset[i].release();
+    }
+    if (m_ffFlat.valid()) {
+        for (int i = 0; i < 2; ++i) {
+            const cv::Mat& flat = m_ffFlat.mean[i];
+            const cv::Mat dark = m_ffDark.valid() && sameShape(m_ffDark.mean[i], flat)
+                                     ? m_ffDark.mean[i] : cv::Mat::zeros(flat.size(), flat.type());
+            const cv::Mat signal = flat - dark;
+            const double level = meanLevel(signal);
+            if (level <= 0.0) continue;
+            cv::Mat gain;
+            cv::divide(level, signal, gain);
+            const cv::Mat dead = signal <= kFieldDeadFraction * level;
+            gain.setTo(1.0, dead);
+            m_ffGain[i] = gain;
+            m_ffOffset[i] = dark.mul(gain);
+
+            const cv::Mat live = dead == 0;
+            const double total = double(flat.total() * flat.channels());
+            m_ffStats.level[i] = level;
+            m_ffStats.dead[i] = cv::countNonZero(dead.reshape(1));
+            cv::minMaxLoc(gain.reshape(1), &m_ffStats.gainMin[i], &m_ffStats.gainMax[i], nullptr, nullptr,
+                          live.reshape(1));
+            m_ffStats.noise[i] = m_ffFlat.noise[i] / level;
+            m_ffStats.clipped[i] = cv::countNonZero(flat.reshape(1) >= m_clipLevel - 0.5) / total;
+        }
+    }
+    const bool active = flatFieldActive() && !m_ffGain[0].empty() && !m_ffGain[1].empty();
+    if (m_worker) {
+        m_worker->setFlatField(active ? m_ffGain : std::array<cv::Mat, 2>{},
+                               active ? m_ffOffset : std::array<cv::Mat, 2>{});
+    }
+    updateFlatInfo();
+    updateKInfo();
+}
+
+void MainWindow::clearFlatField()
+{
+    if (QMessageBox::question(this, "Flat field", "Delete the saved dark and flat frames?")
+        != QMessageBox::Yes)
+        return;
+    m_ffFlat = FieldFrame();
+    m_ffDark = FieldFrame();
+    if (m_chkFlatField) {
+        QSignalBlocker b(m_chkFlatField);
+        m_chkFlatField->setChecked(false);
+    }
+    rebuildFlatField();
+    saveFlatField();
+    m_statusBar->showMessage("Flat field: dark and flat frames deleted, correction off.", 5000);
+}
+
+bool MainWindow::flatFieldActive() const
+{
+    return m_chkFlatField && m_chkFlatField->isChecked() && m_ffFlat.valid();
+}
+
+QString MainWindow::flatFieldMismatch() const
+{
+    if (!m_ffFlat.valid() || m_frame1.empty() || sameShape(m_ffFlat.mean[0], m_frame1)) return QString();
+    return QString("the flat is %1, the frames are %2").arg(fieldShape(m_ffFlat.mean[0]), fieldShape(m_frame1));
+}
+
+QString MainWindow::flatFieldSignature() const
+{
+    if (!flatFieldActive() || !flatFieldMismatch().isEmpty()) return "off";
+    QString sig = "flat " + m_ffFlat.when.toString(Qt::ISODate);
+    if (m_ffDark.valid() && sameShape(m_ffDark.mean[0], m_ffFlat.mean[0]))
+        sig += ", dark " + m_ffDark.when.toString(Qt::ISODate);
+    return sig;
+}
+
+void MainWindow::updateFlatInfo()
+{
+    if (!m_lblFlatInfo) return;
+    const int target = m_spnFlatFrames ? m_spnFlatFrames->value() : kFieldFramesDefault;
+    const int progress = m_ffCapturing && m_worker ? m_worker->fieldCaptureProgress() : 0;
+    auto setButton = [&](QPushButton* b, int kind, const QString& idle) {
+        if (!b) return;
+        b->setText(m_ffCapturing == kind ? QString("Cancel %1/%2").arg(progress).arg(target) : idle);
+        b->setEnabled(!m_ffCapturing || m_ffCapturing == kind);
+    };
+    setButton(m_btnFlatDark, FieldDark, "Dark frame");
+    setButton(m_btnFlatFlat, FieldFlat, "Flat frame");
+    if (m_btnFlatClear) m_btnFlatClear->setEnabled(!m_ffCapturing && (m_ffFlat.valid() || m_ffDark.valid()));
+    if (m_spnFlatFrames) m_spnFlatFrames->setEnabled(!m_ffCapturing);
+    if (m_chkFlatField) m_chkFlatField->setEnabled(m_ffFlat.valid());
+
+    const QString fmt = "dd.MM.yyyy HH:mm";
+    QStringList lines, warnings;
+    if (m_ffFlat.valid()) {
+        const FlatFieldStats& s = m_ffStats;
+        lines << QString("Flat %1  ·  %2 frames  ·  %3")
+                     .arg(m_ffFlat.when.toString(fmt)).arg(m_ffFlat.frames).arg(fieldShape(m_ffFlat.mean[0]));
+        for (int i = 0; i < 2; ++i) {
+            QString l = QString("CAM%1  %2 DN  ·  gain %3–%4  ·  noise %5 %")
+                            .arg(i + 1).arg(s.level[i], 0, 'f', 1)
+                            .arg(s.gainMin[i], 0, 'f', 3).arg(s.gainMax[i], 0, 'f', 3)
+                            .arg(s.noise[i] * 100.0, 0, 'f', 2);
+            if (s.dead[i] > 0) l += QString("  ·  %1 dead").arg(s.dead[i]);
+            lines << l;
+        }
+        const QString mismatch = flatFieldMismatch();
+        if (!mismatch.isEmpty()) warnings << "Not applied: " + mismatch + ". Measure the flat again.";
+        if (m_ffFlat.exposure != exposureSignature()) warnings << "Exposure changed since the flat was taken.";
+        const double clipped = std::max(s.clipped[0], s.clipped[1]);
+        if (clipped > 0.001)
+            warnings << QString("Flat overexposed: %1 % of its pixels reach the clip level.")
+                            .arg(clipped * 100.0, 0, 'f', 1);
+        const double dim = std::min(s.level[0], s.level[1]);
+        if (dim < 50.0)
+            warnings << QString("Flat is dim (%1 DN): aim for 50–80 % of full scale.").arg(dim, 0, 'f', 0);
+    } else {
+        lines << "No flat frame.";
+    }
+    if (m_ffDark.valid()) {
+        lines << QString("Dark %1  ·  %2 frames  ·  CAM1 %3 DN  ·  CAM2 %4 DN")
+                     .arg(m_ffDark.when.toString(fmt)).arg(m_ffDark.frames)
+                     .arg(meanLevel(m_ffDark.mean[0]), 0, 'f', 2).arg(meanLevel(m_ffDark.mean[1]), 0, 'f', 2);
+        if (m_ffFlat.valid() && !sameShape(m_ffDark.mean[0], m_ffFlat.mean[0]))
+            warnings << "The dark frame does not match the flat and is not used.";
+        else if (m_ffDark.exposure != exposureSignature())
+            warnings << "Exposure changed since the dark frame was taken.";
+    } else {
+        lines << "No dark frame: D = 0.";
+    }
+
+    QString html = QString("<span style='color:%1'>%2</span>")
+                       .arg(T::textFaint, lines.join('\n').toHtmlEscaped().replace('\n', "<br>"));
+    for (const QString& w : warnings)
+        html += QString("<br><span style='color:%1'>%2</span>").arg(T::warn, w.toHtmlEscaped());
+    if (m_lblFlatInfo->text() != html) m_lblFlatInfo->setText(html);
+}
+
+bool MainWindow::saveFlatField()
+{
+    const QString dir = flatFieldDir();
+    QDir().mkpath(dir);
+    bool ok = true;
+    QSettings s(settingsPath(), QSettings::IniFormat);
+    s.beginGroup("FlatField");
+    s.remove("");
+    auto store = [&](const QString& name, const FieldFrame& f) {
+        for (int i = 0; i < 2; ++i) {
+            const QString path = QString("%1/%2_cam%3.png").arg(dir, name).arg(i + 1);
+            if (f.valid()) ok = writeFieldMap(path, f.mean[i]) && ok;
+            else QFile::remove(path);
+        }
+        if (!f.valid()) return;
+        s.beginGroup(name);
+        s.setValue("when", f.when.toString(Qt::ISODate));
+        s.setValue("frames", f.frames);
+        s.setValue("exposure", f.exposure);
+        s.setValue("noise1", f.noise[0]);
+        s.setValue("noise2", f.noise[1]);
+        s.endGroup();
+    };
+    store("flat", m_ffFlat);
+    store("dark", m_ffDark);
+    s.endGroup();
+    s.sync();
+    return ok;
+}
+
+void MainWindow::loadFlatField(QSettings& s)
+{
+    const QString dir = flatFieldDir();
+    auto load = [&](const QString& name) {
+        FieldFrame f;
+        s.beginGroup("FlatField/" + name);
+        f.when = QDateTime::fromString(s.value("when").toString(), Qt::ISODate);
+        f.frames = s.value("frames", 0).toInt();
+        f.exposure = s.value("exposure").toString();
+        f.noise = {s.value("noise1", 0.0).toDouble(), s.value("noise2", 0.0).toDouble()};
+        s.endGroup();
+        if (!f.when.isValid()) return FieldFrame();
+        for (int i = 0; i < 2; ++i)
+            f.mean[i] = readFieldMap(QString("%1/%2_cam%3.png").arg(dir, name).arg(i + 1));
+        if (!f.valid() || !sameShape(f.mean[0], f.mean[1])) return FieldFrame();
+        return f;
+    };
+    m_ffFlat = load("flat");
+    m_ffDark = load("dark");
+    if (m_chkFlatField) {
+        QSignalBlocker b(m_chkFlatField);
+        m_chkFlatField->setChecked(s.value("flatFieldEnabled", false).toBool() && m_ffFlat.valid());
+    }
+    rebuildFlatField();
+}
+
 bool MainWindow::eventFilter(QObject* obj, QEvent* event)
 {
     if (obj == m_spnChannelK && event->type() == QEvent::Wheel && !m_spnChannelK->hasFocus()) {
@@ -4366,6 +5197,10 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
     }
     if (obj == m_resPill && event->type() == QEvent::MouseButtonRelease) {
         toggleResourceHud();
+        return true;
+    }
+    if (obj == m_fpsPill && event->type() == QEvent::MouseButtonRelease) {
+        toggleFpsHud();
         return true;
     }
     if (obj == m_videoArea
@@ -4383,19 +5218,29 @@ void MainWindow::onFramesProcessed(cv::Mat f1, cv::Mat f2, double focus1, double
     if (!m_camerasOpen) return;
     ++m_displayedFrames;
 
+    const bool shapeChanged = !sameShape(m_frame1, f1);
     m_frame1 = f1;
     m_frame2 = f2;
+    if (shapeChanged && m_ffFlat.valid()) {
+        updateFlatInfo();
+        updateKInfo();
+    }
     m_lastFocus1 = focus1;
     m_lastFocus2 = focus2;
     m_frameCount = frameCount;
 
     if (m_focusViewActive) {
+        m_focusPending1.append(QPointF(frameCount, focus1));
+        m_focusPending2.append(QPointF(frameCount, focus2));
+    }
+    if (m_focusViewActive && (!m_focusChartClock.isValid() || m_focusChartClock.elapsed() >= kFocusChartIntervalMs)) {
+        m_focusChartClock.start();
         if (m_lblFocus1Big) m_lblFocus1Big->setText(QString::number(static_cast<int>(focus1)));
         if (m_lblFocus2Big) m_lblFocus2Big->setText(QString::number(static_cast<int>(focus2)));
 
         if (m_seriesCam1 && m_seriesCam2 && m_chart) {
-            m_seriesCam1->append(frameCount, focus1);
-            m_seriesCam2->append(frameCount, focus2);
+            m_seriesCam1->append(m_focusPending1);
+            m_seriesCam2->append(m_focusPending2);
 
             int diff1 = m_seriesCam1->count() - m_maxHistory;
             if (diff1 > 0) m_seriesCam1->removePoints(0, diff1);
@@ -4438,6 +5283,8 @@ void MainWindow::onFramesProcessed(cv::Mat f1, cv::Mat f2, double focus1, double
                 }
             }
         }
+        m_focusPending1.clear();
+        m_focusPending2.clear();
     }
 
     if (m_motionActive != motionDetected) {
@@ -4455,6 +5302,7 @@ void MainWindow::onFramesProcessed(cv::Mat f1, cv::Mat f2, double focus1, double
 
     updateView();
     if (m_kCalTarget > 0) collectKSample();
+    if (m_ffCapturing) updateFlatInfo();
 }
 
 void MainWindow::updateView()
@@ -4463,11 +5311,10 @@ void MainWindow::updateView()
 
     if (m_frame1.empty() || m_frame2.empty()) return;
 
-    cv::Mat f1 = m_frame1.clone();
-    cv::Mat f2 = m_frame2.clone();
+    cv::Mat f1 = m_frame1;
+    cv::Mat f2 = m_frame2;
 
     const bool diffMode = m_isDiffMode;
-    cv::Mat valid1, valid2;
     auto warpValid = [](cv::Mat& valid, const cv::Size& srcSize, const cv::Mat& H, const cv::Size& dstSize) {
         if (valid.empty()) valid = cv::Mat(srcSize, CV_8U, cv::Scalar(255));
         cv::Mat warped;
@@ -4475,18 +5322,17 @@ void MainWindow::updateView()
         cv::compare(warped, 255.0, valid, cv::CMP_EQ);
     };
 
+    cv::Mat H1, H2;
     if (!m_manualAdj1.isIdentity()) {
-        cv::Mat H = buildManualHomography(m_manualAdj1, f1.size());
+        H1 = buildManualHomography(m_manualAdj1, f1.size());
         cv::Mat warped;
-        cv::warpPerspective(f1, warped, H, f1.size(), cv::INTER_LINEAR);
-        if (diffMode) warpValid(valid1, f1.size(), H, f1.size());
+        cv::warpPerspective(f1, warped, H1, f1.size(), cv::INTER_LINEAR);
         f1 = warped;
     }
     if (!m_manualAdj2.isIdentity()) {
-        cv::Mat H = buildManualHomography(m_manualAdj2, f2.size());
+        H2 = buildManualHomography(m_manualAdj2, f2.size());
         cv::Mat warped;
-        cv::warpPerspective(f2, warped, H, f2.size(), cv::INTER_LINEAR);
-        if (diffMode) warpValid(valid2, f2.size(), H, f2.size());
+        cv::warpPerspective(f2, warped, H2, f2.size(), cv::INTER_LINEAR);
         f2 = warped;
     }
 
@@ -4514,7 +5360,29 @@ void MainWindow::updateView()
     }
 
     cv::Mat alignedF2 = wantAlign ? warpedF2 : f2;
-    if (diffMode && wantAlign && warped) warpValid(valid2, f2.size(), m_eccWarpMatrix, f1.size());
+    cv::Mat valid1, valid2;
+    if (diffMode) {
+        const cv::Mat Hecc = wantAlign && warped ? m_eccWarpMatrix : cv::Mat();
+        std::vector<double> key{double(f1.cols), double(f1.rows), double(f2.cols), double(f2.rows)};
+        for (const cv::Mat& H : {H1, H2, Hecc}) {
+            key.push_back(H.empty() ? 0.0 : 1.0);
+            if (H.empty()) continue;
+            cv::Mat h;
+            H.convertTo(h, CV_64F);
+            key.insert(key.end(), h.begin<double>(), h.end<double>());
+        }
+        if (key != m_validKey) {
+            cv::Mat v1, v2;
+            if (!H1.empty()) warpValid(v1, f1.size(), H1, f1.size());
+            if (!H2.empty()) warpValid(v2, f2.size(), H2, f2.size());
+            if (!Hecc.empty()) warpValid(v2, f2.size(), Hecc, f1.size());
+            m_validKey = key;
+            m_valid1 = v1;
+            m_valid2 = v2;
+        }
+        valid1 = m_valid1;
+        valid2 = m_valid2;
+    }
     if (wantFusion && !diffMode) {
         f1 = fuseCameras(f1, warpedF2);
     }
@@ -4560,17 +5428,22 @@ void MainWindow::updateView()
 
         if (showPeaks) {
             if (f1.channels() == 1) cv::cvtColor(f1, f1, cv::COLOR_GRAY2BGR);
+            else if (f1.datastart == m_frame1.datastart) f1 = f1.clone();
             if (alignedF2.channels() == 1) cv::cvtColor(alignedF2, alignedF2, cv::COLOR_GRAY2BGR);
+            else if (alignedF2.datastart == m_frame2.datastart) alignedF2 = alignedF2.clone();
             drawTarget(f1, maxLoc1, cv::Scalar(0, 255, 255), "Max 1");
             drawTarget(alignedF2, maxLoc2, cv::Scalar(0, 255, 255), "Max 2");
         }
 
+        auto fpsTag = [this](int cam) {
+            return m_camFps[cam] >= 0 ? QString("  %1 FPS").arg(qRound(m_camFps[cam])) : QString();
+        };
         m_view1->setOverlayColor(QColor(0x4e, 0xc9, 0xb0));
         m_view1->setOverlayText(wantFusion
                                     ? QString("Σ/2 = (CAM1 + %1·CAM2)/2").arg(m_channelK, 0, 'f', 4)
-                                    : QString("CAM1  Focus %1").arg(static_cast<int>(m_lastFocus1)), false);
+                                    : QString("CAM1%1  Focus %2").arg(fpsTag(0)).arg(static_cast<int>(m_lastFocus1)), false);
         m_view2->setOverlayColor(QColor(0xce, 0x91, 0x78));
-        m_view2->setOverlayText(QString("CAM2  Focus %1").arg(static_cast<int>(m_lastFocus2)), true);
+        m_view2->setOverlayText(QString("CAM2%1  Focus %2").arg(fpsTag(1)).arg(static_cast<int>(m_lastFocus2)), true);
 
         displayMat(m_view1, f1);
         displayMat(m_view2, alignedF2);
@@ -4595,7 +5468,7 @@ void MainWindow::updateView()
         if (m_diffScaleRamp.isNull()) m_diffScaleRamp = diffScaleRamp();
         m_resultView->setColorScale(m_diffScaleRamp, st.fullScale, "|D|, DN");
 
-        m_lastDiffResult = diff.clone();
+        m_lastDiffResult = diff;
         displayMat(m_resultView, diff);
         updateDiffReadout();
     }
@@ -5262,18 +6135,26 @@ void MainWindow::pushWorkerParams()
     p.applyBilateral    = m_chkBilateral && m_chkBilateral->isChecked();
     p.bilateralStrength = m_bilateralStrength;
     p.noiseFloor        = m_noiseFloor;
+    p.clipLevel         = m_clipLevel;
     m_worker->setParams(p);
 }
 
 void MainWindow::displayMat(ImageView* view, const cv::Mat& mat)
 {
-    if (mat.empty() || view == nullptr) return;
+    if (mat.empty() || view == nullptr || !view->isVisible()) return;
     if (mat.channels() != 1 && mat.channels() != 3) return;
 
     cv::Mat src = mat;
     const QSize target = view->targetSize(QSize(mat.cols, mat.rows));
     if (target.isValid() && target.width() < mat.cols && target.height() < mat.rows) {
-        cv::resize(mat, src, cv::Size(target.width(), target.height()), 0, 0, cv::INTER_AREA);
+        while (src.cols / 2 >= target.width() && src.rows / 2 >= target.height()) {
+            cv::Mat half;
+            cv::resize(src(cv::Rect(0, 0, src.cols & ~1, src.rows & ~1)), half,
+                       cv::Size(src.cols / 2, src.rows / 2), 0, 0, cv::INTER_AREA);
+            src = half;
+        }
+        if (src.cols != target.width() || src.rows != target.height())
+            cv::resize(src, src, cv::Size(target.width(), target.height()), 0, 0, cv::INTER_AREA);
     }
 
     auto* bgra = new cv::Mat();
@@ -5311,6 +6192,7 @@ QString MainWindow::buildSnapshotBaseName(const QString& prefix) const
             parts << QString("NF%1").arg(m_noiseFloorSlider->value());
         }
         if (enabled("ST") && m_chkStretch && m_chkStretch->isChecked()) parts << "ST";
+        if (enabled("FF") && flatFieldActive()) parts << "FF";
         if (enabled("G") && m_manualExposure) {
             if (m_perCameraExposure) {
                 parts << QString("G1_%1x").arg(m_gainQ8  / 256.0, 0, 'f', 2);
@@ -5513,7 +6395,7 @@ void MainWindow::showExposureDialog()
     };
 
     QDoubleSpinBox* spnG = new QDoubleSpinBox(&dlg);
-    spnG->setRange(0.1, 10.0);
+    spnG->setRange(kGainMin, kGainMax);
     spnG->setDecimals(2);
     spnG->setSingleStep(0.1);
     spnG->setSuffix("x");
@@ -5521,26 +6403,31 @@ void MainWindow::showExposureDialog()
     spnG->setFixedWidth(100);
 
     QSlider* sldG = new QSlider(Qt::Horizontal, &dlg);
-    sldG->setRange(10, 1000);
+    sldG->setRange(int(kGainMin * 100), int(kGainMax * 100));
     sldG->setSingleStep(10);
     sldG->setPageStep(50);
     sldG->setMinimumWidth(280);
 
     QSpinBox* spnS = new QSpinBox(&dlg);
-    spnS->setRange(50, 30000);
+    spnS->setRange(kShutterMinUs, kShutterMaxUs);
     spnS->setSingleStep(100);
     spnS->setSuffix(" us");
     spnS->setKeyboardTracking(false);
     spnS->setFixedWidth(120);
 
     QSlider* sldS = new QSlider(Qt::Horizontal, &dlg);
-    sldS->setRange(50, 30000);
+    sldS->setRange(kShutterMinUs, kShutterMaxUs);
     sldS->setSingleStep(100);
     sldS->setPageStep(1000);
     sldS->setMinimumWidth(280);
 
-    QFrame* rowG = buildRow("GAIN (0.10x – 10.00x)",   spnG, sldG);
-    QFrame* rowS = buildRow("SHUTTER (50 – 30000 µs)", spnS, sldS);
+    QFrame* rowG = buildRow(QString("GAIN (%1x – %2x)").arg(kGainMin, 0, 'f', 2).arg(kGainMax, 0, 'f', 2),
+                            spnG, sldG);
+    QFrame* rowS = buildRow(QString("SHUTTER (%1 – %2 µs)").arg(kShutterMinUs).arg(kShutterMaxUs),
+                            spnS, sldS);
+    rowS->setToolTip(QString("A shutter longer than the frame period lowers the frame rate when the cameras\n"
+                             "start: every frame needs the shutter time plus %1 µs of readout.")
+                         .arg(kFrameMarginUs));
     root->addWidget(rowG);
     root->addWidget(rowS);
 
@@ -5554,8 +6441,8 @@ void MainWindow::showExposureDialog()
         } else {
             g = m_gainQ8  / 256.0;  sh = m_shutterUs;
         }
-        g  = qBound(0.1, g, 10.0);
-        sh = qBound(50, sh, 30000);
+        g  = qBound(kGainMin, g, kGainMax);
+        sh = qBound(kShutterMinUs, sh, kShutterMaxUs);
         QSignalBlocker bg(spnG), bgs(sldG), bs(spnS), bss(sldS);
         spnG->setValue(g);
         sldG->setValue(static_cast<int>(g * 100.0 + 0.5));
@@ -5805,9 +6692,42 @@ ExifParams MainWindow::buildExifParams(const QString& mode) const
             kc["pixelSpread"] = m_kCal.spread;
             kc["exposureAtCalibration"] = m_kCal.exposure;
             kc["exposureNow"] = exposureSignature();
+            kc["flatFieldAtCalibration"] = m_kCal.flatField.isEmpty() ? QString("off") : m_kCal.flatField;
+            kc["flatFieldNow"] = flatFieldSignature();
             kc["frameSize"] = QJsonArray{ m_kCal.frameSize.width(), m_kCal.frameSize.height() };
         }
         obj["channelBalance"] = kc;
+    }
+    {
+        QJsonObject ff;
+        ff["enabled"] = m_chkFlatField && m_chkFlatField->isChecked();
+        ff["applied"] = flatFieldActive() && flatFieldMismatch().isEmpty();
+        auto pair = [](const std::array<double, 2>& v, double scale = 1.0) {
+            return QJsonArray{ std::round(v[0] * scale * 1e4) / 1e4, std::round(v[1] * scale * 1e4) / 1e4 };
+        };
+        if (m_ffFlat.valid()) {
+            ff["formula"] = "C = (R - D) * m / (F - D) per camera and pixel, m = frame mean of (F - D); "
+                            "applied to each camera frame right after capture; R >= clipLevel stays 255";
+            ff["flatAt"] = m_ffFlat.when.toString(Qt::ISODate);
+            ff["flatFrames"] = m_ffFlat.frames;
+            ff["flatExposure"] = m_ffFlat.exposure;
+            ff["flatSize"] = QJsonArray{ m_ffFlat.mean[0].cols, m_ffFlat.mean[0].rows, m_ffFlat.mean[0].channels() };
+            ff["meanLevelDN"] = pair(m_ffStats.level);
+            ff["gainMin"] = pair(m_ffStats.gainMin);
+            ff["gainMax"] = pair(m_ffStats.gainMax);
+            ff["flatNoisePercent"] = pair(m_ffStats.noise, 100.0);
+            ff["deadPixels"] = QJsonArray{ m_ffStats.dead[0], m_ffStats.dead[1] };
+        }
+        if (m_ffDark.valid()) {
+            ff["darkAt"] = m_ffDark.when.toString(Qt::ISODate);
+            ff["darkFrames"] = m_ffDark.frames;
+            ff["darkExposure"] = m_ffDark.exposure;
+            ff["darkLevelDN"] = QJsonArray{ std::round(cv::mean(m_ffDark.mean[0])[0] * 1e3) / 1e3,
+                                            std::round(cv::mean(m_ffDark.mean[1])[0] * 1e3) / 1e3 };
+        } else {
+            ff["dark"] = "none, D = 0";
+        }
+        obj["flatField"] = ff;
     }
     obj["clipLevel"]       = m_clipLevel;
     if (m_isDiffMode && m_diffStats.valid) {
@@ -5916,6 +6836,7 @@ void MainWindow::saveSettings()
     s.setValue("trackPeaks", m_btnPeakIntensities->isChecked());
     s.setValue("channelK", m_channelK);
     s.setValue("clipLevel", m_clipLevel);
+    s.setValue("flatFieldEnabled", m_chkFlatField && m_chkFlatField->isChecked());
     s.setValue("appendParams", m_chkAppendParams ? m_chkAppendParams->isChecked() : false);
     s.setValue("separateFiles", m_chkSeparateFiles ? m_chkSeparateFiles->isChecked() : false);
     s.beginGroup("FilenameParams");
@@ -5960,6 +6881,7 @@ void MainWindow::saveSettings()
     s.setValue("animTabsEnabled", m_animTabsEnabled);
     s.setValue("animDialogsEnabled", m_animDialogsEnabled);
     s.setValue("resourceHud", m_resHudVisible);
+    s.setValue("fpsHud", m_fpsHudVisible);
     s.setValue("eccPolish", m_chkEccPolish ? m_chkEccPolish->isChecked() : true);
     s.setValue("persistAlign", m_chkPersistAlign ? m_chkPersistAlign->isChecked() : true);
     s.sync();
@@ -5977,6 +6899,7 @@ void MainWindow::loadSettings()
     m_animTabsEnabled        = s.value("animTabsEnabled", true).toBool();
     m_animDialogsEnabled     = s.value("animDialogsEnabled", true).toBool();
     m_resHudVisible          = s.value("resourceHud", false).toBool();
+    m_fpsHudVisible          = s.value("fpsHud", false).toBool();
 
     m_comboColorMode->setCurrentIndex(s.value("colorMode", 1).toInt());
     m_chkFlipVer2->setChecked(s.value("flipVer2", false).toBool());
@@ -5990,8 +6913,9 @@ void MainWindow::loadSettings()
     m_noiseFloorSlider->setValue(s.value("noiseFloor", 15).toInt());
     m_chkStretch->setChecked(s.value("stretchIntensity", false).toBool());
     m_btnPeakIntensities->setChecked(s.value("trackPeaks", false).toBool());
-    if (m_spnChannelK) loadKCalibration(s);
     if (m_spnClipLevel) m_spnClipLevel->setValue(s.value("clipLevel", 254).toInt());
+    loadFlatField(s);
+    if (m_spnChannelK) loadKCalibration(s);
     if (m_chkAppendParams) m_chkAppendParams->setChecked(s.value("appendParams", false).toBool());
     if (m_chkSeparateFiles) m_chkSeparateFiles->setChecked(s.value("separateFiles", false).toBool());
     s.beginGroup("FilenameParams");
@@ -6006,10 +6930,10 @@ void MainWindow::loadSettings()
     m_shutter2Us = s.value("shutter2Us", m_shutterUs).toInt();
     m_perCameraExposure = s.value("perCameraExposure", false).toBool();
 
-    double gainVal     = qBound(0.1, m_gainQ8    / 256.0, 10.0);
-    double gain2Val    = qBound(0.1, m_gain2Q8   / 256.0, 10.0);
-    int    shutterVal  = qBound(50,  m_shutterUs,  30000);
-    int    shutter2Val = qBound(50,  m_shutter2Us, 30000);
+    double gainVal     = qBound(kGainMin, m_gainQ8    / 256.0, kGainMax);
+    double gain2Val    = qBound(kGainMin, m_gain2Q8   / 256.0, kGainMax);
+    int    shutterVal  = qBound(kShutterMinUs, m_shutterUs,  kShutterMaxUs);
+    int    shutter2Val = qBound(kShutterMinUs, m_shutter2Us, kShutterMaxUs);
     m_gainQ8     = static_cast<int>(gainVal  * 256.0 + 0.5);
     m_gain2Q8    = static_cast<int>(gain2Val * 256.0 + 0.5);
     m_shutterUs  = shutterVal;
@@ -6384,6 +7308,7 @@ void MainWindow::initCommands()
 
         {"cmd_history", "Chart History Limit", "Options", CmdType::Parameter, {}, [this, createPopup](QWidget*){ createPopup("Chart History Limit", m_historySlider); }},
         {"cmd_resources", "Toggle Resource Monitor", "Options", CmdType::Toggle, [this](){ toggleResourceHud(); }, {}},
+        {"cmd_fps_monitor", "Toggle Frame Rate Monitor", "Options", CmdType::Toggle, [this](){ toggleFpsHud(); }, {}},
 
         {"cmd_tour", "Show Quick Tour", "Help", CmdType::Action, [this](){ showQuickTour(); }, {}},
         {"cmd_help", "Open Help & Tips", "Help", CmdType::Action, [this](){ showHelpDialog(); }, {}}
@@ -6708,12 +7633,18 @@ static QVector<HelpTopic> helpTopics()
           "AUTO / MAN toggles automatic and manual exposure. In manual mode the "
           "current gain × shutter is shown next to the toggle, and "
           "\"Detail...\" opens per-camera gain and shutter controls with "
-          "sliders and exact values. Manual exposure drives libcamera (CSI) "
-          "cameras; USB / DirectShow cameras keep their own exposure." },
+          "sliders and exact values: gain 1–20x, shutter 50–40000 µs. A shutter "
+          "longer than the frame period lowers the frame rate when the cameras "
+          "start. Manual exposure drives libcamera (CSI) cameras; USB / "
+          "DirectShow cameras keep their own exposure." },
         { "Capture workspace",
           "Color mode (grayscale / color), flipping of CAM 2 (horizontal / "
-          "vertical), bilateral noise filter with strength slider, and adaptive "
-          "view options." },
+          "vertical), bilateral noise filter with strength slider, adaptive "
+          "view options and the flat-field correction: average a dark frame "
+          "(lenses capped, optional) and a flat frame (uniform unpolarized "
+          "target), then Apply corrects every pixel of each camera as "
+          "(R − D)·mean(F − D)/(F − D) right after capture. Recalibrate k "
+          "after switching it." },
         { "Pipeline & Diff",
           "Pipeline contains the processing chain: the T-buffer (temporal "
           "averaging over N frames), the motion threshold with its indicator "
@@ -6725,7 +7656,8 @@ static QVector<HelpTopic> helpTopics()
           "frames, saves k at once with the date, spread and exposure, and "
           "keeps it until you calibrate again (presets do not touch it). Then "
           "point the rig at the laser. The noise floor zeroes small "
-          "|D|, stretch multiplies |D| to fill the scale (the factor is shown), "
+          "|D|, stretch multiplies |D| to fill the scale (the factor ×G and the "
+          "top of the scale are shown next to the switch and on the image), "
           "and pixels clipped in both cameras count as 0. The line under the "
           "controls lists every step applied. Peak tracking marks the "
           "brightest spot of each camera." },
@@ -6757,10 +7689,21 @@ static QVector<HelpTopic> helpTopics()
           "temperature; it turns amber at 70 \u00B0C, high CPU or a frequency "
           "cap and red at 80 \u00B0C, throttling or under-voltage. Click it (or "
           "bind \"Toggle Resource Monitor\") for an overlay with per-core load, "
-          "app / GUI / camera-thread CPU, ARM clock, fan, throttle flags, RAM "
-          "and camera / shown / dropped FPS. While streaming, the STREAMING "
-          "pill shows the camera FPS and turns amber when it falls behind the "
-          "requested rate." },
+          "app / GUI / pipeline-thread CPU, ARM clock, fan, throttle flags, RAM "
+          "and FPS." },
+        { "Frame rate",
+          "The FPS pill in the top bar reads C1 · C2 · P: the frames "
+          "each camera delivers per second and the frame pairs the pipeline "
+          "processes per second (it waits for a new frame from both cameras, "
+          "so it never exceeds the slower one). A value turns amber "
+          "when its camera is below 90 % of the requested rate or loses "
+          "frames, or when the pipeline falls behind the slower camera. Click "
+          "the pill (or bind \"Toggle Frame Rate Monitor\") for the last 30 s: "
+          "a small chart per line with the requested rate dashed and red dots "
+          "where frames were lost, min / avg / max, the frames each camera "
+          "lost (gaps in its stream at the requested rate) and, for the "
+          "pipeline, the camera frames it did not use and the pairs the display "
+          "skipped." },
         { "Presets & settings",
           "Presets save the whole processing configuration and can be loaded "
           "or deleted in one click. Settings contains animation speed and "
